@@ -1,0 +1,69 @@
+name: build-xnu
+
+# The kernel is device-agnostic at build time (the phone's drivers are chosen by
+# boot-args), so one kernel serves every MediaTek target; mtkloader is built here
+# as a smoke test too (the per-device loader is rebuilt on the host from the
+# phone's own touch firmware).
+on:
+  push:
+    branches: [mtk, "mtk-*"]
+  workflow_dispatch:
+  workflow_call:
+
+jobs:
+  kernel:
+    runs-on: ubuntu-latest
+    container: archlinux:base
+    timeout-minutes: 75
+    steps:
+      - name: Host packages (the author's verified environment is Arch)
+        run: |
+          pacman -Syu --needed --noconfirm \
+            base-devel git curl tar xz make clang lld python perl flex bison m4 \
+            autoconf automake libxml2 ncurses zlib zstd
+          git config --global --add safe.directory '*'
+          clang --version | head -1
+
+      - uses: actions/checkout@v4
+
+      - name: Theos (cctools ld64 for Mach-O) + iPhoneOS 16.5 SDK
+        run: |
+          git clone --recursive https://github.com/theos/theos.git "$HOME/theos"
+          mkdir -p "$HOME/theos/toolchain" "$HOME/theos/sdks"
+          curl -sL https://github.com/L1ghtmann/llvm-project/releases/latest/download/iOSToolchain-x86_64.tar.xz \
+            | tar -xJ -C "$HOME/theos/toolchain/"
+          curl -sL -o /tmp/sdk.tar.xz \
+            https://github.com/theos/sdks/releases/download/master-146e41f/iPhoneOS16.5.sdk.tar.xz
+          tar -xJf /tmp/sdk.tar.xz -C "$HOME/theos/sdks"
+          test -x "$HOME/theos/toolchain/linux/iphone/bin/ld"
+          test -d "$HOME/theos/sdks/iPhoneOS16.5.sdk/usr/include"
+
+      - name: zig (its ld.lld links mtkloader)
+        run: |
+          mkdir -p xnu-deps/host/zig
+          curl -sL https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz \
+            | tar -xJ --strip-components=1 -C xnu-deps/host/zig
+          xnu-deps/host/zig/zig version
+
+      - name: XNU sources + the tree's own dependencies
+        run: |
+          ./xnu/apply.sh
+          ./xnu-deps/setup.sh
+
+      - name: Build the kernel
+        run: |
+          ./xnu-build.sh -j"$(nproc)" -k
+          ls -la xnu-src/xnu-8796.121.2/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/
+
+      - name: Build mtkloader (with the committed Hot 20 touch firmware)
+        run: |
+          ./mtkloader/build.sh
+          ls -la mtkloader/mtkloader.bin
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hakios-mtk-build
+          path: |
+            xnu-src/xnu-8796.121.2/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837
+            mtkloader/mtkloader.bin
+          if-no-files-found: error
