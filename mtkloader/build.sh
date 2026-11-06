@@ -6,7 +6,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 
 LLD="$ROOT/xnu-deps/host/zig/zig ld.lld"
-CFLAGS="--target=aarch64-linux-gnu -ffreestanding -nostdlib -fno-builtin -mgeneral-regs-only -mstrict-align -Os -Wall -Wextra"
+CFLAGS="--target=aarch64-linux-gnu -ffreestanding -nostdlib -fno-builtin -mgeneral-regs-only -mstrict-align -fno-stack-protector -Os -Wall -Wextra"
 
 clang $CFLAGS "$@" -c "$HERE/start.S" -o "$HERE/start.o"
 clang $CFLAGS "$@" -c "$HERE/mtkloader.c" -o "$HERE/mtkloader.o"
