@@ -219,14 +219,23 @@ find_partition(void)
 	uint64_t entries_lba, at;
 	uint32_t count, size;
 
-	if (!read_retrying(1, 1, sector) || memcmp(s, "EFI PART", 8) != 0) {
+	/* The GPT is laid out on the card's own sectors: 512 bytes on the X6826B, 4096 on rosemary
+	 * (its header sits at byte 4096, the entry array at 8192). Both cards answer reads in
+	 * 512-byte blocks, so a GPT sector is gpt512 of them and every LBA below comes in those. */
+	uint32_t gpt512 = 0;
+	for (uint32_t gs = 512; gs <= 4096 && gpt512 == 0; gs *= 2) {
+		if (read_retrying(gs / 512, 1, sector) && memcmp(s, "EFI PART", 8) == 0) {
+			gpt512 = gs / 512;
+		}
+	}
+	if (gpt512 == 0) {
 		printf("emmc: no GPT (%s)\n", emmc_failed ? emmc_failed : "no signature");
 		return false;
 	}
 	memcpy(&entries_lba, s + 72, 8);
 	memcpy(&count, s + 80, 4);
 	memcpy(&size, s + 84, 4);
-	if (count > 128 || size != 128 || !read_retrying(entries_lba, count * size / 512, entries)) {
+	if (count > 128 || size != 128 || !read_retrying(entries_lba * gpt512, count * size / 512, entries)) {
 		printf("emmc: the GPT's entries: %u of %u bytes\n", count, size);
 		return false;
 	}
@@ -245,8 +254,8 @@ find_partition(void)
 		if (first == 0 || last < first) {
 			return false;
 		}
-		emmc_lba = first;
-		emmc_blocks = last - first + 1;
+		emmc_lba = first * gpt512;
+		emmc_blocks = (last - first + 1) * gpt512;
 		break;
 	}
 	if (emmc_lba == 0) {

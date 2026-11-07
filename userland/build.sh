@@ -279,7 +279,10 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 			[ -f $M/air_run ] && cp $M/air_run obj/air_run
 		fi
 	fi
-	cp obj/hello_dyn obj/svc_test obj/surf_test obj/rwtouch obj/cputop obj/nullxpc obj/mg_test root/bin/
+	for f in hello_dyn svc_test surf_test rwtouch cputop nullxpc mg_test; do
+		# (a prebuilt/ from before a program has none of it either)
+		[ -f obj/$f ] && cp obj/$f root/bin/
+	done
 	[ -f obj/cpu_test ] && cp obj/cpu_test root/bin/        # (a prebuilt/ from before this program has none)
 	[ -f obj/cow_test ] && cp obj/cow_test root/bin/
 	[ -f obj/cg_test ] && cp obj/cg_test root/bin/
