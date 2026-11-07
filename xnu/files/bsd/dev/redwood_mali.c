@@ -2,28 +2,37 @@
  * The GPU of the Redmi Note 10S (rosemary), the Helio G95's Mali, brought up from the kernel. Only
  * with boot-arg mali=1: every address below belongs to this phone.
  *
- * A Bifrost Mali needs no firmware, so bringing it up is power and clocks and nothing else. On this
- * SoC (MT6785) both were measured, not guessed: iMediaTek's closed kernel started this very GPU on
- * this very phone with clock writes alone (their run's pstore, logs/imdt1; the recipe with its
- * before/after register dumps in docs/mali-g57-imdt1-reference.md), and the Android device tree
- * names the blocks: mali@13040000, mfgcfg@13fbf000, apmixed@1000c000. The order they left in the
- * dump, topckgen untouched (the preloader already muxed mfg) and the power already on (no SPM
- * dance, no bus-protection release -- both read back done):
+ * A Bifrost Mali needs no firmware, so bringing it up is power and clocks and nothing else. On
+ * this SoC (MT6785) both recipes are written down: the MTCMOS domains and the bus protection in
+ * this phone's own GPL kernel (drivers/clk/mediatek/clk-mt6785-pg.c, addresses and order only),
+ * the clock state to aim for in iMediaTek's run on this very phone (their pstore, logs/imdt1,
+ * with before/after register dumps in docs/mali-g57-imdt1-reference.md), and the mfgcfg
+ * handshake in their Mali driver's platform code (bifrost r25p0, platform/mt6785). The blocks
+ * themselves the Android device tree names: mali@13040000, mfgcfg@13fbf000, apmixed@1000c000,
+ * the SPM at 0x10006000. The ufs20a run proved the boot before us leaves the MFG domains off
+ * (mfgcfg read all zeros and the core answered GPU_ID 0), so the power is ours to raise:
  *
- *   1  MFGPLL in apmixedsys: pcw 0x152762, postdiv 0x1f0, enable, and a wait for its lock
- *   2  mfgcfg: the rendering clock's mux bits and enable (+0x020), the bus mux to 2 (+0x0b0),
- *      the divider enable (+0x130)
- *   3  the GPU: which one it is (a GPU_ID of zero says the power story failed -- nothing else did
- *      it, and this returns), a soft reset, the job manager / shader / coherency configs they
- *      wrote (no hardware coherency on this SoC; the flushes in JS_CONFIG carry it), and its L2,
- *      tiler and shader cores powered
- *   4  one job, the smallest there is -- write a value into memory -- through address space 0 in
+ *   1  the six MTCMOS domains in the SPM: MFG0 (MFG_ASYNC), MFG1 (MFG_TOP, with its SRAM pair
+ *      and, last, the bus protection released through infracfg), MFG2..MFG5 (the shader cores,
+ *      each with its SRAM)
+ *   2  MFGPLL in apmixedsys (+0x250): read; only if it is off, program it with this phone's own
+ *      words and wait for its change bit to fall. topckgen is not touched -- both runs agree the
+ *      preloader already muxed mfg_sel (the +0x020 word reads the same 0x502 in both)
+ *   3  mfgcfg: BG3D's gate released (+0x008), the async clock's bits 23 and 25 for hardware
+ *      clock gating (+0x020), the enable (+0x024), the Q-channel handshake and the bus-idle
+ *      poll (+0x0b4, +0x170 -> +0x178), the global bits 8 and 10 cleared (+0x0b0), the
+ *      divider enable (+0x130)
+ *   4  the GPU: which one it is (a GPU_ID of zero still says the power story failed), a soft
+ *      reset, the job manager / shader / coherency configs their run left (no hardware
+ *      coherency on this SoC; the flushes in JS_CONFIG carry it), and its L2, tiler and shader
+ *      cores powered
+ *   5  one job, the smallest there is -- write a value into memory -- through address space 0 in
  *      identity mode (a GPU address is the physical one), and the processor reads the value back
- *   5  the same job again through the GPU's own page tables, at a GPU address of their making
+ *   6  the same job again through the GPU's own page tables, at a GPU address of their making
  *
- * (The Infinix Hot 20 this file was born on, a Helio G85 with the same core, wanted the four SPM
- * domains and topckgen's mfg_sel first; this SoC leaves those done. sysctl kern.redwood.mali says
- * how far it got: 6 means every step above worked.)
+ * (The Infinix Hot 20 this file was born on, a Helio G85, wanted the same dance with four
+ * domains and topckgen's mfg_sel first. sysctl kern.redwood.mali says how far it got: 6 means
+ * every step above worked.)
  */
 #include <kern/clock.h>
 #include <kern/thread.h>
@@ -46,14 +55,16 @@ extern struct mali_made { uint64_t address, size; uint32_t asked, flags; } gMali
 
 #define TOPCKGEN_PHYS   0x10000000
 #define INFRACFG_PHYS   0x10001000
+#define SPM_PHYS        0x10006000
 #define APMIXED_PHYS    0x1000c000
 #define MFGCFG_PHYS     0x13fbf000
 #define MALI_PHYS       0x13040000
 
 SYSCTL_DECL(_kern_redwood);
 
-static vm_offset_t topckgen, infracfg, apmixed, mfgcfg, mali;
+static vm_offset_t topckgen, infracfg, spm, apmixed, mfgcfg, mali;
 static uint32_t reached, gpu_id, shader_mask;
+static bool powered;
 
 SYSCTL_UINT(_kern_redwood, OID_AUTO, mali, CTLFLAG_RD | CTLFLAG_LOCKED, &reached, 0,
     "how far the Mali came up: 6 is a job run through page tables");
@@ -261,26 +272,115 @@ wait_for(vm_offset_t base, uint32_t at, uint32_t mask, uint32_t want, uint32_t m
 	return (rd(base, at) & mask) == want;
 }
 
-/* ---- the clocks (MT6785: the mfgcfg block, the MFGPLL in apmixedsys; imdt1's measured recipe) ---- */
+/* ---- power and clocks ----
+ *
+ * The SPM's MTCMOS domains, as this phone's own GPL kernel raises them (clk-mt6785-pg.c: the
+ * PWR_CON offsets, the status bits in PWR_STATUS at SPM+0x160/+0x164, the SRAM bits, the MFG1
+ * bus protection through infracfg). Every domain: power on and its second latch, wait for both
+ * status words, then clock, isolation and reset let go, then the SRAM brought back. MFG1's
+ * protection is released as soon as MFG1 is up: step 2 (bits 21 and 22, cleared at
+ * infracfg+0x2a4) before step 1 (bits 19, 20 and 21, cleared at infracfg+0x2ac), the same order
+ * their driver releases them.
+ */
 
-#define MFG_PLL_POSTDIV  0xb00001f0u     /* apmixed+0x220: MFGPLL's postdiv (their after-dump) */
-#define MFG_PLL_PCW_EN   0x80152762u     /* apmixed+0x224: pcw 0x152762 with the enable set */
-#define MFG_PLL_LOCK     0x80000002u     /* apmixed+0x22c: enabled and locked (both bits waited) */
+#define PWR_STATUS      0x160
+#define PWR_STATUS_2ND  0x164
+#define PWR_RST_B       (1u << 0)
+#define PWR_ISO         (1u << 1)
+#define PWR_ON          (1u << 2)
+#define PWR_ON_2ND      (1u << 3)
+#define PWR_CLK_DIS     (1u << 4)
+
+#define PROT_STEP2_CLR  0x2a4               /* INFRA_TOPAXI_PROTECTEN_CLR */
+#define PROT_STEP1_CLR  0x2ac               /* INFRA_TOPAXI_PROTECTEN_1_CLR */
+#define MFG1_PROT_STEP2 ((1u << 21) | (1u << 22))
+#define MFG1_PROT_STEP1 ((1u << 19) | (1u << 20) | (1u << 21))
+
+/* name, con offset in the SPM, status bit, SRAM bits in the con (0: none) */
+static const struct {
+	const char *name;
+	uint32_t con, bit, sram;
+} domains[6] = {
+	{ "MFG_ASYNC", 0x328, 1u << 4, 0 },
+	{ "MFG_TOP",   0x32c, 1u << 7, (1u << 8) | (1u << 9) },
+	{ "SHADER_0",  0x330, 1u << 20, 1u << 8 },
+	{ "SHADER_1",  0x334, 1u << 22, 1u << 8 },
+	{ "SHADER_2",  0x338, 1u << 23, 1u << 8 },
+	{ "SHADER_3",  0x350, 1u << 13, 1u << 8 },
+};
+
+static bool
+domain_on(unsigned i)
+{
+	uint32_t con = domains[i].con, bit = domains[i].bit;
+
+	wr(spm, con, rd(spm, con) | PWR_ON);
+	wr(spm, con, rd(spm, con) | PWR_ON_2ND);
+	if (!wait_for(spm, PWR_STATUS, bit, bit, 100) || !wait_for(spm, PWR_STATUS_2ND, bit, bit, 100)) {
+		return false;
+	}
+	wr(spm, con, rd(spm, con) & ~PWR_CLK_DIS);
+	wr(spm, con, rd(spm, con) & ~PWR_ISO);
+	wr(spm, con, rd(spm, con) | PWR_RST_B);
+	if (domains[i].sram) {
+		wr(spm, con, rd(spm, con) & ~domains[i].sram);
+		return wait_for(spm, con, domains[i].sram << 4, 0, 100);    /* the ack bits */
+	}
+	return true;
+}
+
+static void
+mali_power(void)
+{
+	for (unsigned i = 0; i < 6; i++) {
+		if (!domain_on(i)) {
+			printf("mali: power domain %s did not come up (status %#x, con %#x)\n",
+			    domains[i].name, rd(spm, PWR_STATUS), rd(spm, domains[i].con));
+			return;
+		}
+		if (i == 1) {
+			/* MFG_TOP's protection, released as soon as it is up -- step 2 first, then
+			 * step 1, the order their driver lets go of them in */
+			wr(infracfg, PROT_STEP2_CLR, MFG1_PROT_STEP2);
+			wr(infracfg, PROT_STEP1_CLR, MFG1_PROT_STEP1);
+		}
+	}
+	powered = true;
+}
+
+/*
+ * MFGPLL (apmixedsys +0x250): CON0 bit 0 is the enable, CON1 the pcw with its change bit 31.
+ * The always-on block keeps it across boots, and both runs this phone has printed show it
+ * already on (CON0 0x181, CON1 0x0314c4ec) -- so this reads it, says it, and programs it only
+ * if it is off, with this phone's own words. The +0x220 quad ufs20a mistook for it belongs to
+ * another PLL; nothing writes there anymore.
+ */
+#define MFGPLL_CON0     0x250
+#define MFGPLL_CON1     0x254
+#define MFGPLL_PCW      0x0314c4ecu     /* posdiv 3, pcw 0x14c4ec: the ~265 MHz this phone runs */
 
 static void
 mali_clocks(void)
 {
-	/* MFGPLL first: the mux in mfgcfg switches to it only once it answers. */
-	wr(apmixed, 0x220, MFG_PLL_POSTDIV);
-	wr(apmixed, 0x224, MFG_PLL_PCW_EN);
-	if (!wait_for(apmixed, 0x22c, MFG_PLL_LOCK, MFG_PLL_LOCK, 100)) {
-		printf("mali: the MFGPLL did not lock (%#x)\n", rd(apmixed, 0x22c));
+	if ((rd(apmixed, MFGPLL_CON0) & 1u) == 0) {
+		wr(apmixed, MFGPLL_CON1, MFGPLL_PCW & ~(1u << 31));
+		wr(apmixed, MFGPLL_CON1, MFGPLL_PCW | (1u << 31));
+		wait_for(apmixed, MFGPLL_CON1, 1u << 31, 0, 100);
+		wr(apmixed, MFGPLL_CON0, rd(apmixed, MFGPLL_CON0) | 1u);
+		printf("mali: MFGPLL was off, programmed (%#x %#x)\n", rd(apmixed, MFGPLL_CON0), rd(apmixed, MFGPLL_CON1));
 	}
 
-	/* The rendering clock's mux bits and its enable, then the bus mux (7 -> 2), then the dividers. */
-	wr(mfgcfg, 0x020, rd(mfgcfg, 0x020) | 0x02800000u);
+	/* Inside the block: BG3D's gate, the async clock's hardware-gating bits, the enable,
+	 * the Q-channel handshake, the bus-idle poll, the global bits their run cleared, the divider. */
+	wr(mfgcfg, 0x008, 1u);                                   /* MFG_CG_CLR: BG3D runs */
+	wr(mfgcfg, 0x020, rd(mfgcfg, 0x020) | (1u << 23) | (1u << 25));
 	wr(mfgcfg, 0x024, rd(mfgcfg, 0x024) | 1u);
-	wr(mfgcfg, 0x0b0, (rd(mfgcfg, 0x0b0) & ~0xf00u) | 0x200u);
+	wr(mfgcfg, 0x0b4, 0x1);                                  /* Q-channel handshake on */
+	wr(mfgcfg, 0x170, 0x3);                                  /* debug select: the bus idle view */
+	if (!wait_for(mfgcfg, 0x178, 1u << 2, 1u << 2, 100)) {
+		printf("mali: the MFG bus did not come idle (%#x)\n", rd(mfgcfg, 0x178));
+	}
+	wr(mfgcfg, 0x0b0, rd(mfgcfg, 0x0b0) & ~((1u << 8) | (1u << 10)));
 	wr(mfgcfg, 0x130, rd(mfgcfg, 0x130) | 1u);
 }
 
@@ -504,36 +604,37 @@ mali_up(void)
 
 	topckgen = ml_io_map(TOPCKGEN_PHYS, 0x200);
 	infracfg = ml_io_map(INFRACFG_PHYS, 0x400);
+	spm = ml_io_map(SPM_PHYS, 0x400);
 	apmixed = ml_io_map(APMIXED_PHYS, 0x300);
 	mfgcfg = ml_io_map(MFGCFG_PHYS, 0x1000);
 
 	/* What the phone left, in the words their run printed: if a step below fails, this is the
 	 * line that says which world we started from. */
-	printf("mali: mfgcfg before: cg %08x sel %08x/%08x pll %08x/%08x bus %08x div %08x/%08x; "
-	    "topck %08x %08x %08x %08x; protection %08x %08x\n",
-	    rd(mfgcfg, 0x010), rd(mfgcfg, 0x020), rd(mfgcfg, 0x024), rd(mfgcfg, 0x030), rd(mfgcfg, 0x034),
-	    rd(mfgcfg, 0x0b0), rd(mfgcfg, 0x130), rd(mfgcfg, 0x134),
-	    rd(topckgen, 0x020), rd(topckgen, 0x100), rd(topckgen, 0x104), rd(topckgen, 0x108),
-	    rd(infracfg, 0x2a0), rd(infracfg, 0x2a4));
+	printf("mali: before: spm en %08x status %08x/%08x, mfg cons %08x %08x %08x %08x %08x %08x; "
+	    "mfgcfg cg %08x sel %08x/%08x; protection %08x %08x %08x; mfgpll %08x %08x\n",
+	    rd(spm, 0x000), rd(spm, PWR_STATUS), rd(spm, PWR_STATUS_2ND),
+	    rd(spm, 0x328), rd(spm, 0x32c), rd(spm, 0x330), rd(spm, 0x334), rd(spm, 0x338), rd(spm, 0x350),
+	    rd(mfgcfg, 0x010), rd(mfgcfg, 0x020), rd(mfgcfg, 0x024),
+	    rd(infracfg, 0x220), rd(infracfg, 0x250), rd(infracfg, 0x254),
+	    rd(apmixed, MFGPLL_CON0), rd(apmixed, MFGPLL_CON1));
 
-	/* 1: the clocks (the power and the top clocks this phone leaves done; imdt1's order). */
-	mali_clocks();
+	/* 1: the six MTCMOS domains (ufs20a proved the boot before us leaves them off). */
+	mali_power();
+	if (!powered) {
+		return;
+	}
 	reached = 1;
 
-	/* 2: the bus protection between the GPU block and the rest, released by the boot before us. */
-	if (rd(infracfg, 0x2a0) != 0 || rd(infracfg, 0x2a4) != 0) {
-		printf("mali: the bus protection is held (%#x %#x) -- this bring-up does not release it\n",
-		    rd(infracfg, 0x2a0), rd(infracfg, 0x2a4));
-	}
+	/* 2: the clocks; topckgen is left alone -- both runs print the same word there. */
+	mali_clocks();
 	reached = 2;
 
-	/* 3: the GPU itself. A core that answers nothing means the power story failed: no register
-	 * this side of it turns the domains on, and imdt1's run says nothing had to. */
+	/* 3: the GPU itself. A core that answers nothing means the power story failed after all. */
 	mali = ml_io_map(MALI_PHYS, 0x4000);
 	gpu_id = rd(mali, GPU_ID);
 	if (gpu_id == 0 || gpu_id == 0xffffffffu) {
-		printf("mali: the core did not answer (GPU_ID %#x): the power is off, and this bring-up "
-		    "leaves power to the boot before it\n", gpu_id);
+		printf("mali: the core did not answer (GPU_ID %#x), status %#x/%#x: the power did not "
+		    "reach it\n", gpu_id, rd(spm, PWR_STATUS), rd(spm, PWR_STATUS_2ND));
 		return;
 	}
 	reached = 3;
@@ -566,13 +667,14 @@ mali_up(void)
 		return;
 	}
 	reached = 4;
-	printf("mali: GPU_ID %#x (product %x), shader cores %#x, tiler %#x, L2 %#x; mfgcfg now: "
-	    "sel %08x/%08x bus %08x div %08x/%08x, pll %08x %08x: all powered\n", gpu_id,
-	    gpu_id >> 16, shaders, tiler, l2,
-	    rd(mfgcfg, 0x020), rd(mfgcfg, 0x024), rd(mfgcfg, 0x0b0), rd(mfgcfg, 0x130), rd(mfgcfg, 0x134),
-	    rd(apmixed, 0x224), rd(apmixed, 0x22c));
+	printf("mali: GPU_ID %#x (product %x), shader cores %#x, tiler %#x, L2 %#x; now: "
+	    "status %#x/%#x, mfgcfg cg %08x sel %08x/%08x idle %08x, mfgpll %08x %08x: all powered\n",
+	    gpu_id, gpu_id >> 16, shaders, tiler, l2,
+	    rd(spm, PWR_STATUS), rd(spm, PWR_STATUS_2ND),
+	    rd(mfgcfg, 0x010), rd(mfgcfg, 0x020), rd(mfgcfg, 0x024), rd(mfgcfg, 0x178),
+	    rd(apmixed, MFGPLL_CON0), rd(apmixed, MFGPLL_CON1));
 
-	/* 4: something for it to do */
+	/* 5 and 6: something for it to do */
 	switch (first_jobs()) {
 	case 2:
 		reached = 6;
