@@ -220,6 +220,10 @@ read_blocks(uint64_t lba, uint32_t blocks, uint32_t *dst)
 #define UFS_IE            0x24
 #define UFS_HCS           0x30           /* DP 1, UTRLRDY 2, UCRDY 8 */
 #define UFS_HCE           0x34
+#define UFS_UECPA          0x38           /* the UIC error codes: one per layer, together they name the killer */
+#define UFS_UECDL          0x3c
+#define UFS_UECN           0x40
+#define UFS_UECT           0x44
 #define UFS_AHIT          0x18           /* auto-hibernate: after this much idle the link is put away */
 #define UFS_UTRLBA_L      0x50
 #define UFS_UTRLBA_H      0x54
@@ -234,6 +238,8 @@ read_blocks(uint64_t lba, uint32_t blocks, uint32_t *dst)
 #define UFS_MPHY          0x2200         /* MediaTek: the MPHY block (the deep stall and its kin) */
 #define UFS_STALL         0x2210         /* MediaTek: automatic deep stall */
 #define UFS_OCS_ERR       0x2244         /* MediaTek's own: what the last command died of */
+#define UFS_DBG_SEL       0x22c0         /* MediaTek: which window PROBE looks through */
+#define UFS_PROBE         0x22c8         /* 0x20 there: the link's own state machine (1 idle, 8..0xd entering hibernation) */
 
 #define UFS_IS_UTRCS      (1u << 0)
 #define UFS_IS_UICERR     (1u << 2)
@@ -241,8 +247,14 @@ read_blocks(uint64_t lba, uint32_t blocks, uint32_t *dst)
 #define UFS_HCS_DP        (1u << 0)
 #define UFS_HCS_UTRLRDY   (1u << 1)
 #define UFS_HCS_UCRDY     (1u << 3)
+#define UFS_UIC_DME_GET    0x01           /* a MIB read: the value comes back in ARG3 */
+#define UFS_UIC_DME_SET    0x02           /* a MIB write: the value rides in ARG3 */
 #define UFS_UIC_LINK_STARTUP 0x16
+#define UFS_UIC_HIBER_ENTER  0x17
 #define UFS_UIC_HIBER_EXIT   0x18
+#define UFS_VS_DBGCLK      0xd0a1         /* unipro: bit 5 forces the TX symbol clock request on */
+#define UFS_VS_SAVEPOWER   0xd0a6         /* unipro: bits 0/2/3 gate the RX/SYS/TX clocks, bit 6 is the deep stall */
+#define UFS_VS_UNIPRO_PD   0xd0a8         /* unipro: nonzero is its low-power mode */
 
 /* one page of descriptors: the UTRD at its start (the list base wants 1 KB), the command
  * descriptor a kilobyte in -- its command UPIU, its response, and one PRD entry, for the
@@ -285,7 +297,7 @@ ufs_clean(vm_offset_t address, vm_size_t size)
 
 /* one DME command, polled like the rest */
 static bool
-ufs_uic(uint32_t opcode, uint32_t arg1, const char *what)
+ufs_uic(uint32_t opcode, uint32_t arg1, uint32_t arg3, const char *what)
 {
 	uint32_t is = 0, i;
 
@@ -300,7 +312,7 @@ ufs_uic(uint32_t opcode, uint32_t arg1, const char *what)
 	}
 	ufs_wr(UFS_UIC_ARG1, arg1);
 	ufs_wr(UFS_UIC_ARG2, 0);
-	ufs_wr(UFS_UIC_ARG3, 0);
+	ufs_wr(UFS_UIC_ARG3, arg3);
 	ufs_wr(UFS_UIC_CMD, opcode & 0xff);
 	for (i = 0; i < 20000000; i++) {
 		is = ufs_rd(UFS_IS);
@@ -319,6 +331,32 @@ ufs_uic(uint32_t opcode, uint32_t arg1, const char *what)
 		return fail(what, ufs_rd(UFS_UIC_ARG2));
 	}
 	return true;
+}
+
+/* the two DME commands the unipro's own settings are reached through */
+static bool
+ufs_dme_get(uint32_t attr, uint32_t *val, const char *what)
+{
+	if (!ufs_uic(UFS_UIC_DME_GET, attr << 16, 0, what)) {
+		return false;
+	}
+	*val = ufs_rd(UFS_UIC_ARG3);
+	return true;
+}
+
+static bool
+ufs_dme_set(uint32_t attr, uint32_t val, const char *what)
+{
+	return ufs_uic(UFS_UIC_DME_SET, attr << 16, val, what);
+}
+
+/* the link's own state machine, through MediaTek's window: 1 is idle, 8 through 0xd are the
+ * states of entering hibernation (Linux waits the same window out before it touches the timer) */
+static uint32_t
+ufs_sm(void)
+{
+	ufs_wr(UFS_DBG_SEL, 0x20);
+	return ufs_rd(UFS_PROBE) & 0x1f;
 }
 
 /* the transfer list pointed at this side's page (the loader's descriptors may be anywhere by
@@ -359,7 +397,7 @@ ufs_reset(void)
 		return fail("controller enable", ufs_rd(UFS_HCE));
 	}
 	ufs_wr(UFS_AHIT, 0);                     /* a cold start re-arms it: the same death would wait again */
-	if (!ufs_uic(UFS_UIC_LINK_STARTUP, 0, "link startup")) {
+	if (!ufs_uic(UFS_UIC_LINK_STARTUP, 0, 0, "link startup")) {
 		return false;
 	}
 	if (!(ufs_rd(UFS_HCS) & UFS_HCS_DP)) {
@@ -439,6 +477,9 @@ ufs_read4k(uint8_t lun, uint64_t lba, uint32_t blocks)
 	if (ocs != 0 || resp != 0) {
 		printf("ufs: LUN %u, %u blocks at %llu: OCS %u, response %#x, sense %#x %#x %#x, MTK %#x, HCS %#x, RSR %#x\n", lun, blocks, lba,
 		    ocs, resp, r[36], r[46], r[47], ufs_rd(UFS_OCS_ERR), ufs_rd(UFS_HCS), ufs_rd(UFS_UTRLRSR));
+		printf("ufs: the aftermath: IS %#x, UECPA %#x, UECDL %#x, UECN %#x, UECT %#x, sm %u, refclk %#x, mphy %#x, stall %#x\n",
+		    ufs_rd(UFS_IS), ufs_rd(UFS_UECPA), ufs_rd(UFS_UECDL), ufs_rd(UFS_UECN), ufs_rd(UFS_UECT), ufs_sm(),
+		    ufs_rd(UFS_REFCLK), ufs_rd(UFS_MPHY), ufs_rd(UFS_STALL));
 		return fail("command status", (ocs << 16) | resp);
 	}
 	return true;
@@ -446,7 +487,8 @@ ufs_read4k(uint8_t lun, uint64_t lba, uint32_t blocks)
 
 /* one READ10 with the ladder behind it: plainly again if the command merely failed, then the
  * link woken and the list rebuilt (a link left hibernated by the loader looks exactly like a
- * dead one), then the controller from cold */
+ * dead one), then hibernation in and out with the link started warm (the rung the cold reset
+ * cannot replace, for it loses the mphy setup the preloader left), then the controller from cold */
 static bool
 ufs_read4k_retry(uint8_t lun, uint64_t lba, uint32_t blocks)
 {
@@ -466,9 +508,16 @@ ufs_read4k_retry(uint8_t lun, uint64_t lba, uint32_t blocks)
 		}
 	}
 	emmc_errors++;
-	printf("ufs: %s (%#x); waking the link and rebuilding the list\n", emmc_failed, emmc_failed_status);
-	(void)ufs_uic(UFS_UIC_HIBER_EXIT, 0, "waking the link");
+	printf("ufs: %s (%#x); waking the link and rebuilding the list (sm %u)\n", emmc_failed, emmc_failed_status, ufs_sm());
+	(void)ufs_uic(UFS_UIC_HIBER_EXIT, 0, 0, "waking the link");
 	if (ufs_list() && ufs_read4k(lun, lba, blocks)) {
+		return true;
+	}
+	printf("ufs: hibernation in and out, then the link started warm\n");
+	(void)ufs_uic(UFS_UIC_HIBER_ENTER, 0, 0, "entering hibernation");
+	(void)ufs_uic(UFS_UIC_HIBER_EXIT, 0, 0, "leaving hibernation");
+	if (ufs_uic(UFS_UIC_LINK_STARTUP, 0, 0, "starting the link warm") && (ufs_rd(UFS_HCS) & UFS_HCS_DP) &&
+	    ufs_list() && ufs_read4k(lun, lba, blocks)) {
 		return true;
 	}
 	printf("ufs: resetting the controller\n");
@@ -511,6 +560,7 @@ static bool
 ufs_start(void)
 {
 	vm_offset_t at = 0;
+	uint32_t savepower = 0, dbgclk = 0;
 
 	if (kmem_alloc_contig(kernel_map, &at, PAGE_SIZE, 0, 0, 0, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) !=
 	    KERN_SUCCESS) {
@@ -551,6 +601,15 @@ ufs_start(void)
 			return false;
 		}
 	}
+	/* Linux's pre-link recipe, run warm (ufs2: AHIT was already 0, yet the death at the first
+	 * ~4 ms idle was the same, so the killer hides in the unipro's own power saving): the
+	 * low-power mode off, the clock gates and the deep stall out, the TX clock held on */
+	(void)ufs_dme_get(UFS_VS_SAVEPOWER, &savepower, "reading SAVEPOWERCONTROL");
+	(void)ufs_dme_get(UFS_VS_DBGCLK, &dbgclk, "reading DEBUGCLOCKENABLE");
+	printf("ufs: unipro: savepower %#x, dbgclk %#x, sm %u; clearing every gate and stall\n", savepower, dbgclk, ufs_sm());
+	(void)ufs_dme_set(UFS_VS_UNIPRO_PD, 0, "clearing the unipro low-power mode");
+	(void)ufs_dme_set(UFS_VS_SAVEPOWER, savepower & ~0x4du, "clearing the clock gates and the deep stall");
+	(void)ufs_dme_set(UFS_VS_DBGCLK, dbgclk | 0x20u, "forcing the TX symbol clock on");
 	/* the link LK left may be hibernated: the read below says so, and the ladder wakes it */
 	/* one read of LUN 0 (a boot LUN, small but alive) says the link answers */
 	if (!ufs_read4k_retry(0, 0, 1)) {
