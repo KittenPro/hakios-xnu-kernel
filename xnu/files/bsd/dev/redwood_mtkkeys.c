@@ -1,7 +1,9 @@
 /*
  * The buttons of the Infinix Hot 20 (X6826B), as a source of button presses for
  * /dev/redwood-touch (sys/redwood_input.h). Only with boot-arg buttons=2: every address below
- * belongs to this phone; buttons=1 is the other phone's, in redwood_buttons.c.
+ * belongs to this phone; buttons=1 is the other phone's, in redwood_buttons.c; buttons=3 is
+ * the Redmi Note 10S's, rosemary_keys_thread below -- the same keypad controller at the same
+ * place, all three of its keys on the matrix, so no PMIC read at all.
  *
  * Android's own device tree says where they are (the kp@10010000 node):
  *   volume up    the SoC's keypad controller, key 0 of its map ("kpd-hw-init-map" 0x73)
@@ -346,16 +348,75 @@ keys_thread(__unused void *parameter, __unused wait_result_t result)
 	}
 }
 
+/* ---- the Redmi Note 10S's buttons (boot-arg buttons=3) ------------------------------------------- */
+
+/*
+ * The same keypad controller as the Infinix's, at the same address (kp@10010000 of
+ * mt6785.dts), the same polarity (a bit of KP_MEM1..5 clear while the key is down, the hw
+ * keycode (i << 4) + j of KP_MEM(i+1)'s bit j -- Linux kpd.c), and every key of this phone on
+ * the matrix (rosemary's cust.dtsi): kpd-hw-init-map's key 0 is volume down, kpd-hw-pwrkey 8
+ * is power, kpd-hw-rstkey 17 is volume up. KP_MEM1 and KP_MEM2 are two halves of one 32-bit
+ * word, so one read carries all three: bits 0, 8 and 17.
+ */
+#define KEY_VOLDN_BIT  (1u << 0)    /* KP_MEM1 bit 0, hw key 0 */
+#define KEY_POWER_BIT  (1u << 8)    /* KP_MEM1 bit 8, hw key 8 */
+#define KEY_VOLUP_BIT  (1u << 17)   /* KP_MEM2 bit 1, hw key 17: the word's upper half */
+
+static struct key rosemary_keys[3] = {
+	{ "volume down", REDWOOD_BUTTON_VOLUME_DOWN, false, false },
+	{ "power", REDWOOD_BUTTON_LOCK, false, false },
+	{ "volume up", REDWOOD_BUTTON_VOLUME_UP, false, false },
+};
+
+static void
+rosemary_keys_thread(__unused void *parameter, __unused wait_result_t result)
+{
+	uint32_t log = 0, presses = 0;
+
+	PE_parse_boot_argn("keylog", &log, sizeof(log));
+	kpd = ml_io_map(KPD_PHYS, 0x1000);
+	printf("mtkkeys: the buttons are looked at every 20 ms; keypad %#x (mem1 %#x, mem2 %#x)\n",
+	    rd(kpd, KP_MEM1), rd(kpd, KP_MEM1) & 0xffffu, rd(kpd, KP_MEM1) >> 16);
+
+	for (unsigned tick = 1;; tick++) {
+		uint32_t both = rd(kpd, KP_MEM1);
+		bool now[3];
+
+		now[0] = !(both & KEY_VOLDN_BIT);
+		now[1] = !(both & KEY_POWER_BIT);
+		now[2] = !(both & KEY_VOLUP_BIT);
+		for (unsigned i = 0; i < 3; i++) {
+			struct key *k = &rosemary_keys[i];
+
+			/* the same twice in a row, or it is a bounce */
+			if (now[i] == k->seen && now[i] != k->down) {
+				k->down = now[i];
+				redwood_touch_post(k->down ? REDWOOD_BUTTON_DOWN : REDWOOD_BUTTON_UP, k->button, 0, 0);
+				presses += k->down;
+				if (log) {
+					printf("mtkkeys: %s %s (keypad %#x)\n", k->name, k->down ? "down" : "up", both);
+				}
+			}
+			k->seen = now[i];
+		}
+		if (tick % 3000 == 0) {
+			printf("mtkkeys: so far %u presses; keypad %#x\n", presses, both);
+		}
+		delay(20000);
+	}
+}
+
 void
 redwood_mtkkeys_init(void)
 {
 	uint32_t which = 0;
 	thread_t thread;
 
-	if (!PE_parse_boot_argn("buttons", &which, sizeof(which)) || which != 2) {
+	/* 2 is the Infinix's, 3 is the Redmi Note 10S's; 1 is in redwood_buttons.c. */
+	if (!PE_parse_boot_argn("buttons", &which, sizeof(which)) || (which != 2 && which != 3)) {
 		return;
 	}
-	if (kernel_thread_start(keys_thread, NULL, &thread) == KERN_SUCCESS) {
+	if (kernel_thread_start(which == 3 ? rosemary_keys_thread : keys_thread, NULL, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);
 	} else {
 		printf("mtkkeys: cannot start the thread that reads the buttons\n");
