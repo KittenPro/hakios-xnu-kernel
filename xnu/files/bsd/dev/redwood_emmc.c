@@ -30,6 +30,7 @@
 #include <kern/clock.h>
 #include <kern/kalloc.h>
 #include <kern/locks.h>
+#include <kern/thread_call.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <mach/vm_param.h>
@@ -249,9 +250,11 @@ read_blocks(uint64_t lba, uint32_t blocks, uint32_t *dst)
 #define UFS_HCS_UCRDY     (1u << 3)
 #define UFS_UIC_DME_GET    0x01           /* a MIB read: the value comes back in ARG3 */
 #define UFS_UIC_DME_SET    0x02           /* a MIB write: the value rides in ARG3 */
+#define UFS_UIC_DME_PEER_GET 0x03         /* the same, answered by the device across the line */
 #define UFS_UIC_LINK_STARTUP 0x16
 #define UFS_UIC_HIBER_ENTER  0x17
 #define UFS_UIC_HIBER_EXIT   0x18
+#define UFS_PA_PWRMODE    0x1571          /* unipro: the link's current gear and power -- a read nothing minds */
 #define UFS_VS_DBGCLK      0xd0a1         /* unipro: bit 5 forces the TX symbol clock request on */
 #define UFS_VS_SAVEPOWER   0xd0a6         /* unipro: bits 0/2/3 gate the RX/SYS/TX clocks, bit 6 is the deep stall */
 #define UFS_VS_UNIPRO_PD   0xd0a8         /* unipro: nonzero is its low-power mode */
@@ -272,6 +275,8 @@ static uint64_t ufs_desc_pa, ufs_bounce_pa;
 static bool ufs_stuck;                       /* the doorbell never cleared: the list needs rebuilding */
 static bool ufs_answered;                    /* the device answered, even to refuse: the link is fine */
 static bool ufs_attention;                   /* the device answered "I was reset, ask again": a unit attention */
+static thread_call_t ufs_keep_call;          /* the millisecond keepalive: the line shall not idle */
+static volatile bool ufs_recovering;         /* the ladder is walking: the keepalive stands aside */
 
 static inline uint32_t
 ufs_rd(uint32_t reg)
@@ -349,6 +354,33 @@ static bool
 ufs_dme_set(uint32_t attr, uint32_t val, const char *what)
 {
 	return ufs_uic(UFS_UIC_DME_SET, attr << 16, val, what);
+}
+
+static bool
+ufs_dme_peer_get(uint32_t attr, uint32_t *val, const char *what)
+{
+	if (!ufs_uic(UFS_UIC_DME_PEER_GET, attr << 16, 0, what)) {
+		return false;
+	}
+	*val = ufs_rd(UFS_UIC_ARG3);
+	return true;
+}
+
+/* the millisecond keepalive: the line dies at ~4 ms of idle (ufs3: a line reset at the PHY
+ * adapter) and nothing brings it back whole (ufs5, ufs6: a cold start buys one answered
+ * command, then silence), so it never idles -- a peer attribute read every millisecond is a
+ * UIC round trip that crosses the line and shares nothing with the read path's page */
+static void
+ufs_keepalive(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+{
+	uint64_t deadline;
+	uint32_t mode = 0;
+
+	if (ufs_on && !ufs_recovering) {
+		(void)ufs_dme_peer_get(UFS_PA_PWRMODE, &mode, "keepalive");
+	}
+	clock_interval_to_deadline(1, NSEC_PER_MSEC, &deadline);
+	thread_call_enter_delayed(ufs_keep_call, deadline);
 }
 
 /* the link's own state machine, through MediaTek's window: 1 is idle, 8 through 0xd are the
@@ -498,7 +530,7 @@ ufs_read4k(uint8_t lun, uint64_t lba, uint32_t blocks)
  * rebuilt, then the link started warm, then the controller from cold -- whose link startup
  * fails here (IS 0x4) yet whose reads still reach the device, so it is tried, not trusted */
 static bool
-ufs_read4k_retry(uint8_t lun, uint64_t lba, uint32_t blocks)
+ufs_read4k_ladder(uint8_t lun, uint64_t lba, uint32_t blocks)
 {
 	if (ufs_read4k(lun, lba, blocks)) {
 		return true;
@@ -554,6 +586,19 @@ ufs_read4k_retry(uint8_t lun, uint64_t lba, uint32_t blocks)
 		(void)ufs_list();                /* a swallowed command: the list rebuilt, the next one tried */
 	}
 	return false;
+}
+
+/* the ladder behind the keepalive's back: while it walks, the keepalive stands aside, for the
+ * rungs are all UIC commands and the UIC engine serves one at a time */
+static bool
+ufs_read4k_retry(uint8_t lun, uint64_t lba, uint32_t blocks)
+{
+	bool ok;
+
+	ufs_recovering = true;
+	ok = ufs_read4k_ladder(lun, lba, blocks);
+	ufs_recovering = false;
+	return ok;
 }
 
 /* the caller's 512-byte blocks out of the LUN's 4096-byte ones: each piece is read whole into
@@ -651,6 +696,14 @@ ufs_start(void)
 	}
 	ufs_on = true;
 	printf("ufs: the transport is up\n");
+	ufs_keep_call = thread_call_allocate((thread_call_func_t)ufs_keepalive, NULL);
+	if (ufs_keep_call) {
+		uint64_t deadline;
+
+		clock_interval_to_deadline(1, NSEC_PER_MSEC, &deadline);
+		thread_call_enter_delayed(ufs_keep_call, deadline);
+		printf("ufs: a keepalive every millisecond: the line shall not idle\n");
+	}
 	return true;
 }
 
