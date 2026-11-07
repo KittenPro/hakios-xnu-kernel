@@ -25,7 +25,8 @@
  * drivers/scsi/ufs; none of that code is used.
  *
  * Read only, by construction: the strategy routine refuses writes and opening for writing is
- * refused. One request at a time, under a mutex, in pieces of EMMC_MAX_BLOCKS.
+ * refused. Reads queue deep: thirty-one slots of the transport's own, as many commands in
+ * flight at once as there are askers of the pager, in pieces of a slot's UFS_SLOT_BLOCKS.
  */
 #include <kern/clock.h>
 #include <kern/kalloc.h>
@@ -210,9 +211,20 @@ read_blocks(uint64_t lba, uint32_t blocks, uint32_t *dst)
 
 /* ---- the UFS transport (rosemary: see the note in the file's head) ----
  *
- * One command at a time, slot 0, polled: nothing in XNU serves this controller's interrupts,
- * so IE stays zero throughout and a command is finished when its doorbell bit clears -- the IS
- * is read only to say what went wrong. */
+ * ufs19 takes the upstream tree's own driver for its model: a transfer list of this kernel's
+ * own with room for thirty-two commands at once.  A demand-paged boot is many askers of one
+ * page each, so the reads take slots 1..31 as they are free, many in flight together -- and
+ * the line that dies at ~4 ms of idle (ufs3: a line reset at the PHY adapter) never sees an
+ * idle while a page is being read: the queue is the keepalive.  Slot 0 is the keepalive's
+ * own: while nothing else is in flight it reads one block of LUN 0 every millisecond, as
+ * ufs1-18 always did, but in a slot and a descriptor of its own, sharing nothing with the
+ * reads.  A waiter spins forty microseconds, then sleeps; one poller thread watches every
+ * sleeping waiter's doorbell bits (nothing in XNU serves this controller's interrupts, so IE
+ * stays zero throughout and a command is finished when its doorbell bit clears -- the IS is
+ * read only to say what went wrong).  Nothing fights the controller on a command's failure
+ * any more: the read is simply tried again over whatever stands, and the ladder (HIBERN8_EXIT
+ * with the list rebuilt; the controller from cold as the last rung) is walked once per
+ * episode under the recovery lock, while other askers wait the episode out and try again. */
 
 #define UFS_PHYS          0x11270000u    /* as lk-mt6765's ufs_aio has it */
 #define UFS_CAP           0x00
@@ -257,28 +269,54 @@ read_blocks(uint64_t lba, uint32_t blocks, uint32_t *dst)
 #define UFS_VS_SAVEPOWER   0xd0a6         /* unipro: bits 0/2/3 gate the RX/SYS/TX clocks, bit 6 is the deep stall */
 #define UFS_VS_UNIPRO_PD   0xd0a8         /* unipro: nonzero is its low-power mode */
 
-/* one page of descriptors: the UTRD at its start (the list base wants 1 KB), the command
- * descriptor a kilobyte in -- its command UPIU, its response, and one PRD entry, for the
- * bounce is one physical piece and one entry covers any read */
+/* an area of this kernel's own: the thirty-two UTRDs at its start (the list base wants
+ * 1 KB), every slot's command descriptor a kilobyte in -- its command UPIU, its response,
+ * and one PRD entry, for a slot's data is one physical piece and one entry covers any read */
+#define UFS_SLOTS         32u
 #define UFS_UCD_OFF       0x400
-#define UFS_CMD_OFF       (UFS_UCD_OFF + 0)
-#define UFS_RSP_OFF       (UFS_UCD_OFF + 512)
-#define UFS_PRD_OFF       (UFS_UCD_OFF + 1024)
+#define UFS_UCD_SIZE      2048u
+#define UFS_CMD_OFF       0              /* within a slot's command descriptor */
+#define UFS_RSP_OFF       512
+#define UFS_PRD_OFF       1024
+#define UFS_AREA_SIZE     (UFS_UCD_OFF + UFS_SLOTS * UFS_UCD_SIZE)
+#define UFS_SLOT_BLOCKS   64u            /* a read slot's data: 256 KB of 4 KB blocks, one READ10 */
+#define UFS_SPIN_US       40u            /* a waiter spins this long, then sleeps */
+#define UFS_TIMEOUT_US    10000000u      /* ten seconds: the slot's command is given up for lost */
+
+/* what a command came to */
+#define UFS_OK       0                        /* the data is in the slot's buffer */
+#define UFS_REFUSED  1                        /* the device answered, and refused the command */
+#define UFS_SILENT   2                        /* no answer: the transport failed */
+
+struct ufs_slot {
+	uint32_t number;                     /* in the list; 0 is the keepalive's, 1..31 the reads' */
+	volatile uint32_t *utrd;             /* its descriptor and its command descriptor: this */
+	volatile uint32_t *ucd;              /* kernel's memory, kept clean for the controller by hand */
+	uint64_t ucd_pa;
+	uint8_t *data;                       /* its own landing place: slot 0 one block, a read's 256 KB */
+	uint64_t data_pa;
+};
 
 static vm_offset_t ufs;
 static bool ufs_on;                          /* reads go through the transport */
 static uint8_t ufs_lun;                      /* the LUN the partition was found on */
-static vm_offset_t ufs_desc, ufs_bounce;     /* that page, and EMMC_MAX_BLOCKS * 512 to read through */
-static uint64_t ufs_desc_pa, ufs_bounce_pa;
-static vm_offset_t ufs_keep;                 /* the keepalive's own window: its reads clobber no one's data */
-static uint64_t ufs_keep_pa;
-static bool ufs_stuck;                       /* the doorbell never cleared: the list needs rebuilding */
+static vm_offset_t ufs_area;                 /* the UTRDs and the command descriptors */
+static uint64_t ufs_area_pa;
+static struct ufs_slot ufs_slots[UFS_SLOTS];
+static uint32_t ufs_free_bits;               /* the reads' slots 1..31 that are free (ufs_slot_lock) */
+static uint32_t ufs_in_flight, ufs_most_in_flight;
+static volatile uint32_t ufs_waiting, ufs_done_bits;   /* the poller's (ufs_slot_lock) */
+static bool ufs_poller_asleep;
 static bool ufs_answered;                    /* the device answered, even to refuse: the link is fine */
 static bool ufs_attention;                   /* the device answered "I was reset, ask again": a unit attention */
-static volatile bool ufs_recovering;         /* the ladder is walking: the keepalive stands aside */
+static volatile bool ufs_recovering;         /* an episode is walking: the keepalive stands aside */
 static uint64_t ufs_quick_fail_last;           /* the keepalive complains of a failure at most once a second */
+static uint64_t ufs_reads, ufs_read_bytes_total, ufs_errors;
+static uint64_t ufs_keepalives, ufs_keepalive_fails, ufs_episodes, ufs_cold_starts;
+static uint64_t ufs_last_cold;               /* mach_absolute_time of the last cold start: not two an hour */
 static LCK_GRP_DECLARE(ufs_lck_grp, "redwood-ufs");
-static LCK_SPIN_DECLARE(ufs_lock, &ufs_lck_grp);   /* the one page of descriptors serves one reader at a time */
+static LCK_MTX_DECLARE(ufs_slot_lock, &ufs_lck_grp);      /* the slots and their bits */
+static LCK_MTX_DECLARE(ufs_recover_lock, &ufs_lck_grp);   /* one episode at a time */
 
 static inline uint32_t
 ufs_rd(uint32_t reg)
@@ -358,12 +396,16 @@ ufs_dme_set(uint32_t attr, uint32_t val, const char *what)
 	return ufs_uic(UFS_UIC_DME_SET, attr << 16, val, what);
 }
 
-static bool ufs_read4k_t(uint8_t lun, uint64_t lba, uint32_t blocks, bool quick);
+static bool ufs_fill(struct ufs_slot *slot, uint8_t lun, uint64_t lba, uint32_t blocks);
+static bool ufs_ring(struct ufs_slot *slot, bool episode);
+static bool ufs_await(struct ufs_slot *slot, uint64_t deadline, bool quick);
+static int ufs_status(struct ufs_slot *slot, bool quick);
 
-/* at most one keepalive complaint a second: it fires every millisecond, and a dead line would
- * fill the log a thousand times over before the ladder even starts */
+/* at most one ufs complaint a second: under the storm a thousand commands fail a second,
+ * and ufs18 lost its hour's whole middle to the log of it -- the counters keep the entire
+ * story for the sysctl, the log keeps one line a second */
 static bool
-ufs_quick_fail_ok(void)
+ufs_log_ok(void)
 {
 	uint64_t now = mach_absolute_time(), ns = 0;
 
@@ -379,14 +421,17 @@ ufs_quick_fail_ok(void)
  * adapter) and nothing brings it back whole (ufs5, ufs6: a cold start buys one answered
  * command, then silence) -- a DME peer read every millisecond did not stop it (ufs7: the
  * killer does not count UIC traffic), so this sends a real READ10 over the line, one block
- * of a boot LUN under the read path's own lock.  A thread of its own -- and the wait between
- * reads a true spin on the time counter: ufs8's callout muted itself over its own transient
- * refusals, ufs9's starved for six whole seconds while the failing exec walked its quiet
- * path, and ufs10's thread fared no better, for delay() is not busy: it sleeps (xnu's
- * clock.c parks the thread with timer leeway), and ufs10's slept straight through the
- * launchd fight -- six seconds without one complaint while the controller held no device
- * at all (HCS 0x8), waking only to find the device freshly reset.  A spinning thread asks
- * no scheduler when the line is worth keeping */
+ * of a boot LUN.  It owns slot 0 outright -- its own descriptor, its own buffer, no lock
+ * shared with the reads -- and rings only when no episode walks and the queue itself is
+ * not keeping the line busy: with reads in flight the queue is the keepalive, and this
+ * thread is what holds the line through the true idles between them.  A thread of its own
+ * -- and the wait between reads a true spin on the time counter: ufs8's callout muted
+ * itself over its own transient refusals, ufs9's starved for six whole seconds while the
+ * failing exec walked its quiet path, and ufs10's thread fared no better, for delay() is
+ * not busy: it sleeps (xnu's clock.c parks the thread with timer leeway), and ufs10's
+ * slept straight through the launchd fight -- six seconds without one complaint while the
+ * controller held no device at all (HCS 0x8), waking only to find the device freshly
+ * reset.  A spinning thread asks no scheduler when the line is worth keeping */
 static void
 ufs_keepalive_thread(__unused void *parameter, __unused wait_result_t result)
 {
@@ -395,9 +440,17 @@ ufs_keepalive_thread(__unused void *parameter, __unused wait_result_t result)
 	clock_interval_to_absolutetime_interval(1, NSEC_PER_MSEC, &period);
 	for (;;) {
 		uint64_t until = mach_absolute_time() + period;
+		uint64_t deadline;
 
-		if (ufs_on && !ufs_recovering) {
-			(void)ufs_read4k_t(0, 0, 1, true);
+		if (ufs_on && !ufs_recovering && (ufs_rd(UFS_UTRLDBR) & ~1u) == 0) {
+			/* the reads' slots all quiet: the line is this thread's to hold */
+			clock_interval_to_absolutetime_interval(2000, NSEC_PER_USEC, &deadline);
+			deadline += mach_absolute_time();
+			ufs_keepalives++;
+			if (!ufs_fill(&ufs_slots[0], 0, 0, 1) || !ufs_ring(&ufs_slots[0], false) ||
+			    !ufs_await(&ufs_slots[0], deadline, true) || ufs_status(&ufs_slots[0], true) != UFS_OK) {
+				ufs_keepalive_fails++;
+			}
 		}
 		while (mach_absolute_time() < until) {
 			/* a true spin: no sleep, no leeway, no scheduler; one core buys the line */
@@ -423,8 +476,8 @@ ufs_list(void)
 	for (uint32_t i = 0; i < 100000 && (ufs_rd(UFS_UTRLRSR) & 1); i++) {
 	}
 	ufs_wr(UFS_UTRLCLR, 0xffffffffu);        /* every doorbell bit: none is in use */
-	ufs_wr(UFS_UTRLBA_L, (uint32_t)ufs_desc_pa);
-	ufs_wr(UFS_UTRLBA_H, (uint32_t)(ufs_desc_pa >> 32));
+	ufs_wr(UFS_UTRLBA_L, (uint32_t)ufs_area_pa);
+	ufs_wr(UFS_UTRLBA_H, (uint32_t)(ufs_area_pa >> 32));
 	ufs_wr(UFS_UTRLRSR, 1);
 	for (uint32_t i = 0; i < 100000 && !(ufs_rd(UFS_HCS) & UFS_HCS_UTRLRDY); i++) {
 	}
@@ -468,39 +521,45 @@ ufs_reset(void)
 	return ufs_list();
 }
 
-/* one READ10, in the LUN's 4096-byte blocks: the UTRD and the UPIU are built where the page
- * has them, both in the byte order each is read in (the UTRD little endian, the UPIU big
- * endian, byte by byte); the page and the doorbell slot serve one reader at a time under the
- * lock, and the keepalive's quick mode reads a window of its own, polls on a shorter clock
- * and complains at most once a second, leaving the ladder's story alone */
-static bool
-ufs_read4k_t(uint8_t lun, uint64_t lba, uint32_t blocks, bool quick)
+/* what the controller wrote back is not IO-coherent either: its lines are dropped before
+ * they are read, or a stale line of ours would answer for it */
+static void
+ufs_inval(vm_offset_t address, vm_size_t size)
 {
-	uint64_t ucd_pa = ufs_desc_pa + UFS_UCD_OFF;
-	uint64_t data_pa = quick ? ufs_keep_pa : ufs_bounce_pa;
-	vm_offset_t data = quick ? ufs_keep : ufs_bounce;
-	uint32_t bytes = blocks * 4096;
-	uint32_t *d = (uint32_t *)ufs_desc;
-	uint32_t *p = (uint32_t *)(ufs_desc + UFS_PRD_OFF);
-	uint8_t *c = (uint8_t *)ufs_desc + UFS_CMD_OFF;
-	uint8_t *r = (uint8_t *)ufs_desc + UFS_RSP_OFF;
-	uint32_t is, ocs, resp, i;
+	for (vm_offset_t line = address; line < address + size; line += 64) {
+		__asm__ volatile ("dc ivac, %0" : : "r" (line));
+	}
+	__asm__ volatile ("dsb sy");
+}
 
-	if (blocks == 0 || blocks > EMMC_MAX_BLOCKS * 512 / 4096) {
+/* one READ10 built into a slot of its own: the UTRD and the UPIU in the byte order each is
+ * read in (the UTRD little endian, the UPIU big endian, byte by byte), the slot's buffer as
+ * the one PRD entry -- no other slot's descriptor or data is touched, so a fill needs no
+ * lock; the task tag is the slot's own number, and the controller's answer comes back to
+ * the slot that asked */
+static bool
+ufs_fill(struct ufs_slot *slot, uint8_t lun, uint64_t lba, uint32_t blocks)
+{
+	uint32_t bytes = blocks * 4096;
+	volatile uint32_t *d = slot->utrd;
+	uint32_t *p = (uint32_t *)(void *)((vm_offset_t)slot->ucd + UFS_PRD_OFF);
+	uint8_t *c = (uint8_t *)(void *)slot->ucd + UFS_CMD_OFF;
+
+	if (blocks == 0 || blocks > UFS_SLOT_BLOCKS) {
 		return fail("too many blocks", blocks);
 	}
-	lck_spin_lock(&ufs_lock);
-	bzero((void *)ufs_desc, UFS_PRD_OFF + 16);
+	bzero((void *)slot->utrd, 32);
+	bzero((void *)slot->ucd, UFS_PRD_OFF);
 	d[0] = 0x15000000u;                      /* device to host, the command-type bit the loader's driver sets, interrupt command */
 	d[2] = 0x0000000fu;                      /* OCS: invalid until the controller writes its zero */
-	d[4] = (uint32_t)ucd_pa;                 /* the command descriptor, both halves little endian */
-	d[5] = (uint32_t)(ucd_pa >> 32);
+	d[4] = (uint32_t)slot->ucd_pa;           /* the command descriptor, both halves little endian */
+	d[5] = (uint32_t)(slot->ucd_pa >> 32);
 	d[6] = (128u << 16) | 128u;              /* its response UPIU: 128 words long, at word 128 */
 	d[7] = (256u << 16) | 1u;                /* one PRD entry, at word 256 */
 	c[0] = 0x01;                             /* transaction: command */
 	c[1] = 0x40;                             /* flags: read */
 	c[2] = lun;
-	c[3] = 0;                                /* task tag 0, the slot the doorbell rings */
+	c[3] = (uint8_t)slot->number;            /* task tag: the slot's own number */
 	c[12] = (uint8_t)(bytes >> 24);          /* the data expected, big endian */
 	c[13] = (uint8_t)(bytes >> 16);
 	c[14] = (uint8_t)(bytes >> 8);
@@ -513,175 +572,377 @@ ufs_read4k_t(uint8_t lun, uint64_t lba, uint32_t blocks, bool quick)
 	c[21] = (uint8_t)lba;
 	c[23] = (uint8_t)(blocks >> 8);          /* how many blocks, big endian */
 	c[24] = (uint8_t)blocks;
-	p[0] = (uint32_t)data_pa;                /* where the data goes: one piece, so one entry */
-	p[1] = (uint32_t)(data_pa >> 32);
+	p[0] = (uint32_t)slot->data_pa;          /* where the data goes: one piece, so one entry */
+	p[1] = (uint32_t)(slot->data_pa >> 32);
 	p[3] = bytes - 1;                        /* PRD entries count one less, as they do */
 
-	ufs_clean(ufs_desc, UFS_PRD_OFF + 16);   /* what the controller reads */
-	ufs_clean(data, bytes);                  /* where it writes: no stale line of ours */
+	ufs_clean((vm_offset_t)slot->utrd, 32);  /* what the controller reads */
+	ufs_clean((vm_offset_t)slot->ucd, UFS_PRD_OFF + 16);
+	ufs_clean((vm_offset_t)slot->data, bytes);   /* where it writes: no stale line of ours */
+	return true;
+}
+
+/* the slot rung, under the slot lock -- for the lock is what an episode holds around its
+ * list rebuild, and a command rung against a list being stopped is swallowed: an episode's
+ * own commands (episode true) pass, everyone else's wait the episode out */
+static bool
+ufs_ring(struct ufs_slot *slot, bool episode)
+{
+	uint32_t is;
+
+	lck_mtx_lock(&ufs_slot_lock);
+	if (!episode && ufs_recovering) {
+		lck_mtx_unlock(&ufs_slot_lock);
+		return false;                    /* an episode owns the list: this command is not rung */
+	}
 	is = ufs_rd(UFS_IS);
 	if (is) {
 		ufs_wr(UFS_IS, is);
 	}
-	ufs_wr(UFS_UTRLDBR, 1);                  /* slot 0: run */
-	for (i = 0; i < (quick ? 2000000u : 20000000u); i++) {   /* the quick clock is the keepalive's own */
-		if (!(ufs_rd(UFS_UTRLDBR) & 1)) {
-			break;
-		}
-	}
-	if (ufs_rd(UFS_UTRLDBR) & 1) {
-		ufs_stuck = true;
-		ufs_answered = false;
-		if (quick && ufs_quick_fail_ok()) {
-			printf("ufs: the keepalive's read stuck (IS %#x, HCS %#x, UECPA %#x, sm %u)\n", ufs_rd(UFS_IS), ufs_rd(UFS_HCS),
-			    ufs_rd(UFS_UECPA), ufs_sm());
-		} else if (!quick) {
-			printf("ufs: LUN %u, %u blocks at %llu: the doorbell never cleared (IS %#x, MTK %#x)\n", lun, blocks, lba,
-			    ufs_rd(UFS_IS), ufs_rd(UFS_OCS_ERR));
-		}
-		lck_spin_unlock(&ufs_lock);
-		if (quick) {
-			return false;
-		}
-		return fail("doorbell stuck", ufs_rd(UFS_IS));
-	}
-	ufs_stuck = false;
-	ocs = d[2] & 0xf;
-	resp = (*(uint32_t *)(void *)(r + 4) >> 16) & 0xffff;    /* response and status, big endian where they sit */
-	ufs_answered = ocs == 0;                 /* the device took the command, even to refuse it */
-	ufs_attention = ufs_answered && r[36] == 6;  /* sense key 6: the device was reset and wants the command again */
-	if (ocs != 0 || resp != 0) {
-		if (quick && ufs_quick_fail_ok()) {
-			printf("ufs: the keepalive's read: OCS %u, response %#x, UECPA %#x, sm %u\n", ocs, resp, ufs_rd(UFS_UECPA), ufs_sm());
-		} else if (!quick) {
-			printf("ufs: LUN %u, %u blocks at %llu: OCS %u, response %#x, sense %#x %#x %#x, MTK %#x, HCS %#x, RSR %#x\n", lun, blocks, lba,
-			    ocs, resp, r[36], r[46], r[47], ufs_rd(UFS_OCS_ERR), ufs_rd(UFS_HCS), ufs_rd(UFS_UTRLRSR));
-			printf("ufs: the aftermath: IS %#x, UECPA %#x, UECDL %#x, UECN %#x, UECT %#x, sm %u, refclk %#x, mphy %#x, stall %#x\n",
-			    ufs_rd(UFS_IS), ufs_rd(UFS_UECPA), ufs_rd(UFS_UECDL), ufs_rd(UFS_UECN), ufs_rd(UFS_UECT), ufs_sm(),
-			    ufs_rd(UFS_REFCLK), ufs_rd(UFS_MPHY), ufs_rd(UFS_STALL));
-		}
-		lck_spin_unlock(&ufs_lock);
-		if (quick) {
-			return false;
-		}
-		return fail("command status", (ocs << 16) | resp);
-	}
-	lck_spin_unlock(&ufs_lock);
+	ufs_wr(UFS_UTRLDBR, 1u << slot->number);
+	lck_mtx_unlock(&ufs_slot_lock);
 	return true;
 }
 
-/* every read of the system's own: the same command, with the whole five seconds of patience */
+/* the wait: forty microseconds spun, then asleep with the poller watching the bit -- no
+ * core burned on a read that takes its milliseconds; the keepalone's quick wait spins it
+ * whole (sleeping waits starve: ufs8-10).  A command that outlives its deadline is aborted
+ * with the list-clear bit and its slot is free to take another */
 static bool
-ufs_read4k(uint8_t lun, uint64_t lba, uint32_t blocks)
+ufs_await(struct ufs_slot *slot, uint64_t deadline, bool quick)
 {
-	return ufs_read4k_t(lun, lba, blocks, false);
-}
+	const uint32_t bit = 1u << slot->number;
+	uint64_t spin_until, tick;
 
-/* one READ10 with the ladder behind it: plainly again if the command merely failed, or again
- * once at a unit attention (the device saying it was reset), then the link woken and the list
- * rebuilt, then the link started warm, then the controller from cold -- whose link startup
- * fails here (IS 0x4) yet whose reads still reach the device, so it is tried, not trusted */
-static bool
-ufs_read4k_ladder(uint8_t lun, uint64_t lba, uint32_t blocks)
-{
-	if (ufs_read4k(lun, lba, blocks)) {
-		return true;
-	}
-	if (ufs_attention) {                       /* the device was reset meanwhile: the answer is to ask again */
-		emmc_errors++;
-		if (ufs_read4k(lun, lba, blocks)) {
-			return true;
-		}
-	}
-	if (ufs_answered) {
-		return false;                       /* the link is fine: the device refused this command */
-	}
-	if (!ufs_stuck) {
-		emmc_errors++;
-		if (ufs_read4k(lun, lba, blocks)) {
-			return true;
-		}
-		if (ufs_answered) {
+	clock_interval_to_absolutetime_interval(UFS_SPIN_US, NSEC_PER_USEC, &spin_until);
+	spin_until += mach_absolute_time();
+	clock_interval_to_absolutetime_interval(1, NSEC_PER_MSEC, &tick);
+	while (ufs_rd(UFS_UTRLDBR) & bit) {
+		uint64_t now = mach_absolute_time();
+
+		if ((int64_t)(now - deadline) >= 0) {
+			ufs_wr(UFS_UTRLCLR, bit);    /* the slot's run bit cleared, the slot reusable */
 			return false;
 		}
-	}
-	emmc_errors++;
-	printf("ufs: %s (%#x); waking the link and rebuilding the list (sm %u)\n", emmc_failed, emmc_failed_status, ufs_sm());
-	(void)ufs_uic(UFS_UIC_HIBER_EXIT, 0, 0, "waking the link");
-	if (ufs_list() && ufs_read4k(lun, lba, blocks)) {
-		return true;
-	}
-	if (ufs_uic(UFS_UIC_LINK_STARTUP, 0, 0, "starting the link warm") && (ufs_rd(UFS_HCS) & UFS_HCS_DP) &&
-	    ufs_list() && ufs_read4k(lun, lba, blocks)) {
-		return true;
-	}
-	/* the controller from cold is the last rung: its startup may still fail and its reads
-	 * reach the device anyway -- the first may answer a unit attention (sense 6/29, "I
-	 * power-cycled, ask again"); a device awake and answering is also the one moment a warm
-	 * link startup may take, so it is tried there before the asking goes on */
-	printf("ufs: resetting the controller\n");
-	(void)ufs_reset();
-	for (uint32_t i = 0; i < 5; i++) {
-		if (ufs_read4k(lun, lba, blocks)) {
+		if (quick || (int64_t)(now - spin_until) < 0) {
+			continue;
+		}
+		lck_mtx_lock(&ufs_slot_lock);
+		if (!(ufs_rd(UFS_UTRLDBR) & bit)) {   /* done while the lock was taken */
+			lck_mtx_unlock(&ufs_slot_lock);
 			return true;
 		}
-		if (ufs_attention) {
-			(void)ufs_uic(UFS_UIC_LINK_STARTUP, 0, 0, "starting the link over the awake device");
-			(void)ufs_list();
-			if (ufs_read4k(lun, lba, blocks)) {
-				return true;
+		ufs_waiting |= bit;                    /* the poller watches the bit from here */
+		if (ufs_poller_asleep) {
+			wakeup((caddr_t)&ufs_waiting);
+		}
+		(void)lck_mtx_sleep_deadline(&ufs_slot_lock, LCK_SLEEP_DEFAULT, (event_t)&ufs_done_bits, THREAD_UNINT,
+		    now + tick);                       /* a millisecond at a time: a stray wake costs nothing */
+		ufs_done_bits &= ~bit;                 /* ours, taken; another waiter's bits stay */
+		lck_mtx_unlock(&ufs_slot_lock);
+	}
+	return true;
+}
+
+/* the command's answer read back: the OCS the controller wrote into the UTRD, the response
+ * and the sense the device wrote into its UPIU; one line a second at most, whatever the
+ * storm, for the counters keep the story */
+static int
+ufs_status(struct ufs_slot *slot, bool quick)
+{
+	volatile uint32_t *d = slot->utrd;
+	volatile uint8_t *r = (volatile uint8_t *)slot->ucd + UFS_RSP_OFF;
+	uint32_t ocs, resp;
+
+	ufs_inval((vm_offset_t)slot->utrd, 32);
+	ufs_inval((vm_offset_t)slot->ucd, UFS_PRD_OFF);
+	ocs = d[2] & 0xf;
+	resp = (*(volatile uint32_t *)(void *)(r + 4) >> 16) & 0xffff;   /* response and status, big endian where they sit */
+	if (ocs == 0 && resp == 0) {
+		return UFS_OK;
+	}
+	ufs_answered = ocs == 0;                 /* the device took the command, even to refuse it */
+	ufs_attention = ufs_answered && r[36] == 6;   /* sense key 6: the device was reset and wants the command again */
+	if (ufs_log_ok()) {
+		if (quick) {
+			printf("ufs: the keepalive's read: OCS %u, response %#x, sense %#x, IS %#x, HCS %#x, UECPA %#x, sm %u\n",
+			    ocs, resp, r[36], ufs_rd(UFS_IS), ufs_rd(UFS_HCS), ufs_rd(UFS_UECPA), ufs_sm());
+		} else {
+			printf("ufs: slot %u: OCS %u, response %#x, sense %#x %#x %#x, IS %#x, HCS %#x, RSR %#x, UECPA %#x, sm %u\n",
+			    slot->number, ocs, resp, r[36], r[46], r[47], ufs_rd(UFS_IS), ufs_rd(UFS_HCS), ufs_rd(UFS_UTRLRSR),
+			    ufs_rd(UFS_UECPA), ufs_sm());
+		}
+	}
+	return ocs == 0 ? UFS_REFUSED : UFS_SILENT;
+}
+
+/* the reads' slots: one taken from the free bits, one given back; slot 0 is never in them
+ * (the keepalive's own), so the engine and the keepalive never meet */
+static struct ufs_slot *
+ufs_slot_take(void)
+{
+	struct ufs_slot *slot = NULL;
+
+	lck_mtx_lock(&ufs_slot_lock);
+	if (ufs_free_bits != 0) {
+		uint32_t low = ufs_free_bits & (0u - ufs_free_bits);
+		uint32_t number = (uint32_t)__builtin_ctz(low);
+
+		ufs_free_bits &= ~low;
+		ufs_in_flight++;
+		if (ufs_in_flight > ufs_most_in_flight) {
+			ufs_most_in_flight = ufs_in_flight;
+		}
+		slot = &ufs_slots[number];
+	}
+	lck_mtx_unlock(&ufs_slot_lock);
+	return slot;
+}
+
+static void
+ufs_slot_give(struct ufs_slot *slot)
+{
+	lck_mtx_lock(&ufs_slot_lock);
+	ufs_free_bits |= 1u << slot->number;
+	if (ufs_in_flight > 0) {
+		ufs_in_flight--;
+	}
+	lck_mtx_unlock(&ufs_slot_lock);
+}
+
+/* the poller: one thread for every sleeping waiter -- it watches the doorbell bits of those
+ * who have spun their forty microseconds and sleep, wakes each as its bit clears, and
+ * otherwise parks itself a hundred milliseconds at a time (a waiter waking it by the flag) */
+static void
+ufs_poller_thread(__unused void *parameter, __unused wait_result_t result)
+{
+	uint64_t tick;
+
+	clock_interval_to_absolutetime_interval(100, NSEC_PER_MSEC, &tick);
+	for (;;) {
+		uint32_t waiting = ufs_waiting;
+
+		if (waiting != 0) {
+			uint32_t done = ~ufs_rd(UFS_UTRLDBR) & waiting;
+
+			if (done != 0) {
+				lck_mtx_lock(&ufs_slot_lock);
+				ufs_done_bits |= done;
+				ufs_waiting &= ~done;
+				lck_mtx_unlock(&ufs_slot_lock);
+				wakeup((caddr_t)&ufs_done_bits);
+			} else {
+				delay(100);              /* a hundred microseconds: waiters are waiting */
+			}
+			continue;
+		}
+		lck_mtx_lock(&ufs_slot_lock);
+		if (ufs_waiting == 0) {
+			ufs_poller_asleep = true;
+			(void)lck_mtx_sleep_deadline(&ufs_slot_lock, LCK_SLEEP_DEFAULT, (event_t)&ufs_waiting, THREAD_UNINT,
+			    mach_absolute_time() + tick);
+			ufs_poller_asleep = false;
+		}
+		lck_mtx_unlock(&ufs_slot_lock);
+	}
+}
+
+/* one read placed across every free slot: the pieces fill and ring together, and the
+ * collection waits each in turn -- this is the depth the line needs, for the pager asks one
+ * page of every thread of it, and thirty-one answers in flight is what keeps the ~4 ms death
+ * from ever seeing an idle.  `drop` bytes of the first piece and `take` bytes in all are
+ * what the caller wants of the read (its 512-byte blocks sit anywhere across the LUN's
+ * 4096-byte ones); the pieces' data is copied out of the slots as each is collected */
+static int
+ufs_read_once(uint8_t lun, uint64_t lba, uint32_t blocks, uint8_t *dst, uint32_t drop, uint32_t take, bool episode)
+{
+	struct ufs_slot *placed[UFS_SLOTS];
+	uint32_t counts[UFS_SLOTS], starts[UFS_SLOTS];
+	bool rung[UFS_SLOTS];
+	uint32_t placed_blocks = 0, copied = 0, want = take;
+	int rc = UFS_OK;
+
+	while (placed_blocks < blocks) {
+		uint32_t np = 0, i;
+
+		if (!episode && ufs_recovering) {
+			delay(100);                /* an episode walks: its owner retries, this asker waits */
+			continue;
+		}
+		while (placed_blocks < blocks && np < UFS_SLOTS) {
+			struct ufs_slot *slot = ufs_slot_take();
+
+			if (slot == NULL) {
+				break;             /* every read slot busy: what is placed is collected first */
+			}
+			counts[np] = blocks - placed_blocks;
+			if (counts[np] > UFS_SLOT_BLOCKS) {
+				counts[np] = UFS_SLOT_BLOCKS;
+			}
+			starts[np] = placed_blocks;
+			if (!ufs_fill(slot, lun, lba + placed_blocks, counts[np])) {
+				ufs_slot_give(slot);
+				return UFS_REFUSED;
+			}
+			placed[np] = slot;
+			placed_blocks += counts[np];
+			np++;
+		}
+		if (np == 0) {
+			delay(100);                /* nothing placed, nothing to collect: a hundred microseconds */
+			continue;
+		}
+		for (i = 0; i < np; i++) {
+			rung[i] = ufs_ring(placed[i], episode);
+		}
+		for (i = 0; i < np; i++) {
+			uint64_t deadline;
+			int st = UFS_SILENT;
+
+			clock_interval_to_absolutetime_interval(UFS_TIMEOUT_US, NSEC_PER_USEC, &deadline);
+			deadline += mach_absolute_time();
+			if (rung[i] && ufs_await(placed[i], deadline, false)) {
+				st = ufs_status(placed[i], false);
+			}                            /* not rung (an episode took the list), or its ten seconds ran out */
+			if (st == UFS_OK) {
+				uint32_t skip = starts[i] == 0 ? drop : 0;
+				uint32_t have = counts[i] * 4096 - skip;
+				uint32_t n = want < have ? want : have;
+
+				ufs_inval((vm_offset_t)placed[i]->data, (vm_size_t)counts[i] * 4096);
+				memcpy(dst + copied, placed[i]->data + skip, n);
+				copied += n;
+				want -= n;
+			} else if (rc == UFS_OK) {
+				rc = st;             /* the first failure is the read's own story */
+			}
+			ufs_slot_give(placed[i]);
+		}
+		if (rc != UFS_OK) {
+			return rc;               /* the whole read is the caller's to try over what stands */
+		}
+	}
+	return rc;
+}
+
+/* the episode, and the read that walks it: one episode at a time under the recovery lock,
+ * every other asker waiting it out (their reads are not rung while it walks).  The rungs
+ * are the old ladder's -- the link woken and the list rebuilt, the link started warm, and
+ * the controller from cold as the last rung of last resort, kept to one an hour, for
+ * ufs18's last half hour was thirty-six cold resets, one collapse every six seconds, each
+ * poisoning the line it meant to fix.  Nothing else fights the controller any more */
+static bool
+ufs_read_or_wait(uint8_t lun, uint64_t lba, uint32_t blocks, uint8_t *dst, uint32_t drop, uint32_t take)
+{
+	int rc = ufs_read_once(lun, lba, blocks, dst, drop, take, false);
+
+	if (rc == UFS_REFUSED) {
+		rc = ufs_read_once(lun, lba, blocks, dst, drop, take, false);   /* the device was reset meanwhile: ask again */
+		if (rc == UFS_REFUSED) {
+			return false;              /* the link is fine: the device refuses this command */
+		}
+	}
+	if (rc == UFS_OK) {
+		return true;
+	}
+	lck_mtx_lock(&ufs_recover_lock);
+	lck_mtx_lock(&ufs_slot_lock);
+	ufs_recovering = true;
+	lck_mtx_unlock(&ufs_slot_lock);
+	ufs_episodes++;
+	if (ufs_log_ok()) {
+		printf("ufs: episode %llu: the link went quiet (read at %llu); waking it\n", ufs_episodes, lba);
+	}
+	(void)ufs_uic(UFS_UIC_HIBER_EXIT, 0, 0, "waking the link");
+	rc = ufs_list() ? ufs_read_once(lun, lba, blocks, dst, drop, take, true) : UFS_SILENT;
+	if (rc == UFS_REFUSED) {
+		rc = ufs_read_once(lun, lba, blocks, dst, drop, take, true);
+	}
+	if (rc != UFS_OK && ufs_uic(UFS_UIC_LINK_STARTUP, 0, 0, "starting the link warm") && (ufs_rd(UFS_HCS) & UFS_HCS_DP)) {
+		rc = ufs_list() ? ufs_read_once(lun, lba, blocks, dst, drop, take, true) : UFS_SILENT;
+		if (rc == UFS_REFUSED) {
+			rc = ufs_read_once(lun, lba, blocks, dst, drop, take, true);
+		}
+	}
+	if (rc != UFS_OK) {
+		uint64_t now = mach_absolute_time(), ns = 0;
+
+		absolutetime_to_nanoseconds(now - ufs_last_cold, &ns);
+		if (ufs_last_cold == 0 || ns > (uint64_t)3600 * NSEC_PER_SEC) {
+			ufs_last_cold = now;
+			ufs_cold_starts++;
+			printf("ufs: episode %llu: the controller from cold (run %llu)\n", ufs_episodes, ufs_cold_starts);
+			(void)ufs_reset();
+			for (uint32_t i = 0; i < 5 && rc != UFS_OK; i++) {
+				rc = ufs_read_once(lun, lba, blocks, dst, drop, take, true);
+				if (rc == UFS_REFUSED) {
+					rc = ufs_read_once(lun, lba, blocks, dst, drop, take, true);
+				}
+				if (rc != UFS_OK && ufs_attention) {
+					(void)ufs_uic(UFS_UIC_LINK_STARTUP, 0, 0, "starting the link over the awake device");
+					(void)ufs_list();
+				}
 			}
 		}
-		if (ufs_answered) {
-			return false;               /* a plain refusal: the link is up, the command is wrong */
-		}
-		(void)ufs_list();                /* a swallowed command: the list rebuilt, the next one tried */
 	}
+	lck_mtx_lock(&ufs_slot_lock);
+	ufs_recovering = false;
+	lck_mtx_unlock(&ufs_slot_lock);
+	lck_mtx_unlock(&ufs_recover_lock);
+	if (rc == UFS_OK) {
+		return true;
+	}
+	ufs_errors++;
+	emmc_errors++;
 	return false;
 }
 
-/* the ladder behind the keepalive's back: while it walks, the keepalive stands aside, for the
- * rungs are all UIC commands and the UIC engine serves one at a time */
+/* the caller's 512-byte blocks out of any LUN's 4096-byte ones: each piece is read whole
+ * into its slots and the asked-for bytes copied out of them */
 static bool
-ufs_read4k_retry(uint8_t lun, uint64_t lba, uint32_t blocks)
+ufs_read_lun(uint8_t lun, uint64_t lba, uint32_t blocks, uint32_t *dst)
 {
-	bool ok;
+	uint8_t *out = (uint8_t *)dst;
 
-	ufs_recovering = true;
-	ok = ufs_read4k_ladder(lun, lba, blocks);
-	ufs_recovering = false;
-	return ok;
-}
-
-/* the caller's 512-byte blocks out of the LUN's 4096-byte ones: each piece is read whole into
- * the bounce and the asked-for bytes copied out of it */
-static bool
-ufs_read_512(uint8_t lun, uint64_t lba, uint32_t blocks, uint32_t *dst)
-{
-	while (blocks) {
+	while (blocks > 0) {
 		uint64_t at = lba >> 3;              /* the 4096-byte block these bytes start in */
 		uint32_t skip = (uint32_t)(lba & 7) * 512;
-		uint32_t n4k = (skip + blocks * 512 + 4095) / 4096;
-		uint32_t take = blocks * 512 < n4k * 4096 - skip ? blocks * 512 : n4k * 4096 - skip;
+		uint32_t need = blocks * 512;
+		uint32_t n4k = (skip + need + 4095) / 4096;
+		uint32_t take;
 
-		if (n4k > EMMC_MAX_BLOCKS * 512 / 4096) {
-			n4k = EMMC_MAX_BLOCKS * 512 / 4096;
-			take = n4k * 4096 - skip;
+		if (n4k > UFS_SLOT_BLOCKS) {
+			n4k = UFS_SLOT_BLOCKS;
 		}
-		if (!ufs_read4k_retry(lun, at, n4k)) {
+		take = need < n4k * 4096 - skip ? need : n4k * 4096 - skip;
+		if (!ufs_read_or_wait(lun, at, n4k, out, skip, take)) {
 			return false;
 		}
-		memcpy(dst, (void *)((uint8_t *)ufs_bounce + skip), take);
-		dst = (uint32_t *)(void *)((uint8_t *)dst + take);
+		ufs_reads++;
+		ufs_read_bytes_total += take;
+		out += take;
 		lba += take / 512;
 		blocks -= take / 512;
 	}
 	return true;
 }
 
+/* the system partition's own: the same, through the LUN it was found on */
+static bool
+ufs_read_bytes_r(uint64_t lba, uint32_t blocks, uint32_t *dst)
+{
+	bool ok = ufs_read_lun(ufs_lun, lba, blocks, dst);
+
+	if (ok) {
+		emmc_reads++;
+		emmc_read_blocks += blocks;
+	}
+	return ok;
+}
+
 /* brings the transport up: LK has left the controller and the link running, it read the boot
  * image through them moments before, so this only takes the interrupts off, points the
- * transfer list at this side's page and reads once; the reset is the fallback */
+ * transfer list at this side's area and reads once; the reset is the fallback */
 static bool
 ufs_start(void)
 {
@@ -689,21 +950,34 @@ ufs_start(void)
 	uint32_t savepower = 0, dbgclk = 0;
 	thread_t th;
 
-	if (kmem_alloc_contig(kernel_map, &at, PAGE_SIZE, 0, 0, 0, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) !=
-	    KERN_SUCCESS) {
-		printf("ufs: no page for the descriptors\n");
-		return false;
-	}
-	ufs_desc = at;
-	ufs_desc_pa = kvtophys(ufs_desc);
-	at = 0;
-	if (kmem_alloc_contig(kernel_map, &at, EMMC_MAX_BLOCKS * 512, 0, 0, 0, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
+	/* the transfer list of this kernel's own: thirty-two UTRDs at the start (the list base
+	 * wants 1 KB), every slot's command descriptor a kilobyte in -- and every slot its own
+	 * landing place, the keepalive's slot 0 one block, the reads' slots 256 KB apiece */
+	if (kmem_alloc_contig(kernel_map, &at, UFS_AREA_SIZE, 0, 0, 0, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
 	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
-		printf("ufs: no %u bytes in one piece for the reads\n", EMMC_MAX_BLOCKS * 512);
+		printf("ufs: no %u bytes for the transfer list\n", (uint32_t)UFS_AREA_SIZE);
 		return false;
 	}
-	ufs_bounce = at;
-	ufs_bounce_pa = kvtophys(ufs_bounce);
+	ufs_area = at;
+	ufs_area_pa = kvtophys(ufs_area);
+	for (uint32_t n = 0; n < UFS_SLOTS; n++) {
+		struct ufs_slot *slot = &ufs_slots[n];
+		vm_size_t bytes = n == 0 ? PAGE_SIZE : (vm_size_t)UFS_SLOT_BLOCKS * 4096;
+
+		slot->number = n;
+		slot->utrd = (volatile uint32_t *)(ufs_area + (uint64_t)n * 32);
+		slot->ucd = (volatile uint32_t *)(ufs_area + UFS_UCD_OFF + (uint64_t)n * UFS_UCD_SIZE);
+		slot->ucd_pa = ufs_area_pa + UFS_UCD_OFF + (uint64_t)n * UFS_UCD_SIZE;
+		at = 0;
+		if (kmem_alloc_contig(kernel_map, &at, bytes, 0, 0, 0, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
+		    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+			printf("ufs: no %u bytes in one piece for slot %u\n", (uint32_t)bytes, n);
+			return false;
+		}
+		slot->data = (uint8_t *)at;
+		slot->data_pa = kvtophys(at);
+	}
+	ufs_free_bits = 0xfffffffeu;              /* the reads' slots 1..31; slot 0 is the keepalive's own */
 	ufs = ml_io_map(UFS_PHYS, 0x3000);
 	if (ufs == 0) {
 		return false;
@@ -741,41 +1015,39 @@ ufs_start(void)
 	(void)ufs_dme_get(UFS_VS_SAVEPOWER, &savepower, "re-reading SAVEPOWERCONTROL");
 	(void)ufs_dme_get(UFS_VS_DBGCLK, &dbgclk, "re-reading DEBUGCLOCKENABLE");
 	printf("ufs: unipro now: savepower %#x, dbgclk %#x\n", savepower, dbgclk);
-	/* the keepalive thread starts before the very first read: ufs10's run died in the tail
-	 * of this very function (the SMC round trip and the page allocation were an idle the
-	 * line did not survive), the swallow that followed poisoned every later read, and no
-	 * ladder loaded launchd through it -- better one thread too early than one read too late */
-	at = 0;
-	if (kmem_alloc_contig(kernel_map, &at, PAGE_SIZE, 0, 0, 0, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
-	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
-		printf("ufs: no page for the keepalive: the line will idle\n");
+	/* the poller before the first sleeping waiter, the keepalive before the very first read
+	 * (ufs10's run died in the tail of this very function -- an idle the line did not
+	 * survive): better two threads too early than one read too late */
+	if (kernel_thread_start(ufs_poller_thread, NULL, &th) != KERN_SUCCESS) {
+		printf("ufs: no poller thread: the waiters would spin\n");
 		return false;
 	}
-	ufs_keep = at;
-	ufs_keep_pa = kvtophys(ufs_keep);
+	thread_deallocate(th);
 	if (kernel_thread_start(ufs_keepalive_thread, NULL, &th) != KERN_SUCCESS) {
 		printf("ufs: no keepalive thread: the line will idle\n");
 		return false;
 	}
 	thread_deallocate(th);
 	ufs_on = true;
-	/* one read of LUN 0 (a boot LUN, small but alive) says the link answers */
-	if (!ufs_read4k_retry(0, 0, 1)) {
+	/* one read of LUN 0 (a boot LUN, small but alive) says the link answers -- through the
+	 * whole of the new path: a slot of its own, a ring, the poller behind it, an episode if
+	 * it must; slot 1's buffer is the scratch, for the keepalive holds slot 0 */
+	if (!ufs_read_or_wait(0, 0, 1, ufs_slots[1].data, 0, 4096)) {
 		ufs_on = false;
 		printf("ufs: the first read failed; the transport is not up\n");
 		return false;
 	}
-	printf("ufs: the transport is up; a keepalive thread reads every millisecond\n");
+	printf("ufs: the transport is up: %u read slots of %u KB, a poller, a keepalive\n", UFS_SLOTS - 1,
+	    (uint32_t)(UFS_SLOT_BLOCKS * 4096 >> 10));
 	return true;
 }
 
-/* the same, tried again once after a failure (the controller cleared and the card told to stop) */
+/* the card's own path (the MSDC), tried again once after a failure (the controller cleared
+ * and the card told to stop) -- the UFS path needs none of this: its retries and its
+ * episodes are its own */
 static bool
 read_retrying(uint64_t lba, uint32_t blocks, uint32_t *dst)
 {
-	if (ufs_on) {
-		return ufs_read_512(ufs_lun, lba, blocks, dst);     /* its retries and its ladder are its own */
-	}
 	if (read_blocks(lba, blocks, dst)) {
 		return true;
 	}
@@ -784,6 +1056,13 @@ read_retrying(uint64_t lba, uint32_t blocks, uint32_t *dst)
 	pio_mode();
 	(void)stop();
 	return read_blocks(lba, blocks, dst);
+}
+
+/* whichever transport the system came up on */
+static bool
+read_root(uint64_t lba, uint32_t blocks, uint32_t *dst)
+{
+	return ufs_on ? ufs_read_bytes_r(lba, blocks, dst) : read_retrying(lba, blocks, dst);
 }
 
 /* ---- the partition ---- */
@@ -807,7 +1086,7 @@ find_partition(void)
 		uint32_t gpt512 = 0;
 
 		for (uint32_t gs = 512; gs <= 4096 && gpt512 == 0; gs *= 2) {
-			if ((ufs_on ? ufs_read_512(lun, gs / 512, 1, sector) : read_retrying(gs / 512, 1, sector)) &&
+			if ((ufs_on ? ufs_read_lun(lun, gs / 512, 1, sector) : read_retrying(gs / 512, 1, sector)) &&
 			    memcmp(s, "EFI PART", 8) == 0) {
 				gpt512 = gs / 512;
 			}
@@ -823,7 +1102,7 @@ find_partition(void)
 		memcpy(&count, s + 80, 4);
 		memcpy(&size, s + 84, 4);
 		if (count > 128 || size != 128 ||
-		    !(ufs_on ? ufs_read_512(lun, entries_lba * gpt512, count * size / 512, entries)
+		    !(ufs_on ? ufs_read_lun(lun, entries_lba * gpt512, count * size / 512, entries)
 		             : read_retrying(entries_lba * gpt512, count * size / 512, entries))) {
 			printf("emmc: the GPT's entries: %u of %u bytes\n", count, size);
 			return false;
@@ -866,7 +1145,7 @@ find_partition(void)
 		uint32_t bs;
 		uint64_t n;
 
-		if (!read_retrying(emmc_lba + at / 512, 1, sector) || sector[8] != 0x4253584eu) {   /* "NXSB" */
+		if (!read_root(emmc_lba + at / 512, 1, sector) || sector[8] != 0x4253584eu) {   /* "NXSB" */
 			break;
 		}
 		bs = sector[9];
@@ -920,34 +1199,61 @@ emmc_strategy(buf_t bp)
 	if (count > (emmc_blocks - block) * 512) {
 		count = (uint32_t)((emmc_blocks - block) * 512);
 	}
-	lck_mtx_lock(&emmc_lock);
-	while (done < count && error == 0) {
-		uint32_t blocks = (count - done) / 512;
+	if (ufs_on) {
+		/* no lock around the UFS path: its slots are its own, and the pager's askers --
+		 * many threads of one page each -- are exactly the depth the line needs; the
+		 * episode under the recovery lock is the only serialization a failure costs */
+		uint32_t blocks = count / 512;
 
-		if (blocks == 0 || ((uintptr_t)(data + done) & 3)) {
-			/* a part block, or a buffer not 4-aligned: one block at a time through the sector buffer */
-			uint32_t n = count - done < 512 ? count - done : 512;
+		if (blocks > 0 && !ufs_read_bytes_r(emmc_lba + block, blocks, (uint32_t *)(void *)data)) {
+			error = EIO;
+		} else {
+			done = blocks * 512;
+			if (done < count) {         /* a part block at the end: one whole sector read, its tail taken */
+				uint8_t *one = kalloc_data(512, Z_WAITOK);
 
-			if (!read_retrying(emmc_lba + block + done / 512, 1, sector)) {
+				if (one == NULL) {
+					error = ENOMEM;
+				} else if (ufs_read_bytes_r(emmc_lba + block + blocks, 1, (uint32_t *)(void *)one)) {
+					memcpy(data + done, one, count - done);
+					done = count;
+					kfree_data(one, 512);
+				} else {
+					kfree_data(one, 512);
+					error = EIO;
+				}
+			}
+		}
+	} else {
+		lck_mtx_lock(&emmc_lock);
+		while (done < count && error == 0) {
+			uint32_t blocks = (count - done) / 512;
+
+			if (blocks == 0 || ((uintptr_t)(data + done) & 3)) {
+				/* a part block, or a buffer not 4-aligned: one block at a time through the sector buffer */
+				uint32_t n = count - done < 512 ? count - done : 512;
+
+				if (!read_retrying(emmc_lba + block + done / 512, 1, sector)) {
+					error = EIO;
+					break;
+				}
+				memcpy(data + done, sector, n);
+				done += n;
+				continue;
+			}
+			if (blocks > EMMC_MAX_BLOCKS) {
+				blocks = EMMC_MAX_BLOCKS;
+			}
+			if (!read_retrying(emmc_lba + block + done / 512, blocks, (uint32_t *)(void *)(data + done))) {
 				error = EIO;
 				break;
 			}
-			memcpy(data + done, sector, n);
-			done += n;
-			continue;
+			emmc_reads++;
+			emmc_read_blocks += blocks;
+			done += blocks * 512;
 		}
-		if (blocks > EMMC_MAX_BLOCKS) {
-			blocks = EMMC_MAX_BLOCKS;
-		}
-		if (!read_retrying(emmc_lba + block + done / 512, blocks, (uint32_t *)(void *)(data + done))) {
-			error = EIO;
-			break;
-		}
-		emmc_reads++;
-		emmc_read_blocks += blocks;
-		done += blocks * 512;
+		lck_mtx_unlock(&emmc_lock);
 	}
-	lck_mtx_unlock(&emmc_lock);
 	buf_setresid(bp, buf_count(bp) - done);
 	if (error) {
 		printf("emmc: block %llu, %u bytes: %s (%#x)\n", block, count, emmc_failed, emmc_failed_status);
@@ -1044,7 +1350,7 @@ redwood_emmc_root(dev_t *root)
 	probe = kalloc_data(EMMC_MAX_BLOCKS * 512, Z_WAITOK);
 	if (probe != NULL) {
 		for (uint32_t at = 0; at < 4 * 2048 && at + EMMC_MAX_BLOCKS <= emmc_blocks; at += EMMC_MAX_BLOCKS) {
-			if (!read_retrying(emmc_lba + at, EMMC_MAX_BLOCKS, probe)) {
+			if (!read_root(emmc_lba + at, EMMC_MAX_BLOCKS, probe)) {
 				break;
 			}
 		}
@@ -1078,10 +1384,14 @@ static int
 emmc_sysctl SYSCTL_HANDLER_ARGS
 {
 #pragma unused(oidp, arg1, arg2)
-	char line[160];
+	char line[320];
 
-	snprintf(line, sizeof(line), "emmc: %llu reads, %llu MB, %llu errors%s%s", emmc_reads, emmc_read_blocks >> 11,
-	    emmc_errors, emmc_failed ? "; last: " : "", emmc_failed ? emmc_failed : "");
+	snprintf(line, sizeof(line),
+	    "emmc: %llu reads, %llu MB, %llu errors%s%s; ufs: %llu MB in %llu commands, %u most in flight, "
+	    "%llu keepalives (%llu failed), %llu episodes, %llu cold starts",
+	    emmc_reads, emmc_read_blocks >> 11, emmc_errors, emmc_failed ? "; last: " : "",
+	    emmc_failed ? emmc_failed : "", ufs_read_bytes_total >> 20, ufs_reads, ufs_most_in_flight,
+	    ufs_keepalives, ufs_keepalive_fails, ufs_episodes, ufs_cold_starts);
 	return SYSCTL_OUT(req, line, strlen(line) + 1);
 }
 
