@@ -14,6 +14,16 @@
  * mode, plain block reads (CMD17, or CMD18 then CMD12). Registers as Linux's
  * drivers/mmc/host/mtk-sd.c has them.
  *
+ * rosemary's storage is not on the MSDC at all: it is a UFS 2.2 device behind the host controller
+ * at 0x11270000 (Linux drives it as ufshcd-mtk, its three LUNs are sda, sdb and the 119 GiB sdc
+ * whose GPT was carved), and every command to the MSDC times out there. When no card is found on
+ * the MSDC, the UFS transport below takes over instead: LK has brought the controller and the link
+ * up to read the boot image and left them running, so this code only points the transfer list at
+ * its own descriptors and rings the doorbell -- a host reset with a DME_LINK_STARTUP is the
+ * fallback. The register addresses and the command sequences were read out of lk-mt6765's ufs_aio
+ * driver (lk/platform/common/storage/ufs/, as LK runs it on this family of SoCs) and Linux's
+ * drivers/scsi/ufs; none of that code is used.
+ *
  * Read only, by construction: the strategy routine refuses writes and opening for writing is
  * refused. One request at a time, under a mutex, in pieces of EMMC_MAX_BLOCKS.
  */
@@ -22,6 +32,7 @@
 #include <kern/locks.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
+#include <mach/vm_param.h>
 #include <miscfs/devfs/devfs.h>
 #include <pexpert/pexpert.h>
 #include <sys/buf.h>
@@ -32,8 +43,11 @@
 #include <sys/redwood_emmc.h>
 #include <sys/sysctl.h>
 #include <sys/systm.h>
+#include <vm/vm_kern.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+extern uint64_t kvtophys(vm_offset_t va);    /* as redwood_mali.c declares it */
+extern void delay(int usec);                 /* as redwood_connsys.c declares it */
 
 #define MSDC0_PHYS       0x11230000u
 #define EMMC_PART        "xnusys"
@@ -193,10 +207,356 @@ read_blocks(uint64_t lba, uint32_t blocks, uint32_t *dst)
 	return blocks == 1 || stop();
 }
 
+/* ---- the UFS transport (rosemary: see the note in the file's head) ----
+ *
+ * One command at a time, slot 0, polled: nothing in XNU serves this controller's interrupts,
+ * so IE stays zero throughout and a command is finished when its doorbell bit clears -- the IS
+ * is read only to say what went wrong. */
+
+#define UFS_PHYS          0x11270000u    /* as lk-mt6765's ufs_aio has it */
+#define UFS_CAP           0x00
+#define UFS_VER           0x08
+#define UFS_IS            0x20           /* write one to clear */
+#define UFS_IE            0x24
+#define UFS_HCS           0x30           /* DP 1, UTRLRDY 2, UCRDY 8 */
+#define UFS_HCE           0x34
+#define UFS_UTRLBA_L      0x50
+#define UFS_UTRLBA_H      0x54
+#define UFS_UTRLDBR       0x58           /* a bit rings its slot; it clears when the command is done */
+#define UFS_UTRLCLR       0x5c
+#define UFS_UTRLRSR       0x60
+#define UFS_UIC_CMD       0x90
+#define UFS_UIC_ARG1      0x94
+#define UFS_UIC_ARG2      0x98           /* a DME command's result: its low byte */
+#define UFS_UIC_ARG3      0x9c
+#define UFS_OCS_ERR       0x2244         /* MediaTek's own: what the last command died of */
+
+#define UFS_IS_UTRCS      (1u << 0)
+#define UFS_IS_UICERR     (1u << 2)
+#define UFS_IS_UICCOMPL   (1u << 10)
+#define UFS_HCS_DP        (1u << 0)
+#define UFS_HCS_UTRLRDY   (1u << 1)
+#define UFS_HCS_UCRDY     (1u << 3)
+#define UFS_UIC_LINK_STARTUP 0x16
+#define UFS_UIC_HIBER_EXIT   0x18
+
+/* one page of descriptors: the UTRD at its start (the list base wants 1 KB), the command
+ * descriptor a kilobyte in -- its command UPIU, its response, and one PRD entry, for the
+ * bounce is one physical piece and one entry covers any read */
+#define UFS_UCD_OFF       0x400
+#define UFS_CMD_OFF       (UFS_UCD_OFF + 0)
+#define UFS_RSP_OFF       (UFS_UCD_OFF + 512)
+#define UFS_PRD_OFF       (UFS_UCD_OFF + 1024)
+
+static vm_offset_t ufs;
+static bool ufs_on;                          /* reads go through the transport */
+static uint8_t ufs_lun;                      /* the LUN the partition was found on */
+static vm_offset_t ufs_desc, ufs_bounce;     /* that page, and EMMC_MAX_BLOCKS * 512 to read through */
+static uint64_t ufs_desc_pa, ufs_bounce_pa;
+static bool ufs_stuck;                       /* the doorbell never cleared: the list needs rebuilding */
+static bool ufs_answered;                    /* the device answered, even to refuse: the link is fine */
+
+static inline uint32_t
+ufs_rd(uint32_t reg)
+{
+	return *(volatile uint32_t *)(ufs + reg);
+}
+
+static inline void
+ufs_wr(uint32_t reg, uint32_t value)
+{
+	*(volatile uint32_t *)(ufs + reg) = value;
+}
+
+/* the path to the controller is not IO-coherent: as redwood_lx.c does for its radio memory,
+ * what the controller is to read is written out, and what it is to write is dropped first */
+static void
+ufs_clean(vm_offset_t address, vm_size_t size)
+{
+	for (vm_offset_t line = address; line < address + size; line += 64) {
+		__asm__ volatile ("dc civac, %0" : : "r" (line));
+	}
+	__asm__ volatile ("dsb sy");
+}
+
+/* one DME command, polled like the rest */
+static bool
+ufs_uic(uint32_t opcode, uint32_t arg1, const char *what)
+{
+	uint32_t is = 0, i;
+
+	for (i = 0; i < 100000 && !(ufs_rd(UFS_HCS) & UFS_HCS_UCRDY); i++) {
+	}
+	if (!(ufs_rd(UFS_HCS) & UFS_HCS_UCRDY)) {
+		return fail(what, ufs_rd(UFS_HCS));
+	}
+	is = ufs_rd(UFS_IS);
+	if (is) {
+		ufs_wr(UFS_IS, is);                  /* write one to clear */
+	}
+	ufs_wr(UFS_UIC_ARG1, arg1);
+	ufs_wr(UFS_UIC_ARG2, 0);
+	ufs_wr(UFS_UIC_ARG3, 0);
+	ufs_wr(UFS_UIC_CMD, opcode & 0xff);
+	for (i = 0; i < 20000000; i++) {
+		is = ufs_rd(UFS_IS);
+		if (is) {
+			ufs_wr(UFS_IS, is);
+		}
+		if (is & (UFS_IS_UICCOMPL | UFS_IS_UICERR)) {
+			break;
+		}
+	}
+	if (!(is & (UFS_IS_UICCOMPL | UFS_IS_UICERR))) {
+		return fail(what, is);
+	}
+	if ((is & UFS_IS_UICERR) || (ufs_rd(UFS_UIC_ARG2) & 0xff) != 0) {
+		printf("ufs: %s: IS %#x, result %#x\n", what, is, ufs_rd(UFS_UIC_ARG2) & 0xff);
+		return fail(what, ufs_rd(UFS_UIC_ARG2));
+	}
+	return true;
+}
+
+/* the transfer list pointed at this side's page (the loader's descriptors may be anywhere by
+ * now): base addresses are only to be written while the list is stopped */
+static bool
+ufs_list(void)
+{
+	ufs_wr(UFS_UTRLRSR, 0);
+	for (uint32_t i = 0; i < 100000 && (ufs_rd(UFS_UTRLRSR) & 1); i++) {
+	}
+	ufs_wr(UFS_UTRLCLR, 0xffffffffu);        /* every doorbell bit: none is in use */
+	ufs_wr(UFS_UTRLBA_L, (uint32_t)ufs_desc_pa);
+	ufs_wr(UFS_UTRLBA_H, (uint32_t)(ufs_desc_pa >> 32));
+	ufs_wr(UFS_UTRLRSR, 1);
+	for (uint32_t i = 0; i < 100000 && !(ufs_rd(UFS_HCS) & UFS_HCS_UTRLRDY); i++) {
+	}
+	if (!(ufs_rd(UFS_HCS) & UFS_HCS_UTRLRDY)) {
+		return fail("transfer list", ufs_rd(UFS_HCS));
+	}
+	return true;
+}
+
+/* the fallback: the controller from cold, as the loader brings it up -- HCE off and on, the
+ * link started again with a DME command -- then the list */
+static bool
+ufs_reset(void)
+{
+	ufs_wr(UFS_HCE, 0);
+	for (uint32_t i = 0; i < 2000000 && (ufs_rd(UFS_HCE) & 1); i++) {
+	}
+	delay(5000);
+	ufs_wr(UFS_HCE, 1);
+	for (uint32_t i = 0; i < 20000000 && !(ufs_rd(UFS_HCE) & 1); i++) {
+	}
+	ufs_wr(UFS_IE, 0);                       /* again: nothing in XNU would serve it */
+	if (!(ufs_rd(UFS_HCE) & 1)) {
+		printf("ufs: the controller would not enable (HCE %#x)\n", ufs_rd(UFS_HCE));
+		return fail("controller enable", ufs_rd(UFS_HCE));
+	}
+	if (!ufs_uic(UFS_UIC_LINK_STARTUP, 0, "link startup")) {
+		return false;
+	}
+	if (!(ufs_rd(UFS_HCS) & UFS_HCS_DP)) {
+		printf("ufs: no device after the startup (HCS %#x)\n", ufs_rd(UFS_HCS));
+		return fail("no device", ufs_rd(UFS_HCS));
+	}
+	return ufs_list();
+}
+
+/* one READ10, in the LUN's 4096-byte blocks, into the bounce: the UTRD and the UPIU are built
+ * where the page has them, both in the byte order each is read in (the UTRD little endian, the
+ * UPIU big endian, byte by byte) */
+static bool
+ufs_read4k(uint8_t lun, uint64_t lba, uint32_t blocks)
+{
+	uint64_t ucd_pa = ufs_desc_pa + UFS_UCD_OFF;
+	uint32_t bytes = blocks * 4096;
+	uint32_t *d = (uint32_t *)ufs_desc;
+	uint32_t *p = (uint32_t *)(ufs_desc + UFS_PRD_OFF);
+	uint8_t *c = (uint8_t *)ufs_desc + UFS_CMD_OFF;
+	uint8_t *r = (uint8_t *)ufs_desc + UFS_RSP_OFF;
+	uint32_t is, ocs, resp, i;
+
+	if (blocks == 0 || blocks > EMMC_MAX_BLOCKS * 512 / 4096) {
+		return fail("too many blocks", blocks);
+	}
+	bzero((void *)ufs_desc, UFS_PRD_OFF + 16);
+	d[0] = 0x15000000u;                      /* device to host, the command-type bit the loader's driver sets, interrupt command */
+	d[2] = 0x0000000fu;                      /* OCS: invalid until the controller writes its zero */
+	d[4] = (uint32_t)ucd_pa;                 /* the command descriptor, both halves little endian */
+	d[5] = (uint32_t)(ucd_pa >> 32);
+	d[6] = (128u << 16) | 128u;              /* its response UPIU: 128 words long, at word 128 */
+	d[7] = (256u << 16) | 1u;                /* one PRD entry, at word 256 */
+	c[0] = 0x01;                             /* transaction: command */
+	c[1] = 0x40;                             /* flags: read */
+	c[2] = lun;
+	c[3] = 0;                                /* task tag 0, the slot the doorbell rings */
+	c[12] = (uint8_t)(bytes >> 24);          /* the data expected, big endian */
+	c[13] = (uint8_t)(bytes >> 16);
+	c[14] = (uint8_t)(bytes >> 8);
+	c[15] = (uint8_t)bytes;
+	c[16] = 0x28;                            /* READ10 */
+	c[17] = 0x08;                            /* FUA, as the loader's driver reads */
+	c[18] = (uint8_t)(lba >> 24);            /* the block, big endian */
+	c[19] = (uint8_t)(lba >> 16);
+	c[20] = (uint8_t)(lba >> 8);
+	c[21] = (uint8_t)lba;
+	c[23] = (uint8_t)(blocks >> 8);          /* how many blocks, big endian */
+	c[24] = (uint8_t)blocks;
+	p[0] = (uint32_t)ufs_bounce_pa;          /* where the data goes: one piece, so one entry */
+	p[1] = (uint32_t)(ufs_bounce_pa >> 32);
+	p[3] = bytes - 1;                        /* PRD entries count one less, as they do */
+
+	ufs_clean(ufs_desc, UFS_PRD_OFF + 16);   /* what the controller reads */
+	ufs_clean(ufs_bounce, bytes);            /* where it writes: no stale line of ours */
+	is = ufs_rd(UFS_IS);
+	if (is) {
+		ufs_wr(UFS_IS, is);
+	}
+	ufs_wr(UFS_UTRLDBR, 1);                  /* slot 0: run */
+	for (i = 0; i < 20000000; i++) {         /* the loader's driver gives a command five seconds */
+		if (!(ufs_rd(UFS_UTRLDBR) & 1)) {
+			break;
+		}
+	}
+	if (ufs_rd(UFS_UTRLDBR) & 1) {
+		ufs_stuck = true;
+		ufs_answered = false;
+		printf("ufs: LUN %u, %u blocks at %llu: the doorbell never cleared (IS %#x, MTK %#x)\n", lun, blocks, lba,
+		    ufs_rd(UFS_IS), ufs_rd(UFS_OCS_ERR));
+		return fail("doorbell stuck", ufs_rd(UFS_IS));
+	}
+	ufs_stuck = false;
+	ocs = d[2] & 0xf;
+	resp = (*(uint32_t *)(void *)(r + 4) >> 16) & 0xffff;    /* response and status, big endian where they sit */
+	ufs_answered = ocs == 0;                 /* the device took the command, even to refuse it */
+	if (ocs != 0 || resp != 0) {
+		printf("ufs: LUN %u, %u blocks at %llu: OCS %u, response %#x, sense %#x %#x %#x, MTK %#x\n", lun, blocks, lba,
+		    ocs, resp, r[36], r[46], r[47], ufs_rd(UFS_OCS_ERR));
+		return fail("command status", (ocs << 16) | resp);
+	}
+	return true;
+}
+
+/* one READ10 with the ladder behind it: plainly again if the command merely failed, then the
+ * link woken and the list rebuilt (a link left hibernated by the loader looks exactly like a
+ * dead one), then the controller from cold */
+static bool
+ufs_read4k_retry(uint8_t lun, uint64_t lba, uint32_t blocks)
+{
+	if (ufs_read4k(lun, lba, blocks)) {
+		return true;
+	}
+	if (ufs_answered) {
+		return false;                       /* the link is fine: the device refused this command */
+	}
+	if (!ufs_stuck) {
+		emmc_errors++;
+		if (ufs_read4k(lun, lba, blocks)) {
+			return true;
+		}
+		if (ufs_answered) {
+			return false;
+		}
+	}
+	emmc_errors++;
+	printf("ufs: %s (%#x); waking the link and rebuilding the list\n", emmc_failed, emmc_failed_status);
+	(void)ufs_uic(UFS_UIC_HIBER_EXIT, 0, "waking the link");
+	if (ufs_list() && ufs_read4k(lun, lba, blocks)) {
+		return true;
+	}
+	printf("ufs: resetting the controller\n");
+	if (ufs_reset() && ufs_read4k(lun, lba, blocks)) {
+		return true;
+	}
+	return false;
+}
+
+/* the caller's 512-byte blocks out of the LUN's 4096-byte ones: each piece is read whole into
+ * the bounce and the asked-for bytes copied out of it */
+static bool
+ufs_read_512(uint8_t lun, uint64_t lba, uint32_t blocks, uint32_t *dst)
+{
+	while (blocks) {
+		uint64_t at = lba >> 3;              /* the 4096-byte block these bytes start in */
+		uint32_t skip = (uint32_t)(lba & 7) * 512;
+		uint32_t n4k = (skip + blocks * 512 + 4095) / 4096;
+		uint32_t take = blocks * 512 < n4k * 4096 - skip ? blocks * 512 : n4k * 4096 - skip;
+
+		if (n4k > EMMC_MAX_BLOCKS * 512 / 4096) {
+			n4k = EMMC_MAX_BLOCKS * 512 / 4096;
+			take = n4k * 4096 - skip;
+		}
+		if (!ufs_read4k_retry(lun, at, n4k)) {
+			return false;
+		}
+		memcpy(dst, (void *)((uint8_t *)ufs_bounce + skip), take);
+		dst = (uint32_t *)(void *)((uint8_t *)dst + take);
+		lba += take / 512;
+		blocks -= take / 512;
+	}
+	return true;
+}
+
+/* brings the transport up: LK has left the controller and the link running, it read the boot
+ * image through them moments before, so this only takes the interrupts off, points the
+ * transfer list at this side's page and reads once; the reset is the fallback */
+static bool
+ufs_start(void)
+{
+	vm_offset_t at = 0;
+
+	if (kmem_alloc_contig(kernel_map, &at, PAGE_SIZE, 0, 0, 0, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) !=
+	    KERN_SUCCESS) {
+		printf("ufs: no page for the descriptors\n");
+		return false;
+	}
+	ufs_desc = at;
+	ufs_desc_pa = kvtophys(ufs_desc);
+	at = 0;
+	if (kmem_alloc_contig(kernel_map, &at, EMMC_MAX_BLOCKS * 512, 0, 0, 0, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
+	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+		printf("ufs: no %u bytes in one piece for the reads\n", EMMC_MAX_BLOCKS * 512);
+		return false;
+	}
+	ufs_bounce = at;
+	ufs_bounce_pa = kvtophys(ufs_bounce);
+	ufs = ml_io_map(UFS_PHYS, 0x3000);
+	if (ufs == 0) {
+		return false;
+	}
+	printf("ufs: HCE %#x, HCS %#x, CAP %#x, VER %#x\n", ufs_rd(UFS_HCE), ufs_rd(UFS_HCS), ufs_rd(UFS_CAP), ufs_rd(UFS_VER));
+	ufs_wr(UFS_IE, 0);
+	if ((ufs_rd(UFS_HCE) & 1) == 0) {
+		printf("ufs: the controller is off; bringing it up from cold\n");
+		if (!ufs_reset()) {
+			return false;
+		}
+	} else if (!ufs_list()) {
+		printf("ufs: the list would not come up; resetting\n");
+		if (!ufs_reset()) {
+			return false;
+		}
+	}
+	/* the link LK left may be hibernated: the read below says so, and the ladder wakes it */
+	/* one read of LUN 0 (a boot LUN, small but alive) says the link answers */
+	if (!ufs_read4k_retry(0, 0, 1)) {
+		printf("ufs: the first read failed; the transport is not up\n");
+		return false;
+	}
+	ufs_on = true;
+	printf("ufs: the transport is up\n");
+	return true;
+}
+
 /* the same, tried again once after a failure (the controller cleared and the card told to stop) */
 static bool
 read_retrying(uint64_t lba, uint32_t blocks, uint32_t *dst)
 {
+	if (ufs_on) {
+		return ufs_read_512(ufs_lun, lba, blocks, dst);     /* its retries and its ladder are its own */
+	}
 	if (read_blocks(lba, blocks, dst)) {
 		return true;
 	}
@@ -220,46 +580,66 @@ find_partition(void)
 	uint32_t count, size;
 
 	/* The GPT is laid out on the card's own sectors: 512 bytes on the X6826B, 4096 on rosemary
-	 * (its header sits at byte 4096, the entry array at 8192). Both cards answer reads in
-	 * 512-byte blocks, so a GPT sector is gpt512 of them and every LBA below comes in those. */
-	uint32_t gpt512 = 0;
-	for (uint32_t gs = 512; gs <= 4096 && gpt512 == 0; gs *= 2) {
-		if (read_retrying(gs / 512, 1, sector) && memcmp(s, "EFI PART", 8) == 0) {
-			gpt512 = gs / 512;
-		}
-	}
-	if (gpt512 == 0) {
-		printf("emmc: no GPT (%s)\n", emmc_failed ? emmc_failed : "no signature");
-		return false;
-	}
-	memcpy(&entries_lba, s + 72, 8);
-	memcpy(&count, s + 80, 4);
-	memcpy(&size, s + 84, 4);
-	if (count > 128 || size != 128 || !read_retrying(entries_lba * gpt512, count * size / 512, entries)) {
-		printf("emmc: the GPT's entries: %u of %u bytes\n", count, size);
-		return false;
-	}
-	for (uint32_t i = 0; i < count; i++) {
-		const uint8_t *e = (const uint8_t *)entries + i * size;
-		size_t k;
-		uint64_t first, last;
+	 * (its header sits at byte 4096, the entry array at 8192). Both answer reads in 512-byte
+	 * blocks, so a GPT sector is gpt512 of them and every LBA below comes in those.
+	 * rosemary's boot LUNs have GPTs of their own, without the partition: each LUN is read
+	 * until one has it, quietly -- only the last failure speaks on the card. */
+	for (uint8_t lun = 0; lun < (ufs_on ? 4 : 1); lun++) {
+		uint32_t gpt512 = 0;
 
-		for (k = 0; EMMC_PART[k] && e[56 + 2 * k] == (uint8_t)EMMC_PART[k] && e[57 + 2 * k] == 0; k++) {
+		for (uint32_t gs = 512; gs <= 4096 && gpt512 == 0; gs *= 2) {
+			if ((ufs_on ? ufs_read_512(lun, gs / 512, 1, sector) : read_retrying(gs / 512, 1, sector)) &&
+			    memcmp(s, "EFI PART", 8) == 0) {
+				gpt512 = gs / 512;
+			}
 		}
-		if (EMMC_PART[k] != 0 || e[56 + 2 * k] != 0 || e[57 + 2 * k] != 0) {
-			continue;
+		if (gpt512 == 0) {
+			if (!ufs_on) {
+				printf("emmc: no GPT (%s)\n", emmc_failed ? emmc_failed : "no signature");
+				return false;
+			}
+			continue;                       /* a boot LUN's own GPT is elsewhere, or none: the next */
 		}
-		memcpy(&first, e + 32, 8);
-		memcpy(&last, e + 40, 8);
-		if (first == 0 || last < first) {
+		memcpy(&entries_lba, s + 72, 8);
+		memcpy(&count, s + 80, 4);
+		memcpy(&size, s + 84, 4);
+		if (count > 128 || size != 128 ||
+		    !(ufs_on ? ufs_read_512(lun, entries_lba * gpt512, count * size / 512, entries)
+		             : read_retrying(entries_lba * gpt512, count * size / 512, entries))) {
+			printf("emmc: the GPT's entries: %u of %u bytes\n", count, size);
 			return false;
 		}
-		emmc_lba = first * gpt512;
-		emmc_blocks = (last - first + 1) * gpt512;
-		break;
+		for (uint32_t i = 0; i < count; i++) {
+			const uint8_t *e = (const uint8_t *)entries + i * size;
+			size_t k;
+			uint64_t first, last;
+
+			for (k = 0; EMMC_PART[k] && e[56 + 2 * k] == (uint8_t)EMMC_PART[k] && e[57 + 2 * k] == 0; k++) {
+			}
+			if (EMMC_PART[k] != 0 || e[56 + 2 * k] != 0 || e[57 + 2 * k] != 0) {
+				continue;
+			}
+			memcpy(&first, e + 32, 8);
+			memcpy(&last, e + 40, 8);
+			if (first == 0 || last < first) {
+				return false;
+			}
+			emmc_lba = first * gpt512;
+			emmc_blocks = (last - first + 1) * gpt512;
+			ufs_lun = lun;                  /* on the card it stays zero, unused */
+			break;
+		}
+		if (emmc_lba != 0) {
+			break;
+		}
+		if (ufs_on) {
+			continue;                       /* this LUN's GPT has no xnusys: the next */
+		}
+		printf("emmc: no " EMMC_PART " partition\n");
+		return false;
 	}
 	if (emmc_lba == 0) {
-		printf("emmc: no " EMMC_PART " partition\n");
+		printf("emmc: no " EMMC_PART " partition%s\n", ufs_on ? " on any LUN" : "");
 		return false;
 	}
 	/* as long as its APFS containers, back to back, as the loader measured it for md0 */
@@ -435,7 +815,11 @@ redwood_emmc_root(dev_t *root)
 	}
 	msdc = ml_io_map(MSDC0_PHYS, 0x1000);
 	if (!find_partition()) {
-		return ENXIO;
+		/* no card answered, and on rosemary every MSDC command times out instead: its storage
+		 * is the UFS device behind the controller the loader left running */
+		if (!ufs_start() || !find_partition()) {
+			return ENXIO;
+		}
 	}
 	/* how fast: the first 4 MB, which the root's mount reads anyway */
 	probe = kalloc_data(EMMC_MAX_BLOCKS * 512, Z_WAITOK);
