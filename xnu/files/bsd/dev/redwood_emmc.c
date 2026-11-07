@@ -30,7 +30,7 @@
 #include <kern/clock.h>
 #include <kern/kalloc.h>
 #include <kern/locks.h>
-#include <kern/thread_call.h>
+#include <kern/thread.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <mach/vm_param.h>
@@ -277,7 +277,6 @@ static uint64_t ufs_keep_pa;
 static bool ufs_stuck;                       /* the doorbell never cleared: the list needs rebuilding */
 static bool ufs_answered;                    /* the device answered, even to refuse: the link is fine */
 static bool ufs_attention;                   /* the device answered "I was reset, ask again": a unit attention */
-static thread_call_t ufs_keep_call;          /* the millisecond keepalive: the line shall not idle */
 static volatile bool ufs_recovering;         /* the ladder is walking: the keepalive stands aside */
 static uint64_t ufs_quick_fail_last;           /* the keepalive complains of a failure at most once a second */
 static LCK_GRP_DECLARE(ufs_lck_grp, "redwood-ufs");
@@ -305,9 +304,14 @@ ufs_sip(uint64_t cmd, uint64_t val)
 	register uint64_t x0 __asm__("x0") = UFS_SIP_CTRL;
 	register uint64_t x1 __asm__("x1") = cmd;
 	register uint64_t x2 __asm__("x2") = val;
+	register uint64_t x3 __asm__("x3") = 0;    /* SMCCC fills the unpassed arguments with zeros; so here (ufs9: -2 with garbage in them) */
+	register uint64_t x4 __asm__("x4") = 0;
+	register uint64_t x5 __asm__("x5") = 0;
+	register uint64_t x6 __asm__("x6") = 0;
+	register uint64_t x7 __asm__("x7") = 0;
 
-	__asm__ volatile ("smc #0" : "+r" (x0), "+r" (x1), "+r" (x2)
-	    : : "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
+	__asm__ volatile ("smc #0" : "+r" (x0), "+r" (x1), "+r" (x2), "+r" (x3), "+r" (x4), "+r" (x5), "+r" (x6), "+r" (x7)
+	    : : "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
 	return (int32_t)x0;
 }
 
@@ -398,19 +402,21 @@ ufs_quick_fail_ok(void)
  * adapter) and nothing brings it back whole (ufs5, ufs6: a cold start buys one answered
  * command, then silence) -- a DME peer read every millisecond did not stop it (ufs7: the
  * killer does not count UIC traffic), so this sends a real READ10 over the line, one block
- * of a boot LUN under the read path's own lock, every millisecond without fail (ufs8: the
- * keepalive once muted itself over its own transient refusals -- five in a run, each healed
- * by the next ordinary read -- and the killer struck in the one window it left open) */
+ * of a boot LUN under the read path's own lock.  A thread of its own, busy-waiting between
+ * reads: ufs8's callout muted itself over its own transient refusals, and ufs9's starved for
+ * six whole seconds while the failing exec walked its quiet path -- the killer took the line
+ * in that silence, and yet the ladder kept resurrecting it (the run lived to 15 s, the device
+ * answering a unit attention at the end) -- so the asking never stops now, and no scheduler
+ * decides when the line is worth keeping */
 static void
-ufs_keepalive(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+ufs_keepalive_thread(__unused void *parameter, __unused wait_result_t result)
 {
-	uint64_t deadline;
-
-	if (ufs_on && !ufs_recovering) {
-		(void)ufs_read4k_t(0, 0, 1, true);
+	for (;;) {
+		if (ufs_on && !ufs_recovering) {
+			(void)ufs_read4k_t(0, 0, 1, true);
+		}
+		delay(1000);                   /* busy on purpose: the line never idles, whatever else idles */
 	}
-	clock_interval_to_deadline(1, NSEC_PER_MSEC, &deadline);
-	thread_call_enter_delayed(ufs_keep_call, deadline);
 }
 
 /* the link's own state machine, through MediaTek's window: 1 is idle, 8 through 0xd are the
@@ -696,6 +702,7 @@ ufs_start(void)
 {
 	vm_offset_t at = 0;
 	uint32_t savepower = 0, dbgclk = 0;
+	thread_t th;
 
 	if (kmem_alloc_contig(kernel_map, &at, PAGE_SIZE, 0, 0, 0, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) !=
 	    KERN_SUCCESS) {
@@ -763,13 +770,9 @@ ufs_start(void)
 	    VM_KERN_MEMORY_IOKIT) == KERN_SUCCESS) {
 		ufs_keep = at;
 		ufs_keep_pa = kvtophys(ufs_keep);
-		ufs_keep_call = thread_call_allocate((thread_call_func_t)ufs_keepalive, NULL);
-		if (ufs_keep_call) {
-			uint64_t deadline;
-
-			clock_interval_to_deadline(1, NSEC_PER_MSEC, &deadline);
-			thread_call_enter_delayed(ufs_keep_call, deadline);
-			printf("ufs: a keepalive read every millisecond: the line shall not idle\n");
+		if (kernel_thread_start(ufs_keepalive_thread, NULL, &th) == KERN_SUCCESS) {
+			thread_deallocate(th);
+			printf("ufs: a keepalive thread, a read every millisecond: the line shall not idle\n");
 		}
 	} else {
 		printf("ufs: no page for the keepalive: the line will idle\n");
