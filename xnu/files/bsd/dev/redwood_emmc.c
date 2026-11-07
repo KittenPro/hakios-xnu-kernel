@@ -271,7 +271,7 @@ static vm_offset_t ufs_desc, ufs_bounce;     /* that page, and EMMC_MAX_BLOCKS *
 static uint64_t ufs_desc_pa, ufs_bounce_pa;
 static bool ufs_stuck;                       /* the doorbell never cleared: the list needs rebuilding */
 static bool ufs_answered;                    /* the device answered, even to refuse: the link is fine */
-static bool ufs_parked;                      /* the link sits in hibernation between reads: never idle awake */
+static bool ufs_attention;                   /* the device answered "I was reset, ask again": a unit attention */
 
 static inline uint32_t
 ufs_rd(uint32_t reg)
@@ -358,17 +358,6 @@ ufs_sm(void)
 {
 	ufs_wr(UFS_DBG_SEL, 0x20);
 	return ufs_rd(UFS_PROBE) & 0x1f;
-}
-
-/* the link back into hibernation the moment a read is done: whatever fires at ~4 ms of idle
- * (ufs3: UECPA 0x80000010, a line reset, with every named power saving already off) must
- * never find the link awake and unattended */
-static void
-ufs_park(void)
-{
-	if (ufs_uic(UFS_UIC_HIBER_ENTER, 0, 0, "parking the link")) {
-		ufs_parked = true;
-	}
 }
 
 /* the transfer list pointed at this side's page (the loader's descriptors may be anywhere by
@@ -486,9 +475,7 @@ ufs_read4k(uint8_t lun, uint64_t lba, uint32_t blocks)
 	ocs = d[2] & 0xf;
 	resp = (*(uint32_t *)(void *)(r + 4) >> 16) & 0xffff;    /* response and status, big endian where they sit */
 	ufs_answered = ocs == 0;                 /* the device took the command, even to refuse it */
-	if (ufs_answered) {
-		ufs_park();                      /* straight back into hibernation: never idle, always parked */
-	}
+	ufs_attention = ufs_answered && r[36] == 6;  /* sense key 6: the device was reset and wants the command again */
 	if (ocs != 0 || resp != 0) {
 		printf("ufs: LUN %u, %u blocks at %llu: OCS %u, response %#x, sense %#x %#x %#x, MTK %#x, HCS %#x, RSR %#x\n", lun, blocks, lba,
 		    ocs, resp, r[36], r[46], r[47], ufs_rd(UFS_OCS_ERR), ufs_rd(UFS_HCS), ufs_rd(UFS_UTRLRSR));
@@ -500,21 +487,21 @@ ufs_read4k(uint8_t lun, uint64_t lba, uint32_t blocks)
 	return true;
 }
 
-/* one READ10 with the ladder behind it: plainly again if the command merely failed, then the
- * link woken and the list rebuilt (a link left hibernated by the loader looks exactly like a
- * dead one), then hibernation in and out with the link started warm (the rung the cold reset
- * cannot replace, for it loses the mphy setup the preloader left), then the controller from cold */
+/* one READ10 with the ladder behind it: plainly again if the command merely failed, or again
+ * once at a unit attention (the device saying it was reset), then the link woken and the list
+ * rebuilt, then the link started warm, then the controller from cold -- whose link startup
+ * fails here (IS 0x4) yet whose reads still reach the device, so it is tried, not trusted */
 static bool
 ufs_read4k_retry(uint8_t lun, uint64_t lba, uint32_t blocks)
 {
-	if (ufs_parked) {
-		ufs_parked = false;               /* woken or not, every rung of the ladder below stands ready */
-		if (!ufs_uic(UFS_UIC_HIBER_EXIT, 0, 0, "waking the parked link")) {
-			printf("ufs: the parked link would not wake (sm %u); the ladder starts\n", ufs_sm());
-		}
-	}
 	if (ufs_read4k(lun, lba, blocks)) {
 		return true;
+	}
+	if (ufs_attention) {                       /* the device was reset meanwhile: the answer is to ask again */
+		emmc_errors++;
+		if (ufs_read4k(lun, lba, blocks)) {
+			return true;
+		}
 	}
 	if (ufs_answered) {
 		return false;                       /* the link is fine: the device refused this command */
@@ -534,16 +521,27 @@ ufs_read4k_retry(uint8_t lun, uint64_t lba, uint32_t blocks)
 	if (ufs_list() && ufs_read4k(lun, lba, blocks)) {
 		return true;
 	}
-	printf("ufs: hibernation in and out, then the link started warm\n");
-	(void)ufs_uic(UFS_UIC_HIBER_ENTER, 0, 0, "entering hibernation");
-	(void)ufs_uic(UFS_UIC_HIBER_EXIT, 0, 0, "leaving hibernation");
 	if (ufs_uic(UFS_UIC_LINK_STARTUP, 0, 0, "starting the link warm") && (ufs_rd(UFS_HCS) & UFS_HCS_DP) &&
 	    ufs_list() && ufs_read4k(lun, lba, blocks)) {
 		return true;
 	}
+	/* hibernation itself is poison on this host (ufs4: an enter that no exit would undo), so
+	 * the last rung is the controller from cold: its link startup fails (IS 0x4), and still
+	 * the reads reach the device -- the first one may answer a unit attention (sense 6/29,
+	 * "I power-cycled, ask again"), which is the way back, so the asking goes on */
 	printf("ufs: resetting the controller\n");
-	if (ufs_reset() && ufs_read4k(lun, lba, blocks)) {
-		return true;
+	(void)ufs_reset();
+	for (uint32_t i = 0; i < 3; i++) {
+		if (ufs_read4k(lun, lba, blocks)) {
+			return true;
+		}
+		if (ufs_attention && ufs_read4k(lun, lba, blocks)) {
+			return true;
+		}
+		if (ufs_answered) {
+			return false;               /* a plain refusal: the link is up, the command is wrong */
+		}
+		(void)ufs_list();                /* a swallowed command: the list rebuilt, the next one tried */
 	}
 	return false;
 }
@@ -625,7 +623,7 @@ ufs_start(void)
 	/* Linux's pre-link recipe, run warm (ufs2: AHIT was already 0, yet the death at the first
 	 * ~4 ms idle was the same; ufs3 caught the death itself: UECPA 0x80000010, a line reset,
 	 * with the clock gates and the deep stall already off -- so SAVEPOWERCONTROL goes to zero
-	 * whole, its unnamed bits included, and every read parks the link in hibernation after) */
+	 * whole, its unnamed bits included) */
 	(void)ufs_dme_get(UFS_VS_SAVEPOWER, &savepower, "reading SAVEPOWERCONTROL");
 	(void)ufs_dme_get(UFS_VS_DBGCLK, &dbgclk, "reading DEBUGCLOCKENABLE");
 	printf("ufs: unipro: savepower %#x, dbgclk %#x, sm %u; clearing every gate and stall\n", savepower, dbgclk, ufs_sm());
@@ -634,7 +632,7 @@ ufs_start(void)
 	(void)ufs_dme_set(UFS_VS_DBGCLK, dbgclk | 0x20u, "forcing the TX symbol clock on");
 	(void)ufs_dme_get(UFS_VS_SAVEPOWER, &savepower, "re-reading SAVEPOWERCONTROL");
 	(void)ufs_dme_get(UFS_VS_DBGCLK, &dbgclk, "re-reading DEBUGCLOCKENABLE");
-	printf("ufs: unipro now: savepower %#x, dbgclk %#x; reads park the link between them\n", savepower, dbgclk);
+	printf("ufs: unipro now: savepower %#x, dbgclk %#x\n", savepower, dbgclk);
 	/* the link LK left may be hibernated: the read below says so, and the ladder wakes it */
 	/* one read of LUN 0 (a boot LUN, small but alive) says the link answers */
 	if (!ufs_read4k_retry(0, 0, 1)) {
