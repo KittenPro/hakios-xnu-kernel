@@ -402,20 +402,29 @@ ufs_quick_fail_ok(void)
  * adapter) and nothing brings it back whole (ufs5, ufs6: a cold start buys one answered
  * command, then silence) -- a DME peer read every millisecond did not stop it (ufs7: the
  * killer does not count UIC traffic), so this sends a real READ10 over the line, one block
- * of a boot LUN under the read path's own lock.  A thread of its own, busy-waiting between
- * reads: ufs8's callout muted itself over its own transient refusals, and ufs9's starved for
- * six whole seconds while the failing exec walked its quiet path -- the killer took the line
- * in that silence, and yet the ladder kept resurrecting it (the run lived to 15 s, the device
- * answering a unit attention at the end) -- so the asking never stops now, and no scheduler
- * decides when the line is worth keeping */
+ * of a boot LUN under the read path's own lock.  A thread of its own -- and the wait between
+ * reads a true spin on the time counter: ufs8's callout muted itself over its own transient
+ * refusals, ufs9's starved for six whole seconds while the failing exec walked its quiet
+ * path, and ufs10's thread fared no better, for delay() is not busy: it sleeps (xnu's
+ * clock.c parks the thread with timer leeway), and ufs10's slept straight through the
+ * launchd fight -- six seconds without one complaint while the controller held no device
+ * at all (HCS 0x8), waking only to find the device freshly reset.  A spinning thread asks
+ * no scheduler when the line is worth keeping */
 static void
 ufs_keepalive_thread(__unused void *parameter, __unused wait_result_t result)
 {
+	uint64_t period;
+
+	clock_interval_to_absolutetime_interval(1, NSEC_PER_MSEC, &period);
 	for (;;) {
+		uint64_t until = mach_absolute_time() + period;
+
 		if (ufs_on && !ufs_recovering) {
 			(void)ufs_read4k_t(0, 0, 1, true);
 		}
-		delay(1000);                   /* busy on purpose: the line never idles, whatever else idles */
+		while (mach_absolute_time() < until) {
+			/* a true spin: no sleep, no leeway, no scheduler; one core buys the line */
+		}
 	}
 }
 
@@ -756,27 +765,32 @@ ufs_start(void)
 	(void)ufs_dme_get(UFS_VS_SAVEPOWER, &savepower, "re-reading SAVEPOWERCONTROL");
 	(void)ufs_dme_get(UFS_VS_DBGCLK, &dbgclk, "re-reading DEBUGCLOCKENABLE");
 	printf("ufs: unipro now: savepower %#x, dbgclk %#x\n", savepower, dbgclk);
-	/* the link LK left may be hibernated: the read below says so, and the ladder wakes it */
+	/* the keepalive thread starts before the very first read: ufs10's run died in the tail
+	 * of this very function (the SMC round trip and the page allocation were an idle the
+	 * line did not survive), the swallow that followed poisoned every later read, and no
+	 * ladder loaded launchd through it -- better one thread too early than one read too late */
+	at = 0;
+	if (kmem_alloc_contig(kernel_map, &at, PAGE_SIZE, 0, 0, 0, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
+	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+		printf("ufs: no page for the keepalive: the line will idle\n");
+		return false;
+	}
+	ufs_keep = at;
+	ufs_keep_pa = kvtophys(ufs_keep);
+	if (kernel_thread_start(ufs_keepalive_thread, NULL, &th) != KERN_SUCCESS) {
+		printf("ufs: no keepalive thread: the line will idle\n");
+		return false;
+	}
+	thread_deallocate(th);
+	ufs_on = true;
 	/* one read of LUN 0 (a boot LUN, small but alive) says the link answers */
 	if (!ufs_read4k_retry(0, 0, 1)) {
+		ufs_on = false;
 		printf("ufs: the first read failed; the transport is not up\n");
 		return false;
 	}
-	ufs_on = true;
-	printf("ufs: the transport is up\n");
+	printf("ufs: the transport is up; a keepalive thread reads every millisecond\n");
 	printf("ufs: the clock buffer asked of ATF, to be held (SMC %#x): %d\n", UFS_SIP_CTRL, ufs_sip(UFS_SIP_REFCLK, 1));
-	at = 0;
-	if (kmem_alloc_contig(kernel_map, &at, PAGE_SIZE, 0, 0, 0, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
-	    VM_KERN_MEMORY_IOKIT) == KERN_SUCCESS) {
-		ufs_keep = at;
-		ufs_keep_pa = kvtophys(ufs_keep);
-		if (kernel_thread_start(ufs_keepalive_thread, NULL, &th) == KERN_SUCCESS) {
-			thread_deallocate(th);
-			printf("ufs: a keepalive thread, a read every millisecond: the line shall not idle\n");
-		}
-	} else {
-		printf("ufs: no page for the keepalive: the line will idle\n");
-	}
 	return true;
 }
 
