@@ -381,29 +381,35 @@ ufs_list(void)
 }
 
 /* the fallback: the controller from cold, as the loader brings it up -- HCE off and on, the
- * link started again with a DME command -- then the list */
+ * link started again with a DME command -- then the list; the pair is retried the way LK
+ * retries it, for the first startup after a toggle often fails on its own (ufs5: IS 0x4) */
 static bool
 ufs_reset(void)
 {
-	ufs_wr(UFS_HCE, 0);
-	for (uint32_t i = 0; i < 2000000 && (ufs_rd(UFS_HCE) & 1); i++) {
+	bool up = false;
+
+	for (uint32_t try = 0; try < 5 && !up; try++) {
+		ufs_wr(UFS_HCE, 0);
+		for (uint32_t i = 0; i < 2000000 && (ufs_rd(UFS_HCE) & 1); i++) {
+		}
+		delay(5000);
+		ufs_wr(UFS_HCE, 1);
+		for (uint32_t i = 0; i < 20000000 && !(ufs_rd(UFS_HCE) & 1); i++) {
+		}
+		ufs_wr(UFS_IE, 0);                       /* again: nothing in XNU would serve it */
+		ufs_wr(UFS_AHIT, 0);                     /* a cold start re-arms it: the same death would wait again */
+		if (!(ufs_rd(UFS_HCE) & 1)) {
+			printf("ufs: the controller would not enable (HCE %#x); toggling again\n", ufs_rd(UFS_HCE));
+			continue;
+		}
+		if (ufs_uic(UFS_UIC_LINK_STARTUP, 0, 0, "link startup") && (ufs_rd(UFS_HCS) & UFS_HCS_DP)) {
+			up = true;
+			break;
+		}
+		printf("ufs: the link would not start (HCS %#x), attempt %u; toggling the controller again\n", ufs_rd(UFS_HCS), try);
 	}
-	delay(5000);
-	ufs_wr(UFS_HCE, 1);
-	for (uint32_t i = 0; i < 20000000 && !(ufs_rd(UFS_HCE) & 1); i++) {
-	}
-	ufs_wr(UFS_IE, 0);                       /* again: nothing in XNU would serve it */
-	if (!(ufs_rd(UFS_HCE) & 1)) {
-		printf("ufs: the controller would not enable (HCE %#x)\n", ufs_rd(UFS_HCE));
-		return fail("controller enable", ufs_rd(UFS_HCE));
-	}
-	ufs_wr(UFS_AHIT, 0);                     /* a cold start re-arms it: the same death would wait again */
-	if (!ufs_uic(UFS_UIC_LINK_STARTUP, 0, 0, "link startup")) {
-		return false;
-	}
-	if (!(ufs_rd(UFS_HCS) & UFS_HCS_DP)) {
-		printf("ufs: no device after the startup (HCS %#x)\n", ufs_rd(UFS_HCS));
-		return fail("no device", ufs_rd(UFS_HCS));
+	if (!up) {
+		return fail("link startup", ufs_rd(UFS_HCS));
 	}
 	return ufs_list();
 }
@@ -525,18 +531,22 @@ ufs_read4k_retry(uint8_t lun, uint64_t lba, uint32_t blocks)
 	    ufs_list() && ufs_read4k(lun, lba, blocks)) {
 		return true;
 	}
-	/* hibernation itself is poison on this host (ufs4: an enter that no exit would undo), so
-	 * the last rung is the controller from cold: its link startup fails (IS 0x4), and still
-	 * the reads reach the device -- the first one may answer a unit attention (sense 6/29,
-	 * "I power-cycled, ask again"), which is the way back, so the asking goes on */
+	/* the controller from cold is the last rung: its startup may still fail and its reads
+	 * reach the device anyway -- the first may answer a unit attention (sense 6/29, "I
+	 * power-cycled, ask again"); a device awake and answering is also the one moment a warm
+	 * link startup may take, so it is tried there before the asking goes on */
 	printf("ufs: resetting the controller\n");
 	(void)ufs_reset();
-	for (uint32_t i = 0; i < 3; i++) {
+	for (uint32_t i = 0; i < 5; i++) {
 		if (ufs_read4k(lun, lba, blocks)) {
 			return true;
 		}
-		if (ufs_attention && ufs_read4k(lun, lba, blocks)) {
-			return true;
+		if (ufs_attention) {
+			(void)ufs_uic(UFS_UIC_LINK_STARTUP, 0, 0, "starting the link over the awake device");
+			(void)ufs_list();
+			if (ufs_read4k(lun, lba, blocks)) {
+				return true;
+			}
 		}
 		if (ufs_answered) {
 			return false;               /* a plain refusal: the link is up, the command is wrong */
