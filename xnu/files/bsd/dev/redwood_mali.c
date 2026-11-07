@@ -1,24 +1,29 @@
 /*
- * The GPU of the Infinix Hot 20 (X6826B), a Mali-G52 MC2, brought up from the kernel. Only with
- * boot-arg mali=1: every address below belongs to this phone (the other phone's GPU is an Adreno,
- * bsd/dev/redwood_adreno.c).
+ * The GPU of the Redmi Note 10S (rosemary), the Helio G95's Mali, brought up from the kernel. Only
+ * with boot-arg mali=1: every address below belongs to this phone.
  *
- * A Bifrost Mali needs no firmware, so bringing it up is power and clocks and nothing else, in the
- * order MediaTek's own kernel uses -- the same sequence the loader's GPU probe proved on the phone
- * (mtkloader/mtkmali.h, where it is written out with its sources):
+ * A Bifrost Mali needs no firmware, so bringing it up is power and clocks and nothing else. On this
+ * SoC (MT6785) both were measured, not guessed: iMediaTek's closed kernel started this very GPU on
+ * this very phone with clock writes alone (their run's pstore, logs/imdt1; the recipe with its
+ * before/after register dumps in docs/mali-g57-imdt1-reference.md), and the Android device tree
+ * names the blocks: mali@13040000, mfgcfg@13fbf000, apmixed@1000c000. The order they left in the
+ * dump, topckgen untouched (the preloader already muxed mfg) and the power already on (no SPM
+ * dance, no bus-protection release -- both read back done):
  *
- *   1  the "mfg_sel" clock mux in topckgen, to the main PLL's third (364 MHz)
- *   2  the four power domains in the SPM, MFG_ASYNC, MFG, MFG_CORE0 and _CORE1, each with its SRAM,
- *      and once MFG has power the bus protection between the GPU block and the rest released
- *   3  the block's own clock gate (BG3D in mfgcfg)
- *   4  the GPU: which one it is, a soft reset, and its L2, tiler and two shader cores powered
- *   5  one job, the smallest there is -- write a value into memory -- through address space 0 in
+ *   1  MFGPLL in apmixedsys: pcw 0x152762, postdiv 0x1f0, enable, and a wait for its lock
+ *   2  mfgcfg: the rendering clock's mux bits and enable (+0x020), the bus mux to 2 (+0x0b0),
+ *      the divider enable (+0x130)
+ *   3  the GPU: which one it is (a GPU_ID of zero says the power story failed -- nothing else did
+ *      it, and this returns), a soft reset, the job manager / shader / coherency configs they
+ *      wrote (no hardware coherency on this SoC; the flushes in JS_CONFIG carry it), and its L2,
+ *      tiler and shader cores powered
+ *   4  one job, the smallest there is -- write a value into memory -- through address space 0 in
  *      identity mode (a GPU address is the physical one), and the processor reads the value back
- *   6  the same job again through the GPU's own page tables, at a GPU address of their making
+ *   5  the same job again through the GPU's own page tables, at a GPU address of their making
  *
- * The PMIC's two GPU rails, VGPU and VSRAM_GPU, are left on by the preloader; this does not touch
- * them. Afterwards the GPU stays powered, for what is to drive it next. sysctl kern.redwood.mali
- * says how far it got: 6 means every step above worked.
+ * (The Infinix Hot 20 this file was born on, a Helio G85 with the same core, wanted the four SPM
+ * domains and topckgen's mfg_sel first; this SoC leaves those done. sysctl kern.redwood.mali says
+ * how far it got: 6 means every step above worked.)
  */
 #include <kern/clock.h>
 #include <kern/thread.h>
@@ -41,13 +46,13 @@ extern struct mali_made { uint64_t address, size; uint32_t asked, flags; } gMali
 
 #define TOPCKGEN_PHYS   0x10000000
 #define INFRACFG_PHYS   0x10001000
-#define SPM_PHYS        0x10006000
-#define MFGCFG_PHYS     0x13000000
+#define APMIXED_PHYS    0x1000c000
+#define MFGCFG_PHYS     0x13fbf000
 #define MALI_PHYS       0x13040000
 
 SYSCTL_DECL(_kern_redwood);
 
-static vm_offset_t topckgen, infracfg, spm, mfgcfg, mali;
+static vm_offset_t topckgen, infracfg, apmixed, mfgcfg, mali;
 static uint32_t reached, gpu_id, shader_mask;
 
 SYSCTL_UINT(_kern_redwood, OID_AUTO, mali, CTLFLAG_RD | CTLFLAG_LOCKED, &reached, 0,
@@ -256,47 +261,27 @@ wait_for(vm_offset_t base, uint32_t at, uint32_t mask, uint32_t want, uint32_t m
 	return (rd(base, at) & mask) == want;
 }
 
-/* ---- power ---- */
+/* ---- the clocks (MT6785: the mfgcfg block, the MFGPLL in apmixedsys; imdt1's measured recipe) ---- */
 
-#define PWR_STATUS      0x180
-#define PWR_STATUS_2ND  0x184
-#define PWR_RST_B       (1u << 0)
-#define PWR_ISO         (1u << 1)
-#define PWR_ON          (1u << 2)
-#define PWR_ON_2ND      (1u << 3)
-#define PWR_CLK_DIS     (1u << 4)
-#define PWR_SRAM_PDN    (1u << 8)
-#define PWR_SRAM_ACK    (1u << 12)
+#define MFG_PLL_POSTDIV  0xb00001f0u     /* apmixed+0x220: MFGPLL's postdiv (their after-dump) */
+#define MFG_PLL_PCW_EN   0x80152762u     /* apmixed+0x224: pcw 0x152762 with the enable set */
+#define MFG_PLL_LOCK     0x80000002u     /* apmixed+0x22c: enabled and locked (both bits waited) */
 
-static const struct {
-	const char *name;
-	uint32_t con, status;
-	bool sram;
-} domains[4] = {
-	{ "MFG_ASYNC", 0x334, 1u << 14, false },
-	{ "MFG", 0x338, 1u << 11, true },
-	{ "MFG_CORE0", 0x34c, 1u << 12, true },
-	{ "MFG_CORE1", 0x310, 1u << 13, true },
-};
-
-static bool
-domain_on(unsigned i)
+static void
+mali_clocks(void)
 {
-	uint32_t con = domains[i].con, bit = domains[i].status;
+	/* MFGPLL first: the mux in mfgcfg switches to it only once it answers. */
+	wr(apmixed, 0x220, MFG_PLL_POSTDIV);
+	wr(apmixed, 0x224, MFG_PLL_PCW_EN);
+	if (!wait_for(apmixed, 0x22c, MFG_PLL_LOCK, MFG_PLL_LOCK, 100)) {
+		printf("mali: the MFGPLL did not lock (%#x)\n", rd(apmixed, 0x22c));
+	}
 
-	wr(spm, con, rd(spm, con) | PWR_ON);
-	wr(spm, con, rd(spm, con) | PWR_ON_2ND);
-	if (!wait_for(spm, PWR_STATUS, bit, bit, 20) || !wait_for(spm, PWR_STATUS_2ND, bit, bit, 20)) {
-		return false;
-	}
-	wr(spm, con, rd(spm, con) & ~PWR_CLK_DIS);
-	wr(spm, con, rd(spm, con) & ~PWR_ISO);
-	wr(spm, con, rd(spm, con) | PWR_RST_B);
-	if (domains[i].sram) {
-		wr(spm, con, rd(spm, con) & ~PWR_SRAM_PDN);
-		return wait_for(spm, con, PWR_SRAM_ACK, 0, 20);
-	}
-	return true;
+	/* The rendering clock's mux bits and its enable, then the bus mux (7 -> 2), then the dividers. */
+	wr(mfgcfg, 0x020, rd(mfgcfg, 0x020) | 0x02800000u);
+	wr(mfgcfg, 0x024, rd(mfgcfg, 0x024) | 1u);
+	wr(mfgcfg, 0x0b0, (rd(mfgcfg, 0x0b0) & ~0xf00u) | 0x200u);
+	wr(mfgcfg, 0x130, rd(mfgcfg, 0x130) | 1u);
 }
 
 /* ---- the GPU's registers (Linux drivers/gpu/drm/panfrost/panfrost_regs.h) ---- */
@@ -315,6 +300,9 @@ domain_on(unsigned i)
 #define SHADER_PWRON        0x180
 #define TILER_PWRON         0x190
 #define L2_PWRON            0x1a0
+#define JM_CONFIG           0xf00       /* (RW) job manager configuration */
+#define SHADER_CONFIG       0xf04       /* (RW) shader core configuration */
+#define COHERENCY_ENABLE    0x304       /* (RW) coherency protocol selection; 31 = none */
 #define IRQ_RESET_COMPLETED (1u << 8)
 
 #define JOB_INT_RAWSTAT     0x1000
@@ -514,34 +502,41 @@ mali_up(void)
 {
 	uint32_t shaders, tiler, l2;
 
-	topckgen = ml_io_map(TOPCKGEN_PHYS, 0x1000);
-	infracfg = ml_io_map(INFRACFG_PHYS, 0x1000);
-	spm = ml_io_map(SPM_PHYS, 0x1000);
+	topckgen = ml_io_map(TOPCKGEN_PHYS, 0x200);
+	infracfg = ml_io_map(INFRACFG_PHYS, 0x400);
+	apmixed = ml_io_map(APMIXED_PHYS, 0x300);
+	mfgcfg = ml_io_map(MFGCFG_PHYS, 0x1000);
 
-	/* 1: the clock; 2: power */
-	wr(topckgen, 0x58, 3u | (1u << 7));     /* CLK_CFG_1_CLR: mfg_sel's source and its gate */
-	wr(topckgen, 0x54, 2u);                 /* CLK_CFG_1_SET: syspll_d3 */
+	/* What the phone left, in the words their run printed: if a step below fails, this is the
+	 * line that says which world we started from. */
+	printf("mali: mfgcfg before: cg %08x sel %08x/%08x pll %08x/%08x bus %08x div %08x/%08x; "
+	    "topck %08x %08x %08x %08x; protection %08x %08x\n",
+	    rd(mfgcfg, 0x010), rd(mfgcfg, 0x020), rd(mfgcfg, 0x024), rd(mfgcfg, 0x030), rd(mfgcfg, 0x034),
+	    rd(mfgcfg, 0x0b0), rd(mfgcfg, 0x130), rd(mfgcfg, 0x134),
+	    rd(topckgen, 0x020), rd(topckgen, 0x100), rd(topckgen, 0x104), rd(topckgen, 0x108),
+	    rd(infracfg, 0x2a0), rd(infracfg, 0x2a4));
+
+	/* 1: the clocks (the power and the top clocks this phone leaves done; imdt1's order). */
+	mali_clocks();
 	reached = 1;
-	for (unsigned i = 0; i < 4; i++) {
-		if (!domain_on(i)) {
-			printf("mali: power domain %s did not come up (status %#x)\n", domains[i].name, rd(spm, PWR_STATUS));
-			return;
-		}
-		if (i == 1) {
-			wr(infracfg, 0x2a4, (1u << 21) | (1u << 22));   /* bus protection, released */
-			wr(infracfg, 0x2a4, 1u << 25);
-		}
+
+	/* 2: the bus protection between the GPU block and the rest, released by the boot before us. */
+	if (rd(infracfg, 0x2a0) != 0 || rd(infracfg, 0x2a4) != 0) {
+		printf("mali: the bus protection is held (%#x %#x) -- this bring-up does not release it\n",
+		    rd(infracfg, 0x2a0), rd(infracfg, 0x2a4));
 	}
 	reached = 2;
 
-	/* 3: inside the block, which now has power and a bus */
-	mfgcfg = ml_io_map(MFGCFG_PHYS, 0x1000);
+	/* 3: the GPU itself. A core that answers nothing means the power story failed: no register
+	 * this side of it turns the domains on, and imdt1's run says nothing had to. */
 	mali = ml_io_map(MALI_PHYS, 0x4000);
-	wr(mfgcfg, 0x008, 1u);                  /* MFG_CG_CLR: BG3D runs */
-	reached = 3;
-
-	/* 4: the GPU itself */
 	gpu_id = rd(mali, GPU_ID);
+	if (gpu_id == 0 || gpu_id == 0xffffffffu) {
+		printf("mali: the core did not answer (GPU_ID %#x): the power is off, and this bring-up "
+		    "leaves power to the boot before it\n", gpu_id);
+		return;
+	}
+	reached = 3;
 	shaders = shader_mask = rd(mali, SHADER_PRESENT);
 	tiler = rd(mali, TILER_PRESENT);
 	l2 = rd(mali, L2_PRESENT);
@@ -553,6 +548,14 @@ mali_up(void)
 		return;
 	}
 	wr(mali, GPU_INT_CLEAR, 0xffffffffu);
+
+	/* The configs their kernel wrote: the job manager's default IDVS group size, the shader
+	 * core's TLS hashing, and coherency NONE -- no hardware coherency on this SoC, which is why
+	 * every job flushes both ends in its JS_CONFIG. */
+	wr(mali, JM_CONFIG, 0x000f0000u);
+	wr(mali, SHADER_CONFIG, 0x00020000u);
+	wr(mali, COHERENCY_ENABLE, 0x1fu);
+
 	wr(mali, L2_PWRON, l2);
 	wr(mali, TILER_PWRON, tiler);
 	wr(mali, SHADER_PWRON, shaders);
@@ -563,10 +566,13 @@ mali_up(void)
 		return;
 	}
 	reached = 4;
-	printf("mali: GPU_ID %#x (Mali-G52 r%up%u), shader cores %#x, tiler %#x, L2 %#x: all powered\n", gpu_id,
-	    (gpu_id >> 12) & 0xf, (gpu_id >> 4) & 0xff, shaders, tiler, l2);
+	printf("mali: GPU_ID %#x (product %x), shader cores %#x, tiler %#x, L2 %#x; mfgcfg now: "
+	    "sel %08x/%08x bus %08x div %08x/%08x, pll %08x %08x: all powered\n", gpu_id,
+	    gpu_id >> 16, shaders, tiler, l2,
+	    rd(mfgcfg, 0x020), rd(mfgcfg, 0x024), rd(mfgcfg, 0x0b0), rd(mfgcfg, 0x130), rd(mfgcfg, 0x134),
+	    rd(apmixed, 0x224), rd(apmixed, 0x22c));
 
-	/* 5: something for it to do */
+	/* 4: something for it to do */
 	switch (first_jobs()) {
 	case 2:
 		reached = 6;
@@ -773,7 +779,7 @@ redwood_mali_parameter(uint32_t which, uint64_t *value)
 		return true;
 	case 39:
 		/*
-		 * THREAD_TLS_ALLOC, which Bifrost has (0x310) and the G52 here needs: answered 0, panfrost
+		 * THREAD_TLS_ALLOC, which Bifrost has (0x310) and the Mali here needs: answered 0, panfrost
 		 * sized the stack of a spilling shader by THREAD_MAX_THREADS instead, and the GPU, which
 		 * gives each core more stacks than that, wrote past the end of it (25 October: every write
 		 * fault of the uber shaders, up to 0x15870 past a 0x60000 buffer). Never less than that
