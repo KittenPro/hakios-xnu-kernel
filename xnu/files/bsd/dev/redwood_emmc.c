@@ -250,11 +250,9 @@ read_blocks(uint64_t lba, uint32_t blocks, uint32_t *dst)
 #define UFS_HCS_UCRDY     (1u << 3)
 #define UFS_UIC_DME_GET    0x01           /* a MIB read: the value comes back in ARG3 */
 #define UFS_UIC_DME_SET    0x02           /* a MIB write: the value rides in ARG3 */
-#define UFS_UIC_DME_PEER_GET 0x03         /* the same, answered by the device across the line */
 #define UFS_UIC_LINK_STARTUP 0x16
 #define UFS_UIC_HIBER_ENTER  0x17
 #define UFS_UIC_HIBER_EXIT   0x18
-#define UFS_PA_PWRMODE    0x1571          /* unipro: the link's current gear and power -- a read nothing minds */
 #define UFS_VS_DBGCLK      0xd0a1         /* unipro: bit 5 forces the TX symbol clock request on */
 #define UFS_VS_SAVEPOWER   0xd0a6         /* unipro: bits 0/2/3 gate the RX/SYS/TX clocks, bit 6 is the deep stall */
 #define UFS_VS_UNIPRO_PD   0xd0a8         /* unipro: nonzero is its low-power mode */
@@ -272,11 +270,16 @@ static bool ufs_on;                          /* reads go through the transport *
 static uint8_t ufs_lun;                      /* the LUN the partition was found on */
 static vm_offset_t ufs_desc, ufs_bounce;     /* that page, and EMMC_MAX_BLOCKS * 512 to read through */
 static uint64_t ufs_desc_pa, ufs_bounce_pa;
+static vm_offset_t ufs_keep;                 /* the keepalive's own window: its reads clobber no one's data */
+static uint64_t ufs_keep_pa;
 static bool ufs_stuck;                       /* the doorbell never cleared: the list needs rebuilding */
 static bool ufs_answered;                    /* the device answered, even to refuse: the link is fine */
 static bool ufs_attention;                   /* the device answered "I was reset, ask again": a unit attention */
 static thread_call_t ufs_keep_call;          /* the millisecond keepalive: the line shall not idle */
 static volatile bool ufs_recovering;         /* the ladder is walking: the keepalive stands aside */
+static volatile bool ufs_bad;                /* the last read anywhere failed: the keepalive stands down */
+static LCK_GRP_DECLARE(ufs_lck_grp, "redwood-ufs");
+static LCK_SPIN_DECLARE(ufs_lock, &ufs_lck_grp);   /* the one page of descriptors serves one reader at a time */
 
 static inline uint32_t
 ufs_rd(uint32_t reg)
@@ -356,28 +359,20 @@ ufs_dme_set(uint32_t attr, uint32_t val, const char *what)
 	return ufs_uic(UFS_UIC_DME_SET, attr << 16, val, what);
 }
 
-static bool
-ufs_dme_peer_get(uint32_t attr, uint32_t *val, const char *what)
-{
-	if (!ufs_uic(UFS_UIC_DME_PEER_GET, attr << 16, 0, what)) {
-		return false;
-	}
-	*val = ufs_rd(UFS_UIC_ARG3);
-	return true;
-}
+static bool ufs_read4k_t(uint8_t lun, uint64_t lba, uint32_t blocks, bool quick);
 
 /* the millisecond keepalive: the line dies at ~4 ms of idle (ufs3: a line reset at the PHY
  * adapter) and nothing brings it back whole (ufs5, ufs6: a cold start buys one answered
- * command, then silence), so it never idles -- a peer attribute read every millisecond is a
- * UIC round trip that crosses the line and shares nothing with the read path's page */
+ * command, then silence) -- and a DME peer read every millisecond did not stop it (ufs7:
+ * the killer does not count UIC traffic), so this now sends a real READ10 over the line, one
+ * block of a boot LUN under the read path's own lock; the first failure stands it down */
 static void
 ufs_keepalive(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 {
 	uint64_t deadline;
-	uint32_t mode = 0;
 
-	if (ufs_on && !ufs_recovering) {
-		(void)ufs_dme_peer_get(UFS_PA_PWRMODE, &mode, "keepalive");
+	if (ufs_on && !ufs_recovering && !ufs_bad) {
+		(void)ufs_read4k_t(0, 0, 1, true);
 	}
 	clock_interval_to_deadline(1, NSEC_PER_MSEC, &deadline);
 	thread_call_enter_delayed(ufs_keep_call, deadline);
@@ -446,13 +441,17 @@ ufs_reset(void)
 	return ufs_list();
 }
 
-/* one READ10, in the LUN's 4096-byte blocks, into the bounce: the UTRD and the UPIU are built
- * where the page has them, both in the byte order each is read in (the UTRD little endian, the
- * UPIU big endian, byte by byte) */
+/* one READ10, in the LUN's 4096-byte blocks: the UTRD and the UPIU are built where the page
+ * has them, both in the byte order each is read in (the UTRD little endian, the UPIU big
+ * endian, byte by byte); the page and the doorbell slot serve one reader at a time under the
+ * lock, and the keepalive's quick mode reads a window of its own, polls on a shorter clock,
+ * reports in brief and marks the line bad on the first failure anywhere */
 static bool
-ufs_read4k(uint8_t lun, uint64_t lba, uint32_t blocks)
+ufs_read4k_t(uint8_t lun, uint64_t lba, uint32_t blocks, bool quick)
 {
 	uint64_t ucd_pa = ufs_desc_pa + UFS_UCD_OFF;
+	uint64_t data_pa = quick ? ufs_keep_pa : ufs_bounce_pa;
+	vm_offset_t data = quick ? ufs_keep : ufs_bounce;
 	uint32_t bytes = blocks * 4096;
 	uint32_t *d = (uint32_t *)ufs_desc;
 	uint32_t *p = (uint32_t *)(ufs_desc + UFS_PRD_OFF);
@@ -463,6 +462,7 @@ ufs_read4k(uint8_t lun, uint64_t lba, uint32_t blocks)
 	if (blocks == 0 || blocks > EMMC_MAX_BLOCKS * 512 / 4096) {
 		return fail("too many blocks", blocks);
 	}
+	lck_spin_lock(&ufs_lock);
 	bzero((void *)ufs_desc, UFS_PRD_OFF + 16);
 	d[0] = 0x15000000u;                      /* device to host, the command-type bit the loader's driver sets, interrupt command */
 	d[2] = 0x0000000fu;                      /* OCS: invalid until the controller writes its zero */
@@ -486,18 +486,18 @@ ufs_read4k(uint8_t lun, uint64_t lba, uint32_t blocks)
 	c[21] = (uint8_t)lba;
 	c[23] = (uint8_t)(blocks >> 8);          /* how many blocks, big endian */
 	c[24] = (uint8_t)blocks;
-	p[0] = (uint32_t)ufs_bounce_pa;          /* where the data goes: one piece, so one entry */
-	p[1] = (uint32_t)(ufs_bounce_pa >> 32);
+	p[0] = (uint32_t)data_pa;                /* where the data goes: one piece, so one entry */
+	p[1] = (uint32_t)(data_pa >> 32);
 	p[3] = bytes - 1;                        /* PRD entries count one less, as they do */
 
 	ufs_clean(ufs_desc, UFS_PRD_OFF + 16);   /* what the controller reads */
-	ufs_clean(ufs_bounce, bytes);            /* where it writes: no stale line of ours */
+	ufs_clean(data, bytes);                  /* where it writes: no stale line of ours */
 	is = ufs_rd(UFS_IS);
 	if (is) {
 		ufs_wr(UFS_IS, is);
 	}
 	ufs_wr(UFS_UTRLDBR, 1);                  /* slot 0: run */
-	for (i = 0; i < 20000000; i++) {         /* the loader's driver gives a command five seconds */
+	for (i = 0; i < (quick ? 2000000u : 20000000u); i++) {   /* the quick clock is the keepalive's own */
 		if (!(ufs_rd(UFS_UTRLDBR) & 1)) {
 			break;
 		}
@@ -505,8 +505,14 @@ ufs_read4k(uint8_t lun, uint64_t lba, uint32_t blocks)
 	if (ufs_rd(UFS_UTRLDBR) & 1) {
 		ufs_stuck = true;
 		ufs_answered = false;
-		printf("ufs: LUN %u, %u blocks at %llu: the doorbell never cleared (IS %#x, MTK %#x)\n", lun, blocks, lba,
-		    ufs_rd(UFS_IS), ufs_rd(UFS_OCS_ERR));
+		ufs_bad = true;
+		if (quick) {
+			printf("ufs: the keepalive's read stuck (IS %#x, HCS %#x)\n", ufs_rd(UFS_IS), ufs_rd(UFS_HCS));
+		} else {
+			printf("ufs: LUN %u, %u blocks at %llu: the doorbell never cleared (IS %#x, MTK %#x)\n", lun, blocks, lba,
+			    ufs_rd(UFS_IS), ufs_rd(UFS_OCS_ERR));
+		}
+		lck_spin_unlock(&ufs_lock);
 		return fail("doorbell stuck", ufs_rd(UFS_IS));
 	}
 	ufs_stuck = false;
@@ -515,14 +521,29 @@ ufs_read4k(uint8_t lun, uint64_t lba, uint32_t blocks)
 	ufs_answered = ocs == 0;                 /* the device took the command, even to refuse it */
 	ufs_attention = ufs_answered && r[36] == 6;  /* sense key 6: the device was reset and wants the command again */
 	if (ocs != 0 || resp != 0) {
-		printf("ufs: LUN %u, %u blocks at %llu: OCS %u, response %#x, sense %#x %#x %#x, MTK %#x, HCS %#x, RSR %#x\n", lun, blocks, lba,
-		    ocs, resp, r[36], r[46], r[47], ufs_rd(UFS_OCS_ERR), ufs_rd(UFS_HCS), ufs_rd(UFS_UTRLRSR));
-		printf("ufs: the aftermath: IS %#x, UECPA %#x, UECDL %#x, UECN %#x, UECT %#x, sm %u, refclk %#x, mphy %#x, stall %#x\n",
-		    ufs_rd(UFS_IS), ufs_rd(UFS_UECPA), ufs_rd(UFS_UECDL), ufs_rd(UFS_UECN), ufs_rd(UFS_UECT), ufs_sm(),
-		    ufs_rd(UFS_REFCLK), ufs_rd(UFS_MPHY), ufs_rd(UFS_STALL));
+		ufs_bad = true;
+		if (quick) {
+			printf("ufs: the keepalive's read: OCS %u, response %#x\n", ocs, resp);
+		} else {
+			printf("ufs: LUN %u, %u blocks at %llu: OCS %u, response %#x, sense %#x %#x %#x, MTK %#x, HCS %#x, RSR %#x\n", lun, blocks, lba,
+			    ocs, resp, r[36], r[46], r[47], ufs_rd(UFS_OCS_ERR), ufs_rd(UFS_HCS), ufs_rd(UFS_UTRLRSR));
+			printf("ufs: the aftermath: IS %#x, UECPA %#x, UECDL %#x, UECN %#x, UECT %#x, sm %u, refclk %#x, mphy %#x, stall %#x\n",
+			    ufs_rd(UFS_IS), ufs_rd(UFS_UECPA), ufs_rd(UFS_UECDL), ufs_rd(UFS_UECN), ufs_rd(UFS_UECT), ufs_sm(),
+			    ufs_rd(UFS_REFCLK), ufs_rd(UFS_MPHY), ufs_rd(UFS_STALL));
+		}
+		lck_spin_unlock(&ufs_lock);
 		return fail("command status", (ocs << 16) | resp);
 	}
+	ufs_bad = false;
+	lck_spin_unlock(&ufs_lock);
 	return true;
+}
+
+/* every read of the system's own: the same command, with the whole five seconds of patience */
+static bool
+ufs_read4k(uint8_t lun, uint64_t lba, uint32_t blocks)
+{
+	return ufs_read4k_t(lun, lba, blocks, false);
 }
 
 /* one READ10 with the ladder behind it: plainly again if the command merely failed, or again
@@ -696,13 +717,21 @@ ufs_start(void)
 	}
 	ufs_on = true;
 	printf("ufs: the transport is up\n");
-	ufs_keep_call = thread_call_allocate((thread_call_func_t)ufs_keepalive, NULL);
-	if (ufs_keep_call) {
-		uint64_t deadline;
+	at = 0;
+	if (kmem_alloc_contig(kernel_map, &at, PAGE_SIZE, 0, 0, 0, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
+	    VM_KERN_MEMORY_IOKIT) == KERN_SUCCESS) {
+		ufs_keep = at;
+		ufs_keep_pa = kvtophys(ufs_keep);
+		ufs_keep_call = thread_call_allocate((thread_call_func_t)ufs_keepalive, NULL);
+		if (ufs_keep_call) {
+			uint64_t deadline;
 
-		clock_interval_to_deadline(1, NSEC_PER_MSEC, &deadline);
-		thread_call_enter_delayed(ufs_keep_call, deadline);
-		printf("ufs: a keepalive every millisecond: the line shall not idle\n");
+			clock_interval_to_deadline(1, NSEC_PER_MSEC, &deadline);
+			thread_call_enter_delayed(ufs_keep_call, deadline);
+			printf("ufs: a keepalive read every millisecond: the line shall not idle\n");
+		}
+	} else {
+		printf("ufs: no page for the keepalive: the line will idle\n");
 	}
 	return true;
 }
