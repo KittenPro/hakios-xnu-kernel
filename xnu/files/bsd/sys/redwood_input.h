@@ -42,6 +42,7 @@ void redwood_input_init(void);
 void redwood_virtio_input_init(void);   /* boot-arg virtio_input=1: QEMU's virtio pointer and keyboard */
 void redwood_goodix_init(void);         /* boot-arg touchscreen=1: the phone's Goodix or FocalTech touch screen */
 void redwood_tcm_init(void);            /* boot-arg touchscreen=2: the Infinix's OmniVision TD4160 */
+void redwood_fts_init(void);            /* boot-arg touchscreen=3: the Redmi Note 10S's FocalTech FT3518 */
 void redwood_mali_init(void);            /* boot-arg mali=1: the Infinix's Mali-G52 brought up */
 void redwood_mtkkeys_init(void);         /* boot-arg buttons=2: the Infinix's power and volume keys */
 void redwood_buttons_init(void);        /* boot-arg buttons=1: the phone's power and volume keys */
