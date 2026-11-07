@@ -254,8 +254,6 @@ read_blocks(uint64_t lba, uint32_t blocks, uint32_t *dst)
 #define UFS_UIC_HIBER_ENTER  0x17
 #define UFS_UIC_HIBER_EXIT   0x18
 #define UFS_VS_DBGCLK      0xd0a1         /* unipro: bit 5 forces the TX symbol clock request on */
-#define UFS_SIP_CTRL       0xc2000276u    /* MTK_SIP_SMC_CMD(0x276): ATF's own arm of the UFS, as the vendor kernel calls it */
-#define UFS_SIP_REFCLK     0x08u          /* UFS_MTK_SIP_REF_CLK_NOTIFICATION, BIT(3): the hold on the clock buffer */
 #define UFS_VS_SAVEPOWER   0xd0a6         /* unipro: bits 0/2/3 gate the RX/SYS/TX clocks, bit 6 is the deep stall */
 #define UFS_VS_UNIPRO_PD   0xd0a8         /* unipro: nonzero is its low-power mode */
 
@@ -292,27 +290,6 @@ static inline void
 ufs_wr(uint32_t reg, uint32_t value)
 {
 	*(volatile uint32_t *)(ufs + reg) = value;
-}
-
-/* the vendor kernel holds the UFS reference clock this way: an SMC into ATF, which owns the
- * PMIC's clock buffer and the SPM (mtk_sip_svc.h and ufs-mediatek.h: MTK_SIP_UFS_CONTROL is
- * a fast SMC64 SIP call, 0xC2000276; REF_CLK_NOTIFICATION is BIT(3), its argument on or off).
- * On this phone nothing else ever asks, and the line dies at ~4 ms of idle without it */
-static int32_t
-ufs_sip(uint64_t cmd, uint64_t val)
-{
-	register uint64_t x0 __asm__("x0") = UFS_SIP_CTRL;
-	register uint64_t x1 __asm__("x1") = cmd;
-	register uint64_t x2 __asm__("x2") = val;
-	register uint64_t x3 __asm__("x3") = 0;    /* SMCCC fills the unpassed arguments with zeros; so here (ufs9: -2 with garbage in them) */
-	register uint64_t x4 __asm__("x4") = 0;
-	register uint64_t x5 __asm__("x5") = 0;
-	register uint64_t x6 __asm__("x6") = 0;
-	register uint64_t x7 __asm__("x7") = 0;
-
-	__asm__ volatile ("smc #0" : "+r" (x0), "+r" (x1), "+r" (x2), "+r" (x3), "+r" (x4), "+r" (x5), "+r" (x6), "+r" (x7)
-	    : : "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
-	return (int32_t)x0;
 }
 
 /* the path to the controller is not IO-coherent: as redwood_lx.c does for its radio memory,
@@ -488,7 +465,6 @@ ufs_reset(void)
 	if (!up) {
 		return fail("link startup", ufs_rd(UFS_HCS));
 	}
-	(void)ufs_sip(UFS_SIP_REFCLK, 1);         /* a cold start is ATF's cue to drop what it held: ask again */
 	return ufs_list();
 }
 
@@ -790,7 +766,6 @@ ufs_start(void)
 		return false;
 	}
 	printf("ufs: the transport is up; a keepalive thread reads every millisecond\n");
-	printf("ufs: the clock buffer asked of ATF, to be held (SMC %#x): %d\n", UFS_SIP_CTRL, ufs_sip(UFS_SIP_REFCLK, 1));
 	return true;
 }
 
