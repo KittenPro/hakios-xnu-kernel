@@ -41,7 +41,8 @@ jobs:
       - name: zig (its ld.lld links mtkloader)
         run: |
           mkdir -p xnu-deps/host/zig
-          curl -sL https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz \
+          curl -sL --retry 5 --retry-delay 10 --connect-timeout 30 --max-time 600 \
+            https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz \
             | tar -xJ --strip-components=1 -C xnu-deps/host/zig
           xnu-deps/host/zig/zig version
 
