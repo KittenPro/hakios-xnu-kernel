@@ -220,6 +220,7 @@ read_blocks(uint64_t lba, uint32_t blocks, uint32_t *dst)
 #define UFS_IE            0x24
 #define UFS_HCS           0x30           /* DP 1, UTRLRDY 2, UCRDY 8 */
 #define UFS_HCE           0x34
+#define UFS_AHIT          0x18           /* auto-hibernate: after this much idle the link is put away */
 #define UFS_UTRLBA_L      0x50
 #define UFS_UTRLBA_H      0x54
 #define UFS_UTRLDBR       0x58           /* a bit rings its slot; it clears when the command is done */
@@ -229,6 +230,9 @@ read_blocks(uint64_t lba, uint32_t blocks, uint32_t *dst)
 #define UFS_UIC_ARG1      0x94
 #define UFS_UIC_ARG2      0x98           /* a DME command's result: its low byte */
 #define UFS_UIC_ARG3      0x9c
+#define UFS_REFCLK        0x144          /* MediaTek: the reference clock's handshake */
+#define UFS_MPHY          0x2200         /* MediaTek: the MPHY block (the deep stall and its kin) */
+#define UFS_STALL         0x2210         /* MediaTek: automatic deep stall */
 #define UFS_OCS_ERR       0x2244         /* MediaTek's own: what the last command died of */
 
 #define UFS_IS_UTRCS      (1u << 0)
@@ -354,6 +358,7 @@ ufs_reset(void)
 		printf("ufs: the controller would not enable (HCE %#x)\n", ufs_rd(UFS_HCE));
 		return fail("controller enable", ufs_rd(UFS_HCE));
 	}
+	ufs_wr(UFS_AHIT, 0);                     /* a cold start re-arms it: the same death would wait again */
 	if (!ufs_uic(UFS_UIC_LINK_STARTUP, 0, "link startup")) {
 		return false;
 	}
@@ -432,8 +437,8 @@ ufs_read4k(uint8_t lun, uint64_t lba, uint32_t blocks)
 	resp = (*(uint32_t *)(void *)(r + 4) >> 16) & 0xffff;    /* response and status, big endian where they sit */
 	ufs_answered = ocs == 0;                 /* the device took the command, even to refuse it */
 	if (ocs != 0 || resp != 0) {
-		printf("ufs: LUN %u, %u blocks at %llu: OCS %u, response %#x, sense %#x %#x %#x, MTK %#x\n", lun, blocks, lba,
-		    ocs, resp, r[36], r[46], r[47], ufs_rd(UFS_OCS_ERR));
+		printf("ufs: LUN %u, %u blocks at %llu: OCS %u, response %#x, sense %#x %#x %#x, MTK %#x, HCS %#x, RSR %#x\n", lun, blocks, lba,
+		    ocs, resp, r[36], r[46], r[47], ufs_rd(UFS_OCS_ERR), ufs_rd(UFS_HCS), ufs_rd(UFS_UTRLRSR));
 		return fail("command status", (ocs << 16) | resp);
 	}
 	return true;
@@ -528,6 +533,13 @@ ufs_start(void)
 	}
 	printf("ufs: HCE %#x, HCS %#x, CAP %#x, VER %#x\n", ufs_rd(UFS_HCE), ufs_rd(UFS_HCS), ufs_rd(UFS_CAP), ufs_rd(UFS_VER));
 	ufs_wr(UFS_IE, 0);
+	/* the preloader leaves the auto-hibernate idle timer armed; Linux on this family (the
+	 * mt8183-ufshci quirk) marks it broken and zeroes it: once it fires the controller drops
+	 * commands and refuses to wake -- exactly the death ufs1 took at its first ~4 ms idle */
+	printf("ufs: AHIT %#x, refclk %#x, mphy %#x, stall %#x; clearing the idle timer\n", ufs_rd(UFS_AHIT), ufs_rd(UFS_REFCLK),
+	    ufs_rd(UFS_MPHY), ufs_rd(UFS_STALL));
+	ufs_wr(UFS_AHIT, 0);
+	delay(5000);
 	if ((ufs_rd(UFS_HCE) & 1) == 0) {
 		printf("ufs: the controller is off; bringing it up from cold\n");
 		if (!ufs_reset()) {
