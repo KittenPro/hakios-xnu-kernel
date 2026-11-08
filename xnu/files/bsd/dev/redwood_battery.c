@@ -202,8 +202,11 @@ battery_thread(__unused void *parameter, __unused wait_result_t result)
  * temperature the NTC curve would ask for is not brought yet -- the thermistor's
  * millivolts are in the log, and 25 C is said meanwhile. The percent and the current are
  * the fuel gauge's own, the FGADC block below: the counter's coulombs from a voltage
- * anchor, the averaged current beside the voltage in the log. The charger's currents, and
- * the fast charge with them, are the MT6360's next story.
+ * anchor, the averaged current beside the voltage in the log. The charger's currents the
+ * MT6360's registers set, when the boot-args chg_aicr and chg_ichg ask for them: the
+ * input's limit and the battery's own current, conservative steps from half an ampere,
+ * the battery's ceiling and every voltage left alone -- the fast charge through the
+ * port's own negotiation is a story of its own.
  */
 #define RM_GPIO_PHYS        0x10005000
 #define RM_DIR_AT(pin)      (0x0000 + 0x10 * ((pin) / 32))
@@ -248,10 +251,24 @@ battery_thread(__unused void *parameter, __unused wait_result_t result)
 #define MT6360_PMU_ADDR     0x34            /* the charger half of the companion, on i2c5 */
 #define MT6360_CHG_STAT     0x4a            /* bits 7:6: 0 standby, 1 charging, 2 done, 3 fault */
 #define MT6360_CHG_STAT1    0xe0            /* bit 7: the port's power good */
+#define MT6360_CHG_CTRL2    0x12            /* bit 0 the charger's own switch; bits 3:2 where the input's limit comes from, 2 the AICR register */
+#define MT6360_CHG_CTRL3    0x13            /* bits 7:2 the input's limit: 100 mA and 50 mA a step to 3250; bit 0 the limit applied */
+#define MT6360_CHG_CTRL4    0x14            /* bits 7:1 the battery's ceiling: 3900 mV and 10 mV a step -- read, never written here */
+#define MT6360_CHG_CTRL6    0x16            /* bits 7:1 the port's droop floor: 3900 mV and 100 mV a step, the input's own guard */
+#define MT6360_CHG_CTRL7    0x17            /* bits 7:2 the battery's current: 100 mA and 100 mA a step to 5 A */
+#define MT6360_CHG_CTRL13   0x1d            /* bit 7 the charger's watchdog, nobody here to pet it -- said in the log */
+
+/* boot-args chg_aicr / chg_ichg, in milliamperes: the currents the charger is given when the
+ * battery is asked to actually fill, 0 to leave whatever the bootloader left. The ceiling
+ * (CTRL4) and the port's voltage are never written here; the port's own droop floor (CTRL6)
+ * stays as found too. A fifth of what the battery could take is where these start. */
+static int chg_aicr_ma, chg_ichg_ma;
 
 static vm_offset_t rm_gpio;
 static bool rm_pushpull;                    /* i2c5's ones driven instead of only released */
 static int battery_vbus_mv = -1, battery_vcdt_raw = -1, battery_ntc_mv;
+
+extern void redwood_host_keep_add(const char *format, ...) __printflike(1, 2);   /* redwood_mali.c: a line the log's middle cannot lose */
 
 SYSCTL_INT(_kern_redwood, OID_AUTO, battery_vbus_mv, CTLFLAG_RD | CTLFLAG_LOCKED,
     &battery_vbus_mv, 0, "the USB port's voltage as the PMIC's VCDT channel sees it, in millivolts");
@@ -540,6 +557,31 @@ mt6360_read(uint8_t reg, uint8_t *value)
 	return true;
 }
 
+/* A register of the charger written whole, and the read-modify-write the vendor's own driver
+ * does for its fields (mt6360_pmu_reg_update_bits). */
+static bool
+mt6360_write(uint8_t reg, uint8_t value)
+{
+	if (!rm_i2c_start() || !rm_i2c_out(MT6360_PMU_ADDR << 1) || !rm_i2c_out(reg) ||
+	    !rm_i2c_out(value)) {
+		rm_i2c_stop();
+		return false;
+	}
+	rm_i2c_stop();
+	return true;
+}
+
+static bool
+mt6360_update(uint8_t reg, uint8_t mask, uint8_t value)
+{
+	uint8_t v = 0;
+
+	if (!mt6360_read(reg, &v)) {
+		return false;
+	}
+	return mt6360_write(reg, (uint8_t)((v & ~mask) | (value & mask)));
+}
+
 static void
 rosemary_battery_thread(__unused void *parameter, __unused wait_result_t result)
 {
@@ -599,6 +641,63 @@ rosemary_battery_thread(__unused void *parameter, __unused wait_result_t result)
 	if (!mt6360) {
 		printf("battery: the MT6360 does not answer at %#x; the charger's state will be the PMIC's own bit\n",
 		    MT6360_PMU_ADDR);
+	}
+
+	/* what the bootloader left in the charger, said once and kept for the host: the switch, the
+	 * input's limit and where it comes from, the battery's current and ceiling, the port's
+	 * droop floor, and the watchdog nobody here pets */
+	if (mt6360) {
+		uint8_t ctrl2 = 0, ctrl3 = 0, ctrl4 = 0, ctrl6 = 0, ctrl7 = 0, ctrl13 = 0;
+
+		(void)mt6360_read(MT6360_CHG_CTRL2, &ctrl2);
+		(void)mt6360_read(MT6360_CHG_CTRL3, &ctrl3);
+		(void)mt6360_read(MT6360_CHG_CTRL4, &ctrl4);
+		(void)mt6360_read(MT6360_CHG_CTRL6, &ctrl6);
+		(void)mt6360_read(MT6360_CHG_CTRL7, &ctrl7);
+		(void)mt6360_read(MT6360_CHG_CTRL13, &ctrl13);
+		printf("battery: the MT6360 as found: charge %s, the limit's source %u, the input %u mA, "
+		    "the battery %u mA, the ceiling %u mV, the droop floor %u mV, the watchdog %s\n",
+		    ctrl2 & 1 ? "on" : "off", (ctrl2 >> 2) & 3, 100 + ((ctrl3 >> 2) & 0x3f) * 50,
+		    100 + ((ctrl7 >> 2) & 0x3f) * 100, 3900 + ((ctrl4 >> 1) & 0x7f) * 10,
+		    3900 + ((ctrl6 >> 1) & 0x7f) * 100, ctrl13 & 0x80 ? "on" : "off");
+		redwood_host_keep_add("battery: the MT6360 as found: charge %s, the limit's source %u, "
+		    "the input %u mA, the battery %u mA, the ceiling %u mV, the droop floor %u mV, the watchdog %s",
+		    ctrl2 & 1 ? "on" : "off", (ctrl2 >> 2) & 3, 100 + ((ctrl3 >> 2) & 0x3f) * 50,
+		    100 + ((ctrl7 >> 2) & 0x3f) * 100, 3900 + ((ctrl4 >> 1) & 0x7f) * 10,
+		    3900 + ((ctrl6 >> 1) & 0x7f) * 100, ctrl13 & 0x80 ? "on" : "off");
+
+		/* the currents, if asked for: the input's limit turned to the AICR register first
+		 * (the source the bootloader left may not honor it), the input brought up from
+		 * 500 mA the way the vendor's probe settles it, then the battery's own current */
+		if (chg_aicr_ma > 0 || chg_ichg_ma > 0) {
+			int aicr = chg_aicr_ma;
+
+			if (aicr <= 0) {
+				aicr = 100 + ((ctrl3 >> 2) & 0x3f) * 50;    /* keep the limit, take the register's side */
+			}
+			if (aicr < 100) aicr = 100;
+			if (aicr > 3250) aicr = 3250;
+			(void)mt6360_update(MT6360_CHG_CTRL2, 0x0d, (2 << 2) | 1);
+			if (aicr > 500) {
+				(void)mt6360_update(MT6360_CHG_CTRL3, 0xfc, 8 << 2);    /* 500 mA while the port settles */
+				delay_for_interval(100, NSEC_PER_MSEC);
+			}
+			(void)mt6360_update(MT6360_CHG_CTRL3, 0xfc, (uint8_t)((aicr - 100) / 50) << 2);
+			if (chg_ichg_ma > 0) {
+				int ichg = chg_ichg_ma < 100 ? 100 : chg_ichg_ma > 5000 ? 5000 : chg_ichg_ma;
+
+				(void)mt6360_update(MT6360_CHG_CTRL7, 0xfc, (uint8_t)((ichg - 100) / 100) << 2);
+			}
+			(void)mt6360_read(MT6360_CHG_CTRL2, &ctrl2);
+			(void)mt6360_read(MT6360_CHG_CTRL3, &ctrl3);
+			(void)mt6360_read(MT6360_CHG_CTRL7, &ctrl7);
+			printf("battery: the MT6360 set: charge %s, the limit's source %u, the input %u mA, "
+			    "the battery %u mA\n", ctrl2 & 1 ? "on" : "off", (ctrl2 >> 2) & 3,
+			    100 + ((ctrl3 >> 2) & 0x3f) * 50, 100 + ((ctrl7 >> 2) & 0x3f) * 100);
+			redwood_host_keep_add("battery: the MT6360 set: charge %s, the limit's source %u, "
+			    "the input %u mA, the battery %u mA", ctrl2 & 1 ? "on" : "off", (ctrl2 >> 2) & 3,
+			    100 + ((ctrl3 >> 2) & 0x3f) * 50, 100 + ((ctrl7 >> 2) & 0x3f) * 100);
+		}
 	}
 
 	for (unsigned tick = 0;; tick++) {
@@ -718,6 +817,8 @@ redwood_battery_init(void)
 	if (!PE_parse_boot_argn("battery", &enabled, sizeof(enabled)) || !enabled) return;
 	if (enabled == 3) {
 		/* the Redmi Note 10S's own: the PMIC's AUXADC and the charger companion, above */
+		(void)PE_parse_boot_argn("chg_aicr", &chg_aicr_ma, sizeof(chg_aicr_ma));
+		(void)PE_parse_boot_argn("chg_ichg", &chg_ichg_ma, sizeof(chg_ichg_ma));
 		if (kernel_thread_start(rosemary_battery_thread, NULL, &thread) == KERN_SUCCESS) {
 			thread_deallocate(thread);
 			printf("battery: this phone's own, read every 5 seconds\n");
