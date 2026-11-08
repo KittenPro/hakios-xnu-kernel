@@ -3,7 +3,7 @@
  * /dev/redwood-touch (sys/redwood_input.h). Only with boot-arg buttons=2: every address below
  * belongs to this phone; buttons=1 is the other phone's, in redwood_buttons.c; buttons=3 is
  * the Redmi Note 10S's, rosemary_keys_thread below -- the same keypad controller at the same
- * place, all three of its keys on the matrix, so no PMIC read at all.
+ * place for the volume keys, the power key on the MT6359P PMIC through the same wrapper.
  *
  * Android's own device tree says where they are (the kp@10010000 node):
  *   volume up    the SoC's keypad controller, key 0 of its map ("kpd-hw-init-map" 0x73)
@@ -353,14 +353,21 @@ keys_thread(__unused void *parameter, __unused wait_result_t result)
 /*
  * The same keypad controller as the Infinix's, at the same address (kp@10010000 of
  * mt6785.dts), the same polarity (a bit of KP_MEM1..5 clear while the key is down, the hw
- * keycode (i << 4) + j of KP_MEM(i+1)'s bit j -- Linux kpd.c), and every key of this phone on
- * the matrix (rosemary's cust.dtsi): kpd-hw-init-map's key 0 is volume down, kpd-hw-pwrkey 8
- * is power, kpd-hw-rstkey 17 is volume up. KP_MEM1 and KP_MEM2 are two halves of one 32-bit
- * word, so one read carries all three: bits 0, 8 and 17.
+ * keycode (i << 4) + j of KP_MEM(i+1)'s bit j -- Linux kpd.c), and both volume keys on the
+ * matrix (rosemary's cust.dtsi): kpd-hw-init-map's key 0 is volume down, kpd-hw-rstkey 17
+ * volume up. KP_MEM1 and KP_MEM2 are separate 16-bit registers here, read one at a time
+ * and masked, for a 32-bit read's upper half reads zero on this SoC -- which ufs22a saw as
+ * one long volume-up press. The power key is not on the matrix at all: this kernel is
+ * built with CONFIG_KPD_PWRKEY_USE_PMIC, Android's power presses arriving as PMIC
+ * interrupts -- and the debounced level they come from is the MT6359P's TOPSTATUS (0x2a)
+ * bit 1, clear while the key is down, through the same PMIC wrapper the Infinix's power
+ * key uses (mt6359p/v1/pmic_irq.c, upmu_hw.h; pwrap@1000d000).
  */
-#define KEY_VOLDN_BIT  (1u << 0)    /* KP_MEM1 bit 0, hw key 0 */
-#define KEY_POWER_BIT  (1u << 8)    /* KP_MEM1 bit 8, hw key 8 */
-#define KEY_VOLUP_BIT  (1u << 17)   /* KP_MEM2 bit 1, hw key 17: the word's upper half */
+#define KP_MEM2         0x0008          /* keys 16..31, its own read on this SoC */
+#define KEY_VOLDN_BIT   (1u << 0)       /* KP_MEM1 bit 0, hw key 0 */
+#define KEY_VOLUP_BIT   (1u << 1)       /* KP_MEM2 bit 1, hw key 17 */
+#define MT6359P_TOPSTATUS 0x2a          /* a word read: bit 1 the power key's level */
+#define PWRKEY_DEB_BIT  (1u << 1)       /* clear while the power key is down */
 
 static struct key rosemary_keys[3] = {
 	{ "volume down", REDWOOD_BUTTON_VOLUME_DOWN, false, false },
@@ -375,16 +382,19 @@ rosemary_keys_thread(__unused void *parameter, __unused wait_result_t result)
 
 	PE_parse_boot_argn("keylog", &log, sizeof(log));
 	kpd = ml_io_map(KPD_PHYS, 0x1000);
-	printf("mtkkeys: the buttons are looked at every 20 ms; keypad %#x (mem1 %#x, mem2 %#x)\n",
-	    rd(kpd, KP_MEM1), rd(kpd, KP_MEM1) & 0xffffu, rd(kpd, KP_MEM1) >> 16);
+	pwrap = ml_io_map(PWRAP_PHYS, 0x1000);
+	printf("mtkkeys: the buttons are looked at every 20 ms; keypad mem1 %#x, mem2 %#x, PMIC %s\n",
+	    rd(kpd, KP_MEM1) & 0xffffu, rd(kpd, KP_MEM2) & 0xffffu,
+	    pwrap_wait(PWRAP_FSM_IDLE) ? "reachable" : "NOT REACHABLE");
 
 	for (unsigned tick = 1;; tick++) {
-		uint32_t both = rd(kpd, KP_MEM1);
+		uint32_t mem1 = rd(kpd, KP_MEM1) & 0xffffu, mem2 = rd(kpd, KP_MEM2) & 0xffffu, top = 0;
 		bool now[3];
 
-		now[0] = !(both & KEY_VOLDN_BIT);
-		now[1] = !(both & KEY_POWER_BIT);
-		now[2] = !(both & KEY_VOLUP_BIT);
+		(void)pmic_read(MT6359P_TOPSTATUS, &top);
+		now[0] = !(mem1 & KEY_VOLDN_BIT);
+		now[1] = !(top & PWRKEY_DEB_BIT);
+		now[2] = !(mem2 & KEY_VOLUP_BIT);
 		for (unsigned i = 0; i < 3; i++) {
 			struct key *k = &rosemary_keys[i];
 
@@ -394,13 +404,14 @@ rosemary_keys_thread(__unused void *parameter, __unused wait_result_t result)
 				redwood_touch_post(k->down ? REDWOOD_BUTTON_DOWN : REDWOOD_BUTTON_UP, k->button, 0, 0);
 				presses += k->down;
 				if (log) {
-					printf("mtkkeys: %s %s (keypad %#x)\n", k->name, k->down ? "down" : "up", both);
+					printf("mtkkeys: %s %s (mem1 %#x, mem2 %#x, PMIC %#x)\n", k->name,
+					    k->down ? "down" : "up", mem1, mem2, top);
 				}
 			}
 			k->seen = now[i];
 		}
 		if (tick % 3000 == 0) {
-			printf("mtkkeys: so far %u presses; keypad %#x\n", presses, both);
+			printf("mtkkeys: so far %u presses; mem1 %#x, mem2 %#x, PMIC %#x\n", presses, mem1, mem2, top);
 		}
 		delay(20000);
 	}
