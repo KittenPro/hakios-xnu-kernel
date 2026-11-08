@@ -308,6 +308,10 @@ battery_thread(__unused void *parameter, __unused wait_result_t result)
 #define TCPC_MTK_CLK_CTRL1  0x87            /* the PD clocks: un-gated 0xca (the vendor's own value) */
 #define TCPC_MTK_CLK_CTRL2  0x88            /* un-gated 0x54: the 24M and the protocol clocks */
 #define TCPC_RX_DETECT_ON   0x21            /* SOP messages and hard resets: a listening sink's ear */
+#define TCPC_ALERT_ON       0x867f          /* the vendor's own set: the receive and its overflow, the line and power
+	                                        * events, the transmit's three verdicts, fault and vendor -- ones, the
+	                                        * TCPCI v1.0 way of saying these alerts may speak */
+#define TCPC_HDR_SINK20     0x02            /* MSG_HDR_INFO: a PD 2.0 sink, UFP -- what the hardware's own GoodCRC says */
 #define TCPC_ALERT_RX_STATUS (1u << 2)      /* a message waits in the FIFO */
 #define TCPC_ALERT_RX_OVERFLOW (1u << 10)   /* the FIFO overflowed; the oldest are lost */
 
@@ -820,20 +824,22 @@ pd_pdo_say(uint32_t pdo, char *out, int len)
 }
 
 /* A message from the brick, if one waits: read, said, and its alert handed back cleared --
- * the vendor's own get_message handshake, nothing else touched. The header's own two
- * objects come with the count in the FIFO's first bytes; the objects themselves follow. */
+ * the vendor's own get_message handshake, nothing else touched. The FIFO is asked at its
+ * own door as well as through the alert: a message can sit unannounced if the alert mask
+ * was left without the receive's bits, and the count register says what waits whatever
+ * the alert says. */
 static void
 tcpc_drain_rx(void)
 {
 	uint16_t alert = 0;
-
-	if (!tcpc_read_word(TCPC_ALERT, &alert) || !(alert & TCPC_ALERT_RX_STATUS)) {
-		return;
-	}
 	uint8_t head[4] = { 0, 0, 0, 0 }, payload[28];
 
+	(void)tcpc_read_word(TCPC_ALERT, &alert);
 	if (!rm_dev_read_block(TCPC_ADDR, TCPC_RX_BYTE_CNT, head, 4)) {
 		return;
+	}
+	if (!(alert & TCPC_ALERT_RX_STATUS) && head[0] == 0) {
+		return;                      /* nothing anywhere */
 	}
 	int n = head[0] > 3 ? head[0] - 3 : 0;
 
@@ -1039,15 +1045,25 @@ rosemary_battery_thread(__unused void *parameter, __unused wait_result_t result)
 				tcpc_drain_rx();    /* whatever waited through the boot, said now */
 			}
 			if (pd_listen) {
-				/* the vendor's set_rx_enable: the clocks un-gated, then the ear on */
-				uint8_t rxdet = 0;
+				/* the vendor's set_rx_enable and init_alert_mask, and the header info its
+				 * policy engine sets for a PD 2.0 sink: clocks un-gated, the ear on, the
+				 * alerts allowed to speak, and the hardware's GoodCRC saying who it
+				 * answers for. Still no word of our own, ever. */
+				uint8_t rxdet = 0, hdr = 0;
+				uint16_t amask = 0;
 
 				(void)rm_dev_write(TCPC_ADDR, TCPC_MTK_CLK_CTRL1, 0xca);
 				(void)rm_dev_write(TCPC_ADDR, TCPC_MTK_CLK_CTRL2, 0x54);
 				(void)rm_dev_write(TCPC_ADDR, TCPC_RX_DETECT, TCPC_RX_DETECT_ON);
+				(void)tcpc_write_word(TCPC_ALERT_MASK, TCPC_ALERT_ON);
+				(void)rm_dev_write(TCPC_ADDR, TCPC_MSG_HDR_INFO, TCPC_HDR_SINK20);
 				(void)rm_dev_read(TCPC_ADDR, TCPC_RX_DETECT, &rxdet);
-				printf("battery: the TCPC's ear on (rx-detect now %#x); listening, never speaking\n", rxdet);
-				redwood_host_keep_add("battery: the TCPC's ear on (rx-detect %#x); listening, never speaking", rxdet);
+				(void)rm_dev_read(TCPC_ADDR, TCPC_MSG_HDR_INFO, &hdr);
+				(void)tcpc_read_word(TCPC_ALERT_MASK, &amask);
+				printf("battery: the TCPC's ear on (rx-detect %#x, mask %04x, hdr-info %#x); "
+				    "listening, never speaking\n", rxdet, amask, hdr);
+				redwood_host_keep_add("battery: the TCPC's ear on (rx-detect %#x, mask %04x, hdr %#x); "
+				    "listening, never speaking", rxdet, amask, hdr);
 			}
 		}
 	}
