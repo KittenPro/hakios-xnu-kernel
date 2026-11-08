@@ -200,9 +200,10 @@ battery_thread(__unused void *parameter, __unused wait_result_t result)
  * mt6785_battery_table.dtsi: a hundred rows a percent apart, 4412 mV at full down to
  * 2857 mV, its middle column in tenth-millivolts read here in millivolts. The battery's
  * temperature the NTC curve would ask for is not brought yet -- the thermistor's
- * millivolts are in the log, and 25 C is said meanwhile; the current waits for the sense
- * resistor's calibration. The charger's currents, and the fast charge with them, are the
- * MT6360's next story.
+ * millivolts are in the log, and 25 C is said meanwhile. The percent and the current are
+ * the fuel gauge's own, the FGADC block below: the counter's coulombs from a voltage
+ * anchor, the averaged current beside the voltage in the log. The charger's currents, and
+ * the fast charge with them, are the MT6360's next story.
  */
 #define RM_GPIO_PHYS        0x10005000
 #define RM_DIR_AT(pin)      (0x0000 + 0x10 * ((pin) / 32))
@@ -219,6 +220,30 @@ battery_thread(__unused void *parameter, __unused wait_result_t result)
 #define MT6359P_HK_TOP_RST_CON0 0xf90       /* the AUXADC's reset, bits 3 and 0 */
 #define MT6359P_HK_TOP_WKEY     0xfb4
 #define MT6359P_CHR_CON0        0xa88       /* bit 0: RGS_CHRDET, a charger on the port */
+
+/* The fuel gauge the PMIC carries (FGADC, mt6359_gauge.c of the phone's kernel): a coulomb
+ * counter (CAR) and an averaged current (IAVG), the counter behind a latch -- the request
+ * bit 0 of CON1 latches a reading, bit 15 says it is done, bit 3 lets it go, and its words
+ * are CAR_CON0's low one and CAR_CON1's high fifteen, thirty-one counts of 0.085 uAh each,
+ * the high word's top bit the discharge side and the count running straight through zero
+ * between charging and giving back. The current is twenty-eight bits of its own, each
+ * 305.176 uA, charging positive, no latch asked of it. This is where Android takes its
+ * percent from, and battery=3 does the same now: one anchor at the start -- the open-circuit
+ * voltage the table turns into percent, the current's IR (a hundred milliohms, the table's
+ * own 73-to-160 column) taken off the terminal voltage first -- and the counter's coulombs
+ * after that, each count 0.085 uAh into the battery's 4952000, so the percent stays put when
+ * a cable goes in or out and only moves as the battery actually fills or empties. A counter
+ * that does not move at a current that should have moved it is a gauge gone asleep, and the
+ * anchor is taken again from the voltage until it comes back. The gauge's switch is CON0's
+ * bit 0, on since Android's last boot; it is checked and set anyway. */
+#define MT6359P_FGADC_CON0      0xd08       /* bit 0: the gauge's switch */
+#define MT6359P_FGADC_CON1      0xd0a       /* bit 0 latches, bit 3 clears, bit 15 done */
+#define MT6359P_FGADC_CAR_CON0  0xd16       /* the coulomb counter's low word */
+#define MT6359P_FGADC_CAR_CON1  0xd18       /* ... and high one, top bit the discharge side */
+#define MT6359P_FGADC_IAVG_CON0 0xd2c       /* the average current's low word */
+#define MT6359P_FGADC_IAVG_CON1 0xd2e       /* 12 bits more; bit 11 the sign, bit 15 valid */
+#define ROSEMARY_QMAX_UAH       4952000     /* the table's own span: 4952 mAh */
+#define ROSEMARY_R_BAT_MOHM     100         /* the battery's own resistance, the table's 73 to 160 */
 
 #define MT6360_PMU_ADDR     0x34            /* the charger half of the companion, on i2c5 */
 #define MT6360_CHG_STAT     0x4a            /* bits 7:6: 0 standby, 1 charging, 2 done, 3 fault */
@@ -289,6 +314,71 @@ rosemary_auxadc(uint32_t channel, uint32_t mask, uint32_t *raw)
 		delay_for_interval(100, NSEC_PER_USEC);
 	}
 	return false;
+}
+
+/* The coulomb counter through its latch, the mt6359_gauge.c way: the request bit set, the
+ * done bit waited for, the two words taken, the latch let go. The wrapper writes a register
+ * whole, so every step is the read-modify-write Linux's own pmic_config_interface does. */
+static bool
+rosemary_fg_car(int64_t *counts)
+{
+	uint32_t con1 = 0, lo = 0, hi = 0;
+	bool done = false;
+
+	if (!redwood_pmic_read(MT6359P_FGADC_CON1, &con1) ||
+	    !redwood_pmic_write(MT6359P_FGADC_CON1, con1 | 0x0001)) {
+		return false;
+	}
+	for (uint32_t spin = 0; spin < 50; spin++) {
+		if (!redwood_pmic_read(MT6359P_FGADC_CON1, &con1)) {
+			return false;
+		}
+		if (con1 & 0x8000) {
+			done = true;
+			break;
+		}
+		delay_for_interval(100, NSEC_PER_USEC);
+	}
+	if (!done || !redwood_pmic_read(MT6359P_FGADC_CAR_CON0, &lo) ||
+	    !redwood_pmic_read(MT6359P_FGADC_CAR_CON1, &hi)) {
+		(void)redwood_pmic_write(MT6359P_FGADC_CON1, con1 & ~0x0009u);
+		return false;
+	}
+	uint32_t raw31 = (hi & 0x7fff) << 16 | (lo & 0xffff);
+
+	*counts = (hi & 0x8000) ? (int64_t)raw31 - 0x7fffffff : (int64_t)raw31;
+
+	/* let the latch go: the clear bit set with the request dropped, the done bit waited out */
+	(void)redwood_pmic_write(MT6359P_FGADC_CON1, (con1 | 0x0008) & ~0x0001u);
+	for (uint32_t spin = 0; spin < 50; spin++) {
+		uint32_t drop = 0;
+
+		if (!redwood_pmic_read(MT6359P_FGADC_CON1, &drop) || !(drop & 0x8000)) {
+			break;
+		}
+		delay_for_interval(100, NSEC_PER_USEC);
+	}
+	(void)redwood_pmic_write(MT6359P_FGADC_CON1, con1 & ~0x0009u);
+	return true;
+}
+
+/* The gauge's averaged current: twenty-eight bits across the two words, the high one's bit 11
+ * the sign (set means the battery giving its charge away) and its bit 15 the words being
+ * valid, each count 305.176 uA -- the driver's own arithmetic with its car_tune of 100. */
+static bool
+rosemary_fg_iavg(int64_t *ua)
+{
+	uint32_t lo = 0, hi = 0;
+
+	if (!redwood_pmic_read(MT6359P_FGADC_IAVG_CON0, &lo) ||
+	    !redwood_pmic_read(MT6359P_FGADC_IAVG_CON1, &hi) || !(hi & 0x8000)) {
+		return false;
+	}
+	uint32_t raw = (hi & 0xfff) << 16 | (lo & 0xffff);
+	int64_t signed_raw = (hi & 0x800) ? (int64_t)raw - 0x10000000 : (int64_t)raw;
+
+	*ua = signed_raw * 305176 / 1000;
+	return true;
 }
 
 /* ---- i2c5 by hand, for the MT6360: the touch's own copy of this is busy on i2c0 -------------------- */
@@ -456,6 +546,10 @@ rosemary_battery_thread(__unused void *parameter, __unused wait_result_t result)
 	struct redwood_battery_state state;
 	uint64_t reads = 0, failed = 0;
 	bool mt6360 = false;
+	bool anchored = false;                    /* the coulomb anchor is taken */
+	int anchor_soc = 0;                       /* the percent the anchor holds, in hundredths */
+	int64_t anchor_car = 0, car_prev = 0;     /* the counter at the anchor and at the last tick */
+	unsigned frozen = 0;                      /* ticks the counter has not moved at a real current */
 
 	memset(&state, 0, sizeof(state));
 	state.size = (int32_t)sizeof(state);
@@ -479,6 +573,12 @@ rosemary_battery_thread(__unused void *parameter, __unused wait_result_t result)
 	(void)redwood_pmic_write(MT6359P_AUXADC_RQST0, w | 0x80);
 	(void)redwood_pmic_read(MT6359P_AUXADC_RQST1, &w);
 	(void)redwood_pmic_write(MT6359P_AUXADC_RQST1, w | 0x40);
+
+	/* the fuel gauge's switch, on since Android's last boot and set here if it ever is not */
+	if (redwood_pmic_read(MT6359P_FGADC_CON0, &w) && !(w & 1)) {
+		(void)redwood_pmic_write(MT6359P_FGADC_CON0, w | 1);
+		printf("battery: the fuel gauge was off; its switch is set\n");
+	}
 
 	/* the companion answers open drain first, then with ones driven: which way is a finding */
 	for (int pushpull = 0; pushpull < 2; pushpull++) {
@@ -504,8 +604,10 @@ rosemary_battery_thread(__unused void *parameter, __unused wait_result_t result)
 	for (unsigned tick = 0;; tick++) {
 		uint32_t batadc = 0, isense = 0, vcdt = 0, ntc = 0, chrdet = 0;
 		uint8_t stat = 0, stat1 = 0;
-		int chgstat = -1, pwr_rdy = 0, charger, status, soc;
+		int chgstat = -1, pwr_rdy = 0, charger, status, soc, ma, ocv;
 		uint32_t vbat, vbus;
+		int64_t car = 0, ua = 0;
+		bool car_ok, by_coulombs = false;
 
 		if (!rosemary_auxadc(0, 0x7fff, &batadc) || !rosemary_auxadc(1, 0x7fff, &isense) ||
 		    !rosemary_auxadc(2, 0x0fff, &vcdt) || !rosemary_auxadc(3, 0x0fff, &ntc) ||
@@ -522,6 +624,43 @@ rosemary_battery_thread(__unused void *parameter, __unused wait_result_t result)
 		battery_vcdt_raw = (int)vcdt;
 		battery_ntc_mv = (int)(ntc * 4500u >> 12);    /* <5 2> over 12 bits */
 
+		car_ok = rosemary_fg_car(&car);
+		(void)rosemary_fg_iavg(&ua);
+		ma = (int)(ua / 1000);                    /* the averaged current, charging positive */
+		ocv = (int)vbat - ma * ROSEMARY_R_BAT_MOHM / 1000;  /* its IR off the terminal voltage */
+
+		/* the anchor at the start, and again whenever the counter has stopped counting: the
+		 * voltage's own estimate, taken at the gauge's side of the resistor */
+		if (car_ok) {
+			if (!anchored) {
+				anchor_soc = rosemary_soc(ocv > 0 ? (uint32_t)ocv : vbat);
+				anchor_car = car;
+				anchored = true;
+				frozen = 0;
+			} else if (car != car_prev) {
+				frozen = 0;
+			} else if (ma > 100 || ma < -100) {
+				if (++frozen >= 3) {
+					anchor_soc = rosemary_soc(ocv > 0 ? (uint32_t)ocv : vbat);
+					anchor_car = car;
+					frozen = 0;
+				}
+			}
+			car_prev = car;
+		}
+		if (car_ok && anchored) {
+			/* the coulombs since the anchor: each count 0.085 uAh into the battery's own 4952 mAh */
+			int64_t duah = (car - anchor_car) * 85 / 1000;
+			int dsoc = (int)(duah * 10000 / ROSEMARY_QMAX_UAH);
+
+			soc = anchor_soc + dsoc;
+			if (soc < 0) soc = 0;
+			if (soc > 10000) soc = 10000;
+			by_coulombs = true;
+		} else {
+			soc = rosemary_soc(vbat);
+		}
+
 		if (mt6360) {
 			if (mt6360_read(MT6360_CHG_STAT, &stat)) {
 				chgstat = (stat >> 6) & 3;
@@ -531,7 +670,6 @@ rosemary_battery_thread(__unused void *parameter, __unused wait_result_t result)
 			}
 		}
 		charger = (chrdet & 1) != 0 || pwr_rdy != 0;
-		soc = rosemary_soc(vbat);
 
 		/* Linux's POWER_SUPPLY_STATUS_*: 1 charging, 2 discharging, 3 not charging, 4 full */
 		if (!charger) {
@@ -548,6 +686,7 @@ rosemary_battery_thread(__unused void *parameter, __unused wait_result_t result)
 
 		state.percent_hundredths = soc;
 		state.voltage_uv = (int32_t)(vbat * 1000);
+		state.current_ua = (int32_t)ua;
 		state.present = vbat >= 2500 && vbat <= 5500;
 		state.external = charger;
 		state.status = status;
@@ -557,9 +696,11 @@ rosemary_battery_thread(__unused void *parameter, __unused wait_result_t result)
 		battery_source_dsp = 2;                  /* not the DSP: this driver's own reading */
 
 		if (tick % 12 == 0) {
-			printf("battery: SOC=%d.%02d%%, V=%u mV, port=%u mV (vcdt %u), NTC=%d mV, isense %u, "
-			    "charger=%d (chrdet %u, pwr_rdy %d, chgstat %d), %llu reads, %llu failed\n",
-			    soc / 100, soc % 100, vbat, vbus, vcdt, battery_ntc_mv, isense, charger,
+			printf("battery: SOC=%d.%02d%% by %s, V=%u mV, I=%d mA, CAR=%lld, port=%u mV (vcdt %u), "
+			    "NTC=%d mV, isense %u, charger=%d (chrdet %u, pwr_rdy %d, chgstat %d), "
+			    "%llu reads, %llu failed\n",
+			    soc / 100, soc % 100, by_coulombs ? "coulombs" : "voltage", vbat, ma,
+			    (long long)car, vbus, vcdt, battery_ntc_mv, isense, charger,
 			    chrdet & 1, pwr_rdy, chgstat, reads, failed);
 		}
 		delay_for_interval(5000, NSEC_PER_MSEC);
