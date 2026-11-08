@@ -1650,6 +1650,8 @@ send_button(IOHIDServiceClientRef buttons, const struct redwood_touch *t)
 	    HID_USAGE_VOLUME_DOWN : 0;
 	IOHIDEventRef event;
 
+	say("redwood: input: button %u %s, usage %#x, service %p\n", t->finger,
+	    t->type == REDWOOD_BUTTON_DOWN ? "down" : "up", usage, (void *)buttons);
 	if (usage == 0) {
 		return;
 	}
@@ -1733,6 +1735,9 @@ input_thread(__unused void *arg)
 		if (t.type > REDWOOD_TOUCH_UP) {
 			if (buttons != NULL) {
 				send_button(buttons, &t);
+			} else {
+				say("redwood: input: button %u %s, but no buttons service\n", t.finger,
+				    t.type == REDWOOD_BUTTON_DOWN ? "down" : "up");
 			}
 		} else if (t.type == REDWOOD_TOUCH_DOWN && (touch_mode & 0xff) == TOUCH_MODE_WAKE && buttons != NULL) {
 			/*
