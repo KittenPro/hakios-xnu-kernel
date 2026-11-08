@@ -2,8 +2,9 @@
  * The buttons of the Infinix Hot 20 (X6826B), as a source of button presses for
  * /dev/redwood-touch (sys/redwood_input.h). Only with boot-arg buttons=2: every address below
  * belongs to this phone; buttons=1 is the other phone's, in redwood_buttons.c; buttons=3 is
- * the Redmi Note 10S's, rosemary_keys_thread below -- the same keypad controller at the same
- * place for the volume keys, the power key on the MT6359P PMIC through the same wrapper.
+ * the Redmi Note 10S's, rosemary_keys_thread below -- volume down on the same keypad
+ * controller at the same place, power and volume up on the MT6359P PMIC through the same
+ * wrapper.
  *
  * Android's own device tree says where they are (the kp@10010000 node):
  *   volume up    the SoC's keypad controller, key 0 of its map ("kpd-hw-init-map" 0x73)
@@ -353,21 +354,24 @@ keys_thread(__unused void *parameter, __unused wait_result_t result)
 /*
  * The same keypad controller as the Infinix's, at the same address (kp@10010000 of
  * mt6785.dts), the same polarity (a bit of KP_MEM1..5 clear while the key is down, the hw
- * keycode (i << 4) + j of KP_MEM(i+1)'s bit j -- Linux kpd.c), and both volume keys on the
- * matrix (rosemary's cust.dtsi): kpd-hw-init-map's key 0 is volume down, kpd-hw-rstkey 17
- * volume up. KP_MEM1 and KP_MEM2 are separate 16-bit registers here, read one at a time
- * and masked, for a 32-bit read's upper half reads zero on this SoC -- which ufs22a saw as
- * one long volume-up press. The power key is not on the matrix at all: this kernel is
- * built with CONFIG_KPD_PWRKEY_USE_PMIC, Android's power presses arriving as PMIC
- * interrupts -- and the debounced level they come from is the MT6359P's TOPSTATUS (0x2a)
- * bit 1, clear while the key is down, through the same PMIC wrapper the Infinix's power
- * key uses (mt6359p/v1/pmic_irq.c, upmu_hw.h; pwrap@1000d000).
+ * keycode (i << 4) + j of KP_MEM(i+1)'s bit j -- Linux kpd.c), and only one key of this
+ * phone on the matrix: volume down, kpd-hw-init-map's key 0 of rosemary's cust.dtsi. ufs22b
+ * proved it -- every press cleared KP_MEM1 bit 0 -- while volume up never moved the matrix.
+ * It cannot: with CONFIG_KPD_PWRKEY_USE_PMIC, kpd.c zeroes the map's keys 8 (this phone's
+ * kpd-hw-pwrkey) and 17, 26, 35... (its kpd-hw-rstkey and the same column), and those presses
+ * arrive as PMIC interrupts instead: INT_PWRKEY through kpd_pwrkey_pmic_handler, INT_HOMEKEY
+ * through kpd_pmic_rstkey_handler -- and this phone's sw-rstkey is 115, KEY_VOLUME_UP. So all
+ * of power and volume up is two bits of the MT6359P's TOPSTATUS (0x2a), both clear while
+ * down, through the same PMIC wrapper the Infinix's power key uses (mt6359p/v1/pmic_irq.c,
+ * upmu_hw.h; pwrap@1000d000). keylog=1 also prints the raw mem1..3 and PMIC word whenever
+ * any bit of them changes, to check the wiring of whatever key is pressed against.
  */
 #define KP_MEM2         0x0008          /* keys 16..31, its own read on this SoC */
+#define KP_MEM3         0x000c          /* keys 32..47, watched for the wiring's sake */
 #define KEY_VOLDN_BIT   (1u << 0)       /* KP_MEM1 bit 0, hw key 0 */
-#define KEY_VOLUP_BIT   (1u << 1)       /* KP_MEM2 bit 1, hw key 17 */
-#define MT6359P_TOPSTATUS 0x2a          /* a word read: bit 1 the power key's level */
+#define MT6359P_TOPSTATUS 0x2a          /* a word read: bit 1 the power key's level, bit 3 the home key's */
 #define PWRKEY_DEB_BIT  (1u << 1)       /* clear while the power key is down */
+#define HOMEKEY_DEB_BIT (1u << 3)       /* clear while the volume up key is down */
 
 static struct key rosemary_keys[3] = {
 	{ "volume down", REDWOOD_BUTTON_VOLUME_DOWN, false, false },
@@ -379,22 +383,28 @@ static void
 rosemary_keys_thread(__unused void *parameter, __unused wait_result_t result)
 {
 	uint32_t log = 0, presses = 0;
+	uint32_t was1 = 0, was2 = 0, was3 = 0, wastop = 0;
 
 	PE_parse_boot_argn("keylog", &log, sizeof(log));
 	kpd = ml_io_map(KPD_PHYS, 0x1000);
 	pwrap = ml_io_map(PWRAP_PHYS, 0x1000);
-	printf("mtkkeys: the buttons are looked at every 20 ms; keypad mem1 %#x, mem2 %#x, PMIC %s\n",
-	    rd(kpd, KP_MEM1) & 0xffffu, rd(kpd, KP_MEM2) & 0xffffu,
+	printf("mtkkeys: the buttons are looked at every 20 ms; keypad mem1 %#x, mem2 %#x, mem3 %#x, PMIC %s\n",
+	    rd(kpd, KP_MEM1) & 0xffffu, rd(kpd, KP_MEM2) & 0xffffu, rd(kpd, KP_MEM3) & 0xffffu,
 	    pwrap_wait(PWRAP_FSM_IDLE) ? "reachable" : "NOT REACHABLE");
 
 	for (unsigned tick = 1;; tick++) {
-		uint32_t mem1 = rd(kpd, KP_MEM1) & 0xffffu, mem2 = rd(kpd, KP_MEM2) & 0xffffu, top = 0;
+		uint32_t mem1 = rd(kpd, KP_MEM1) & 0xffffu, mem2 = rd(kpd, KP_MEM2) & 0xffffu,
+		    mem3 = rd(kpd, KP_MEM3) & 0xffffu, top = 0;
 		bool now[3];
 
 		(void)pmic_read(MT6359P_TOPSTATUS, &top);
+		if (log && (mem1 != was1 || mem2 != was2 || mem3 != was3 || top != wastop)) {
+			printf("mtkkeys: raw mem1 %#x, mem2 %#x, mem3 %#x, PMIC %#x\n", mem1, mem2, mem3, top);
+		}
+		was1 = mem1; was2 = mem2; was3 = mem3; wastop = top;
 		now[0] = !(mem1 & KEY_VOLDN_BIT);
 		now[1] = !(top & PWRKEY_DEB_BIT);
-		now[2] = !(mem2 & KEY_VOLUP_BIT);
+		now[2] = !(top & HOMEKEY_DEB_BIT);
 		for (unsigned i = 0; i < 3; i++) {
 			struct key *k = &rosemary_keys[i];
 
@@ -404,14 +414,15 @@ rosemary_keys_thread(__unused void *parameter, __unused wait_result_t result)
 				redwood_touch_post(k->down ? REDWOOD_BUTTON_DOWN : REDWOOD_BUTTON_UP, k->button, 0, 0);
 				presses += k->down;
 				if (log) {
-					printf("mtkkeys: %s %s (mem1 %#x, mem2 %#x, PMIC %#x)\n", k->name,
-					    k->down ? "down" : "up", mem1, mem2, top);
+					printf("mtkkeys: %s %s (mem1 %#x, mem2 %#x, mem3 %#x, PMIC %#x)\n", k->name,
+					    k->down ? "down" : "up", mem1, mem2, mem3, top);
 				}
 			}
 			k->seen = now[i];
 		}
 		if (tick % 3000 == 0) {
-			printf("mtkkeys: so far %u presses; mem1 %#x, mem2 %#x, PMIC %#x\n", presses, mem1, mem2, top);
+			printf("mtkkeys: so far %u presses; mem1 %#x, mem2 %#x, mem3 %#x, PMIC %#x\n",
+			    presses, mem1, mem2, mem3, top);
 		}
 		delay(20000);
 	}
