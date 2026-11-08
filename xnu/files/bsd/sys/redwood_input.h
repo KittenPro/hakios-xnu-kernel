@@ -84,7 +84,7 @@ void redwood_adreno_quiesce(void);      /* on the way back to the loader: the GP
 void redwood_adreno_stop(void);         /* before that, where the ending is no panic's: the GPU given back in order */
 void redwood_adreno_minute(void);       /* once a minute: a line about how warm the GPU is, if it is in use */
 void redwood_scp_init(void);            /* boot-arg scp_step=N: the MT6768's SCP (the sensor hub), steps 1 to N */
-void redwood_connsys_init(void);        /* boot-arg connsys_step=N: the Infinix's CONNSYS (Wi-Fi/BT), steps 1 to N */
+void redwood_connsys_init(void);        /* boot-arg connsys_step=N: the phone's CONNSYS (Wi-Fi/BT), steps 1 to N */
 /* CONNSYS's memory (Android's consys-reserve-memory), and the AP's the Wi-Fi's DMA and BTIF's FIFO use (its
  * wifi-reserve-memory): both outside XNU's, which begins at 0xc0000000 (mtkloader.c) */
 #define REDWOOD_CONNSYS_EMI_PHYS        0x51000000u

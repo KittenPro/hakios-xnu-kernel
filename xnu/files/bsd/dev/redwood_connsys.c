@@ -1,28 +1,34 @@
 /*
- * CONNSYS, the Wi-Fi/Bluetooth/GPS subsystem of the Infinix Hot 20's MT6768 (with the MT6631 radio):
- * docs/wifi-x6826b.md. Steps 1 and 2 read only; 3 and 4 write (the PMIC's supplies, then the power domain).
+ * CONNSYS, the Wi-Fi/Bluetooth/GPS subsystem of the Redmi Note 10S's MT6785 (the radio on the SoC's
+ * own die): the recipe is docs/wifi-x6826b.md's, the Infinix Hot 20 (MT6768) port this file once was
+ * -- the run numbers in the comments below are that phone's, and the lessons with them. Steps 1 and 2
+ * read only; 3 and 4 write (the PMIC's supplies, then the power domain).
  *
  * The addresses are the ones Android's device tree gives MediaTek's driver for this SoC
- * (consys@18002000, "mediatek,mt6768-consys", printed by mtkloader/mtkconnsys.h), and what is read
- * is what that driver reads (common_main/platform/mt6768.c and include/mt6768.h in
- * MiCode/MTK_kernel_modules, merlin-r-oss):
+ * (consys@18002000, "mediatek,mt6785-consys", printed by mtkloader/mtkconnsys.h), and what is written
+ * is what that driver writes (common_main/platform/mt6785.c and include/mt6785.h of the rosemary-r
+ * kernel, xiaomi-mt6785-dev/android_kernel_xiaomi_mt6785) -- except the power domain itself, whose
+ * canon is Linux's own scpsys (spm_mtcmos_ctrl_conn of drivers/clk/mediatek/clk-mt6785-pg.c, what
+ * Android's "scp_conn_main" clock reaches):
  *
- *   SPM (0x10006000)     +0x32C  TOP1_PWR_CTRL  bit 0 reset released, 1 isolation, 2 power on, 3 power on (second),
+ *   SPM (0x10006000)     +0x320  CONN_PWR_CON   bit 0 reset released, 1 isolation, 2 power on, 3 power on (second),
  *                                               4 clock
- *                        +0x180  PWR_STATUS     bit 1 CONNSYS on, bit 30 its second (TOP2) domain on
- *                        +0x184  PWR_STATUS_2ND the same, from the other half of the power switch
- *   MCU_TOP_MISC_OFF (0x180B1000) +0x10  CONSYS_IP_VER: 0x10020501 once CONNSYS runs; +0x1C its configuration
+ *                        +0x160  PWR_STATUS     bit 1 CONNSYS on
+ *                        +0x164  PWR_STATUS_2ND the same, from the other half of the power switch
+ *                        (no second domain: the MT6768's TOP2, bit 30, has no counterpart here)
+ *   MCU_TOP_MISC_OFF (0x180B1000) +0x10  CONSYS_IP_VER: 0x10020600 once CONNSYS runs; +0x1C its configuration
  *   MCU (0x18002000)     +0x00  hardware version, +0x04 firmware (ROM) version
  *
- * The CONNSYS registers (the last two blocks) are read only when SPM says both of its domains are on:
- * a read of a powered-off block of this kind can hang the bus. Android powers CONNSYS on at its own
- * start and LK does not, so after a boot of XNU straight from LK it is expected to be off.
+ * The CONNSYS registers (the last two blocks) are read only when SPM says the domain is on: a read of
+ * a powered-off block of this kind can hang the bus. Android powers CONNSYS on at its own start and
+ * LK does not, so after a boot of XNU straight from LK it is expected to be off.
  *
  * Boot-arg connsys_step=1; 2 also reads its supplies, 3 turns them on, 4 powers CONNSYS up, 5 puts its firmware in and lets its CPU go, 6 also
  * listens on BTIF, 7 asks WMT for the chip ID through it, 8 puts STP into its full mode (below); 9 reads the MCU's
  * patch and says what would be sent, 10 sends it the PDA way and resets WMT before the full mode, as Android does
  * on this chip (connsys_pda_patch), 11 sends what Android's WMT does after the full mode (connsys_sw_init); 12 and on
- * are the Wi-Fi's own (redwood_mtkwifi.c). What it finds is said once and kept for the end of the log.
+ * are the Wi-Fi's own (redwood_mtkwifi.c -- whose own constants are still the MT6768's, not adapted
+ * yet). What it finds is said once and kept for the end of the log.
  */
 
 #include <kern/clock.h>
@@ -46,16 +52,15 @@ extern void redwood_host_keep_add(const char *format, ...) __printflike(1, 2);
 extern void delay(int usec);
 
 #define SPM_PHYS                0x10006000u
-#define SPM_TOP1_PWR_CTRL       0x32C
-#define SPM_PWR_STATUS          0x180
-#define SPM_PWR_STATUS_2ND      0x184
+#define SPM_CONN_PWR_CON        0x320
+#define SPM_PWR_STATUS          0x160
+#define SPM_PWR_STATUS_2ND      0x164
 #define PWR_STATUS_CONN         (1u << 1)
-#define PWR_STATUS_CONN_TOP2    (1u << 30)
 
 #define MCU_TOP_MISC_OFF_PHYS   0x180B1000u
 #define CONSYS_IP_VER           0x10
 #define CONSYS_CONF_ID          0x1C
-#define CONSYS_IP_VER_ID        0x10020501u
+#define CONSYS_IP_VER_ID        0x10020600u
 
 #define MCU_PHYS                0x18002000u
 #define CONSYS_HW_ID            0x00
@@ -76,11 +81,16 @@ connsys_ms(void)
 }
 
 /*
- * Step 2a (connsys_step=2), reading only: CONNSYS's supplies as LK leaves them -- the PMIC MT6358's
- * LDOs VCN18, VCN28 and VCN33 (two enables: Bluetooth's and Wi-Fi's), each its enable register and its
- * analog register with the voltage selection (include/linux/mfd/mt6358/registers.h of the MT6768's
- * vendor kernel), read through the PMIC wrapper's WACS2 channel as redwood_mtkkeys.c reads the PMIC.
- * Android turns VCN18 and VCN33 on (consys_hw_vcn18_ctrl in mt6768.c) before it powers CONNSYS up.
+ * Step 2a (connsys_step=2), reading only: CONNSYS's supplies as LK leaves them -- the PMIC MT6359's
+ * LDOs VCN18, VCN33_1 (the BT/Wi-Fi PALDO: two enables in the one CON0, bits 0 and 15) and VCN33_2
+ * (the efuse read's 2.8 V rail, FM/GPS's in co-clock mode -- what the MT6768's VCN28 was), each its
+ * CON0, its OP_EN and its analog register with the voltage selection (include/linux/mfd/mt6359/
+ * registers.h and mt-plat/mt6785/include/mach/upmu_hw.h of this phone's kernel), read through the
+ * PMIC wrapper's WACS2 channel as redwood_mtkkeys.c reads the PMIC: the wrapper is the MT6768's own.
+ * Android turns VCN18 and VCN33_1 on before it powers CONNSYS up (consys_hw_vcn18_ctrl, mt6785.c).
+ * Which OP_EN bit software control is, and what LK leaves in these at all, the sources name only
+ * through an enum that never leaves the vendor's binary: step 3 writes no OP_EN until this has been
+ * read and said (boot-arg connsys_op_en=N there, once known).
  */
 #define PWRAP_PHYS              0x1000d000u
 #define PWRAP_WACS2_CMD         0xc20
@@ -119,20 +129,32 @@ connsys_pmic_read(uint32_t reg, uint32_t *value)
 static void
 connsys_power_report(void)
 {
-	static const struct { const char *name; uint32_t enable, analog; } ldo[] = {
-		{ "VCN18", 0x1c58, 0x1e8c },
-		{ "VCN28", 0x1d88, 0x1e14 },
-		{ "VCN33 (BT)", 0x1d1c, 0x1e28 },
-		{ "VCN33 (Wi-Fi)", 0x1d2a, 0x1e28 },
+	static const struct { const char *name; uint32_t con0, op_en, analog; } ldo[] = {
+		{ "VCN18", 0x1c2a, 0x1c2e, 0 },
+		{ "VCN33_1", 0x1bd8, 0x1bdc, 0x1f98 },
+		{ "VCN33_2", 0x1c08, 0x1c0c, 0x1f9c },
 	};
 
 	connsys_pwrap = ml_io_map(PWRAP_PHYS, 0x1000);
 	for (unsigned i = 0; i < sizeof(ldo) / sizeof(ldo[0]); i++) {
-		uint32_t enable = 0xdead, analog = 0xdead;
-		bool read = connsys_pmic_read(ldo[i].enable, &enable) && connsys_pmic_read(ldo[i].analog, &analog);
+		uint32_t con0 = 0xdead, op_en = 0xdead, analog = 0xdead;
+		bool read = connsys_pmic_read(ldo[i].con0, &con0) && connsys_pmic_read(ldo[i].op_en, &op_en) &&
+		    (ldo[i].analog == 0 || connsys_pmic_read(ldo[i].analog, &analog));
 
-		redwood_host_keep_add("connsys: step 2: %s: %s, enable register %#x = %#x, analog %#x = %#x", ldo[i].name,
-		    read ? ((enable & 1) ? "ON" : "off") : "NOT READ", ldo[i].enable, enable, ldo[i].analog, analog);
+		redwood_host_keep_add("connsys: step 2: %s: %s, CON0 %#x = %#x (EN %u, LP %u, OP_MODE %u), "
+		    "OP_EN %#x = %#x, analog %#x = %#x (VOSEL %u)", ldo[i].name,
+		    read ? ((con0 & 1) ? "ON" : "off") : "NOT READ", ldo[i].con0, con0, con0 & 1, (con0 >> 1) & 1,
+		    (con0 >> 10) & 1, ldo[i].op_en, op_en, ldo[i].analog, analog,
+		    ldo[i].analog != 0 ? (analog >> 8) & 0xf : 0);
+	}
+	{
+		uint32_t cw00 = 0;
+
+		/* the 26 MHz buffer of co-clock mode (below, step 3): the MT6359 keeps the MT6358's register */
+		if (connsys_pmic_read(0x788, &cw00)) {
+			redwood_host_keep_add("connsys: step 2: XO_WCN: DCXO_CW00 %#x (EXTBUF2 EN_M %u, MODE %u)",
+			    cw00, (cw00 >> 5) & 1, (cw00 >> 3) & 3);
+		}
 	}
 }
 
@@ -156,70 +178,89 @@ connsys_pmic_update(uint32_t reg, uint32_t mask, uint32_t value)
 }
 
 /*
- * XO_WCN, the PMIC's 26 MHz buffer for CONNSYS in co-clock mode (WMT_SOC.cfg co_clock_flag=1): Android's log at boot
- * has "PMIC_CLK_BUF?_STATUS=2 1 1 2 0 0 0" -- buffer 2, XO_WCN, under software control -- and "DCXO_CW00/01/02/11/
- * 14/16/23=0x4e1d 6d55 ...", and turns it on before CONNSYS's power-on ("co clock type(1),turn on clk buf",
- * mtk_wcn_consys_hw_reg_ctrl -> clk_buf_ctrl(CLK_BUF_CONN, true)): XO_EXTBUF2_EN_M, bit 5 of DCXO_CW00. Until run
- * 428 nothing here did; the MCU dies within 5 ms of entering the patch, awake (HCLK, OSC on, SLEEP off), pc 0 -- as
- * would a patch that starts the radio's die with no clock. DCXO_CW00 is 0x788 and CW01 0x78e in the MT6358's map as
- * I read it: the bit is set only when 0x788 holds what Android printed (bit 5 aside), so that a wrong address is
- * read and said, never written. Boot-arg connsys_xo=0: left as it is.
+ * XO_WCN, the PMIC's 26 MHz buffer for CONNSYS in co-clock mode (WMT_SOC.cfg co_clock_flag=1, as the
+ * Infinix's): Android turns it on before CONNSYS's power-on ("co clock type(1),turn on clk buf",
+ * mtk_wcn_consys_hw_reg_ctrl -> clk_buf_ctrl(CLK_BUF_CONN, true)) through the clkbuf driver
+ * (base/power/clkbuf_v1/mt6785/mtk_clkbuf_hw.c of this phone's kernel), whose force-on is: the
+ * wrapper's DCXO_ENABLE (PWRAP+0x190) bit 1, DCXO_CONN_ENABLE, cleared, and DCXO_CW00's EXTBUF2 --
+ * the WCN buffer -- put under software control (its MODE bits, 4:3, cleared through DCXO_CW00_CLR
+ * +0x78c) and let out (EN_M, bit 5, set through DCXO_CW00_SET +0x78a); the register addresses and
+ * bits are the MT6358's own, which the MT6359 keeps. The rest of DCXO_CW00 is only read and said,
+ * never written: what Android leaves it at, no log of this phone says yet (the Infinix's boot had
+ * 0x4e1d, and only bit 5 was ever written there). Boot-arg connsys_xo=0: left as it is.
  */
 static void
 connsys_xo_wcn_on(void)
 {
-	uint32_t cw00 = 0, cw01 = 0, after = 0, wanted = 1;
-	bool known;
+	uint32_t wanted = 1, cw00 = 0, after = 0, dcxo_en;
 
 	(void)PE_parse_boot_argn("connsys_xo", &wanted, sizeof(wanted));
-	if (!connsys_pmic_read(0x788, &cw00) || !connsys_pmic_read(0x78e, &cw01)) {
-		redwood_host_keep_add("connsys: step 3: XO_WCN: DCXO_CW00/CW01 not read (the wrapper did not answer)");
+	if (!connsys_pmic_read(0x788, &cw00)) {
+		redwood_host_keep_add("connsys: step 3: XO_WCN: DCXO_CW00 not read (the wrapper did not answer)");
 		return;
 	}
-	known = (cw00 & ~0x20u) == (0x4e1du & ~0x20u);
-	if (wanted != 0 && known && (cw00 & 0x20u) == 0) {
-		(void)connsys_pmic_update(0x788, 0x20u, 0x20u);
+	dcxo_en = rd(connsys_pwrap, 0x190);
+	if (wanted != 0) {
+		*(volatile uint32_t *)(connsys_pwrap + 0x190) = dcxo_en & ~(1u << 1);    /* DCXO_CONN_ENABLE off: SW control */
+		(void)connsys_pmic_write(0x78c, 0x18u);                            /* CW00_CLR: EXTBUF2_MODE -> 0, software */
+		(void)connsys_pmic_write(0x78a, 0x20u);                            /* CW00_SET: EXTBUF2_EN_M on */
 		delay_for_interval(2, NSEC_PER_MSEC);
 	}
 	(void)connsys_pmic_read(0x788, &after);
-	redwood_host_keep_add("connsys: step 3: XO_WCN: DCXO_CW00 %#x CW01 %#x (%s) -> CW00 %#x, XO_EXTBUF2_EN_M %u%s", cw00, cw01,
-	    known ? "Android's boot value" : "NOT Android's 0x4e1d: not written", after, (after >> 5) & 1,
-	    wanted == 0 ? " (connsys_xo=0)" : "");
+	redwood_host_keep_add("connsys: step 3: XO_WCN: DCXO_CW00 %#x (EN_M %u, MODE %u), PWRAP+0x190 %#x -> %#x -> "
+	    "CW00 %#x (EN_M %u%s)", cw00, (cw00 >> 5) & 1, (cw00 >> 3) & 3, dcxo_en, rd(connsys_pwrap, 0x190), after,
+	    (after >> 5) & 1, wanted == 0 ? ", connsys_xo=0: left as it is" : "");
 }
 
 /*
- * Step 3 (connsys_step=3): the supplies on, as consys_hw_vcn18_ctrl, consys_hw_wifi/bt_vcn33_ctrl and
- * mtk_wcn_consys_hw_efuse_paldo_ctrl do it (mt6768.c, mtk_wcn_consys_hw.c) with values from the MT6358
- * regulator driver: VCN18 (fixed 1.8 V) and VCN33 to software control (their OP_EN registers = 1),
- * VCN33's voltage selection to 3.3 V (VCN33_ANA_CON0 bits 8-9 = 1; LK leaves 3, 3.5 V), its Bluetooth
- * and Wi-Fi enables, and VCN28 (fixed 2.8 V, for the efuse). Then all four read again.
+ * Step 3 (connsys_step=3): the supplies on, as consys_hw_vcn18_ctrl, consys_hw_bt/wifi_vcn33_ctrl and
+ * mtk_wcn_consys_hw_efuse_paldo_ctrl do it (mt6785.c, mtk_wcn_consys_hw.c): VCN18 (fixed 1.8 V) on,
+ * VCN33_1 to 3.3 V (its VOSEL, VCN33_1_ANA_CON0 bits 11-8, to 1) with both its enables -- bit 0 and
+ * bit 15 of the one CON0, what the MT6768 had two registers for -- and VCN33_2 on at its default
+ * 2.8 V (the efuse read's rail). What Android's PMIC driver also does is put each LDO under software
+ * control through its OP_EN register (pmic_ldo_*_lp of pmic_lp_api.c) -- a bit the sources name only
+ * through the enum of the last comment, so none is written until run 1 of step 2 has said what LK
+ * leaves: boot-arg connsys_op_en=N then writes N into all three. Then all three read again, and the
+ * clock buffer of co-clock mode turned on.
  */
 static void
 connsys_supplies_on(void)
 {
-	bool ok = connsys_pmic_write(0x1c5a, 1) &&              /* LDO_VCN18_OP_EN: SW */
-	    connsys_pmic_update(0x1c58, 1, 1) &&                /* LDO_VCN18_CON0: EN */
-	    connsys_pmic_write(0x1d1e, 1) &&                    /* LDO_VCN33_OP_EN: SW */
-	    connsys_pmic_update(0x1e28, 0x300, 0x100) &&        /* VCN33_ANA_CON0: VOSEL 3.3 V */
-	    connsys_pmic_update(0x1d1c, 1, 1) &&                /* LDO_VCN33_CON0_0: EN (Bluetooth's) */
-	    connsys_pmic_update(0x1d2a, 1, 1) &&                /* LDO_VCN33_CON0_1: EN (Wi-Fi's) */
-	    connsys_pmic_update(0x1d88, 1, 1);                  /* LDO_VCN28_CON0: EN */
+	uint32_t op_en = 0;
+	bool ok;
+
+	(void)PE_parse_boot_argn("connsys_op_en", &op_en, sizeof(op_en));
+	ok = connsys_pmic_update(0x1c2a, 1, 1);                /* LDO_VCN18_CON0: EN */
+	ok &= connsys_pmic_update(0x1f98, 0xf00u, 0x100u);     /* VCN33_1_ANA_CON0: VOSEL (bits 11-8) 3.3 V */
+	ok &= connsys_pmic_update(0x1bd8, 0x8001u, 0x8001u);   /* LDO_VCN33_1_CON0: EN_0 and EN_1 (bits 0 and 15) */
+	ok &= connsys_pmic_update(0x1c08, 1, 1);               /* LDO_VCN33_2_CON0: EN (2.8 V as it stands) */
+	if (op_en != 0) {
+		ok &= connsys_pmic_update(0x1c2e, 0xffu, op_en & 0xffu);   /* the three OP_EN registers, once step 2 */
+		ok &= connsys_pmic_update(0x1bdc, 0xffu, op_en & 0xffu);   /* has said which bit software control is */
+		ok &= connsys_pmic_update(0x1c0c, 0xffu, op_en & 0xffu);
+	}
 
 	delay(1000);
-	redwood_host_keep_add("connsys: step 3: VCN18, VCN33 (3.3 V) and VCN28 turned on: %s", ok ? "written" : "THE WRAPPER DID NOT ANSWER");
+	redwood_host_keep_add("connsys: step 3: VCN18, VCN33_1 (3.3 V) and VCN33_2 turned on: %s%s", ok ? "written" :
+	    "THE WRAPPER DID NOT ANSWER", op_en != 0 ? ", OP_EN written" : " (OP_EN left as LK had it: connsys_op_en=0)");
 	connsys_power_report();
 	connsys_xo_wcn_on();
 }
 
 /*
- * Step 4 (connsys_step=4): CONNSYS powered up, as consys_set_if_pinmux, consys_hw_reset_bit_set and the
- * hand-made branch of consys_hw_power_ctrl do it (mt6768.c; Android goes through the clock framework's
- * clk_scp_conn_main, which does the same), every wait bounded and said instead of endless: the pins to
- * the radio, the CPU held in reset, SPM's key, the on-domain's two parts powered (each waiting for its
- * ack), the bus clock on, isolation off, the off-domain's acks, the software reset let go, the bus
- * protections (AP to CONNSYS, CONNSYS to AP) taken off, SPM's apsrc/ddr settings; then CONNSYS's IP
- * version polled -- 0x10020501 is the MT6768's and says it lives. The clock buffer of co-clock mode
- * (WMT_SOC.cfg: co_clock_flag=1, Android's clk_buf driver) is not done yet.
+ * Step 4 (connsys_step=4): CONNSYS powered up, as consys_set_if_pinmux, consys_hw_reset_bit_set and
+ * consys_hw_power_ctrl do it (mt6785.c) -- Android reaching the power domain through the clock
+ * framework's scp_conn_main, whose CONN_sys_enable_op is Linux scpsys' own spm_mtcmos_ctrl_conn
+ * (drivers/clk/mediatek/clk-mt6785-pg.c), the canon of the order below -- every wait bounded and said
+ * instead of endless: the pins to the radio, the CPU held in reset, CCIF4's clock ungated (the first
+ * thing consys_hw_power_ctrl does), SPM's key, the domain's power (both halves set before either is
+ * waited for -- the canon's own order, unlike the MT6768's one-half-at-a-time), the bus clock on,
+ * isolation off, the software reset let go, the bus protections taken off (STEP2_0, STEP2_1, then
+ * STEP1_0: the MT6768 took them off in another order), and PERICFG's CON_PWR_ON (consys_hw_power_ctrl's
+ * own write after its clocks); then CONNSYS's IP version polled -- 0x10020600 is the MT6785's and says
+ * it lives. Not done, as neither does the stock path: the CPU reset's bit 9, ap_sw_rst_b (the MT6768
+ * let it go by hand, run 307: only read here), and INFRACFG's AP2CONN OSC (the hand-made branch's
+ * +0xf00, which the clock framework's way leaves alone).
  */
 static bool
 connsys_wait(vm_offset_t base, uint32_t offset, uint32_t bit, const char *what)
@@ -239,75 +280,55 @@ connsys_power_on(vm_offset_t spm)
 {
 	vm_offset_t pinmux = ml_io_map(0x10005000u, 0x1000), rgu = ml_io_map(0x10007000u, 0x1000);
 	vm_offset_t infra = ml_io_map(0x10001000u, 0x1000), misc = ml_io_map(MCU_TOP_MISC_OFF_PHYS, 0x1000);
+	vm_offset_t peri = ml_io_map(0x10003000u, 0x1000), driving = ml_io_map(0x11EA0000u, 0x100);
+	vm_offset_t hif = ml_io_map(0x18007000u, 0x1000);
 	uint32_t version = 0;
 
 #define W(base, offset, value) (*(volatile uint32_t *)((base) + (offset)) = (value))
-	W(pinmux, 0x3f0, (rd(pinmux, 0x3f0) & 0xffffff88u) | 0x11u);
-	W(pinmux, 0x3e0, (rd(pinmux, 0x3e0) & 0x8888888fu) | 0x11111110u);
+	W(pinmux, 0x430, (rd(pinmux, 0x430) & 0x0000ffffu) | 0x11110000u);   /* the pins to the radio switched to its */
+	W(pinmux, 0x440, (rd(pinmux, 0x440) & 0xfff00000u) | 0x00011111u);   /* interface (consys_set_if_pinmux) ... */
+	W(driving, 0x000, (rd(driving, 0x000) & 0xff000007u) | 0x0u);        /* ... and their driving, 2 mA */
 	delay(150);
-	W(rgu, 0x18, rd(rgu, 0x18) | (1u << 12) | (0x88u << 24));            /* the CPU's software reset on */
-	W(spm, 0x000, (rd(spm, 0x000) & 0xffffu) | 0x0b160001u);              /* SPM's write key */
-	W(spm, SPM_TOP1_PWR_CTRL, rd(spm, SPM_TOP1_PWR_CTRL) | (1u << 2));    /* on-domain power */
-	if (!connsys_wait(spm, SPM_PWR_STATUS, 1u << 1, "on-domain power")) {
+	W(rgu, 0x18, rd(rgu, 0x18) | (1u << 12) | (0x88u << 24));            /* the CPU's software reset on (key 0x88) */
+	W(infra, 0xc4, 1u << 28);                                            /* INFRA3_CLR: CCIF4's clock ungated */
+	W(spm, 0x000, (rd(spm, 0x000) & 0xffffu) | 0x0b160001u);             /* SPM's write key */
+	W(spm, SPM_CONN_PWR_CON, rd(spm, SPM_CONN_PWR_CON) | (1u << 2));     /* the domain's power ... */
+	W(spm, SPM_CONN_PWR_CON, rd(spm, SPM_CONN_PWR_CON) | (1u << 3));     /* ... and its second part, both before either */
+	if (!connsys_wait(spm, SPM_PWR_STATUS, 1u << 1, "the domain's power") ||
+	    !connsys_wait(spm, SPM_PWR_STATUS_2ND, 1u << 1, "the domain's power, second part")) {
 		return;
 	}
-	W(spm, SPM_TOP1_PWR_CTRL, rd(spm, SPM_TOP1_PWR_CTRL) | (1u << 3));    /* ... its second part */
-	if (!connsys_wait(spm, SPM_PWR_STATUS_2ND, 1u << 1, "on-domain power, second part")) {
-		return;
-	}
-	W(spm, SPM_TOP1_PWR_CTRL, rd(spm, SPM_TOP1_PWR_CTRL) & ~(1u << 4));   /* the bus clock */
-	W(spm, SPM_TOP1_PWR_CTRL, rd(spm, SPM_TOP1_PWR_CTRL) & ~(1u << 1));   /* isolation off */
-	/*
-	 * The domain's own reset let go (PWR_RST_B, bit 0), as Linux's scpsys does it
-	 * (spm_mtcmos_ctrl_conn_pwr, drivers/clk/mediatek/clk-mt6768-pg.c) -- WMT's hand-made branch
-	 * leaves it out, and without it the off-domain's ack (bit 30) never came (run 305).
-	 */
-	W(spm, SPM_TOP1_PWR_CTRL, rd(spm, SPM_TOP1_PWR_CTRL) | (1u << 0));
-	(void)connsys_wait(spm, SPM_PWR_STATUS, 1u << 30, "off-domain power");
-	(void)connsys_wait(spm, SPM_PWR_STATUS_2ND, 1u << 30, "off-domain power, second part");
-	W(rgu, 0x18, (rd(rgu, 0x18) & ~(1u << 9)) | (0x88u << 24));          /* ap_sw_rst_b: let go */
-	/* the bus protections, through their CLR registers as spm_mtcmos_ctrl_conn_bus_prot does */
-	W(infra, 0x2a4, (1u << 14) | (1u << 16));
-	W(infra, 0x2a4, 1u << 13);
-	W(infra, 0x2ac, 1u << 18);
+	W(spm, SPM_CONN_PWR_CON, rd(spm, SPM_CONN_PWR_CON) & ~(1u << 4));    /* the bus clock */
+	W(spm, SPM_CONN_PWR_CON, rd(spm, SPM_CONN_PWR_CON) & ~(1u << 1));    /* isolation off */
+	W(spm, SPM_CONN_PWR_CON, rd(spm, SPM_CONN_PWR_CON) | (1u << 0));     /* the domain's own reset let go (PWR_RST_B) */
 	delay(10);
-	/* (run 307 wrote these two, unexplained, and Android's power-up -- spm_mtcmos_ctrl_conn_pwr/_bus_prot of
-	 * clk-mt6768-pg.c -- has neither: boot-arg connsys_spmx=0 leaves them out) */
-	{
-		uint32_t spmx = 1;
-
-		(void)PE_parse_boot_argn("connsys_spmx", &spmx, sizeof(spmx));
-		if (spmx != 0) {
-			W(spm, 0x6f8, 0x5);
-			W(spm, 0x6fc, 0x50505);
-		}
-	}
+	/* the bus protections off, through their CLR registers in the canon's order (the MT6768's was another) */
+	W(infra, 0x2a4, 1u << 14);                                           /* STEP2_0 */
+	W(infra, 0x2ac, 1u << 10);                                           /* STEP2_1 */
+	W(infra, 0x2a4, (1u << 13) | (1u << 18));                            /* STEP1_0 */
+	W(peri, 0x438, rd(peri, 0x438) | 1u);                                /* PERICFG's CON_PWR_ON (bit 0) */
 #undef W
 	delay(10);
-	redwood_host_keep_add("connsys: step 4 [%u ms]: powered: TOP1_PWR_CTRL %#x, PWR_STATUS %#x/%#x, bus protection %#x (%#x) and %#x (%#x)",
-	    connsys_ms(), rd(spm, SPM_TOP1_PWR_CTRL), rd(spm, SPM_PWR_STATUS), rd(spm, SPM_PWR_STATUS_2ND), rd(infra, 0x220), rd(infra, 0x228),
+	redwood_host_keep_add("connsys: step 4 [%u ms]: powered: CONN_PWR_CON %#x, PWR_STATUS %#x/%#x, bus protection %#x (%#x) and %#x (%#x)",
+	    connsys_ms(), rd(spm, SPM_CONN_PWR_CON), rd(spm, SPM_PWR_STATUS), rd(spm, SPM_PWR_STATUS_2ND), rd(infra, 0x220), rd(infra, 0x228),
 	    rd(infra, 0x250), rd(infra, 0x258));
-	/*
-	 * Linux takes the domain as on with bit 1 alone (CONN_PWR_STA_MASK, clk-mt6768-pg.c) and Android reads
-	 * the IP version right after; WMT's header has the off-domain's ack at bit 30, but on this phone it is
-	 * bit 31 that comes once PWR_RST_B is let go (0x06c57c2e -> 0x86c57c2e, run 306). Either will do.
-	 */
 	{
 		uint32_t both = rd(spm, SPM_PWR_STATUS) & rd(spm, SPM_PWR_STATUS_2ND);
 
-		if (!(both & (1u << 1)) || !(both & ((1u << 30) | (1u << 31)))) {
+		if (!(both & PWR_STATUS_CONN)) {
 			/* (a read of a block that is not powered can hang the bus, and the phone with it) */
-			redwood_host_keep_add("connsys: step 4 [%u ms]: the off-domain is not powered (%#x): its registers are not read", connsys_ms(), both);
+			redwood_host_keep_add("connsys: step 4 [%u ms]: the domain is not powered (%#x): its registers are not read", connsys_ms(), both);
 			return;
 		}
-		redwood_host_keep_add("connsys: step 4 [%u ms]: CONN_HIF_ON CPUPCR %#x", connsys_ms(), rd(ml_io_map(0x18007000u, 0x1000), 0x104));
+		redwood_host_keep_add("connsys: step 4 [%u ms]: RGU+0x18 %#x (bit 9, ap_sw_rst_b, only ever read here: %u), CONN_HIF_ON CPUPCR %#x",
+		    connsys_ms(), rd(rgu, 0x18), (rd(rgu, 0x18) >> 9) & 1, rd(hif, 0x104));
 	}
 	for (unsigned n = 0; n < 10 && version != CONSYS_IP_VER_ID; n++) {
 		version = rd(misc, CONSYS_IP_VER);
 		delay(20000);
 	}
 	redwood_host_keep_add("connsys: step 4 [%u ms]: IP version %#x: %s", connsys_ms(), version,
-	    version == CONSYS_IP_VER_ID ? "CONNSYS LIVES (the MT6768's)" : "not the expected 0x10020501");
+	    version == CONSYS_IP_VER_ID ? "CONNSYS LIVES (the MT6785's)" : "not the expected 0x10020600");
 }
 
 /*
@@ -315,14 +336,15 @@ connsys_power_on(vm_offset_t spm)
  * (core/wmt_ic_soc.c) does it, and its CPU let go. Each of the phone's soc1_0_*_hdr.bin files
  * (/vendor/firmware, in the system image as /fw/connsys: userland/build.sh) is a 48-byte struct
  * wmt_rom_patch (core/include/wmt_core.h) -- whose u4PatchAddr is where CONNSYS sees it, 0xf0000000 being
- * the start of its memory (CONSYS_EMI_FW_PHY_BASE against CONSYS_EMI_AP_PHY_BASE, include/mt6768.h) --
+ * the start of its memory (CONSYS_EMI_FW_PHY_BASE against CONSYS_EMI_AP_PHY_BASE, include/mt6785.h) --
  * and then its body, copied there: the MCU's RAM code at 0, its ROM patch at 0x1c000, Bluetooth's at
- * 0x80000, Wi-Fi's at 0x140000. The memory is Android's 4 MB consys-reserve-memory; here at 0x51000000
- * (16 MB aligned, as INFRA's remapping register takes it: bits 24 and up), clear of the loader's and the
- * sensor hub's. Then INFRA+0x380 told where it is and +0x388 the peripheral window
- * (consys_emi_set_remapping_reg), the CPU's software reset let go (consys_hw_reset_bit_set), and
- * MCU+0x600 polled for 0x1D1E -- what Android waits for. In a thread: the files are there only once
- * the root is mounted.
+ * 0x80000, Wi-Fi's at 0x140000 (this phone's own files, whose headers say the same as the Infinix's
+ * did). The memory is Android's 4 MB consys-reserve-memory; here at 0x51000000 (16 MB aligned, as
+ * INFRA's remapping register takes it -- which at the MT6785 is bits 19 and up of the address shifted
+ * 16, where the MT6768 took bits 23 and up shifted 24: consys_emi_set_remapping_reg of mt6785.c),
+ * clear of the loader's and the kernel's. Then INFRA+0x380 told where it is and +0x388 the peripheral
+ * window, the CPU's software reset let go (consys_hw_reset_bit_set), and MCU+0x600 polled for 0x1D1E --
+ * what Android waits for. In a thread: the files are there only once the root is mounted.
  */
 /* kern.redwood.connsys: how step 5 ended, for a job to read (the kept lines run out on a long run) */
 static char connsys_said[1000] = "not run";
@@ -375,8 +397,8 @@ extern kern_return_t thread_terminate(thread_t thread);
 
 /*
  * Step 6 (connsys_step=6): BTIF, the bridge WMT talks to CONNSYS through (btif@1100c000 in the device
- * tree, run 313): its clock on (infracfg's IFR2 gate, bit 31: CLR at +0x84 -- clk-mt6768.c, ifr_btif)
- * and the hardware set up as hal_btif_hw_init does it (drivers/misc/mediatek/btif/common/btif_plat.c):
+ * tree, run 313): its clock on (infracfg's IFR0 gate, bit 31: CLR at +0x84 -- clk-mt6785.c, infra_btif,
+ * the same bank and bit the MT6768 had) and the hardware set up as hal_btif_hw_init does it (drivers/misc/mediatek/btif/common/btif_plat.c):
  * normal mode, the new handshake, both FIFOs cleared, no DMA, auto-reset -- before CONNSYS is powered,
  * as Android does it; once CONNSYS runs, whatever it sends is read for a second (PIO: LSR bit 0, RBR).
  */
@@ -541,11 +563,12 @@ connsys_btif_init(void)
 static uint32_t connsys_step;
 
 /*
- * The build time of each image in CONNSYS's EMI, where Android puts it (platform/mt6768.c:1058-1065,
- * CONSYS_EMI_*_BUILDTIME_OFFSET of mt6768.h): ram_bt 0x68300, ram_wifi 0x68310, ram_mcu 0x68320 as it copies the
- * RAM images in (wmt_ic_soc.c:3615-3633), the MCU's patch 0x68330 after the patch and before the WMT reset
- * (wmt_ic_soc.c:3285) -- the first 16 bytes of the file's header, the 16th made 0. "For debugging", MediaTek says;
- * runs 356-379 went without it, and the WMT reset after the patch was never answered.
+ * The build time of each image in CONNSYS's EMI, where Android puts it (CONSYS_EMI_*_BUILDTIME_OFFSET
+ * of include/mt6785.h: ram_bt 0x68300, ram_wifi 0x68310, ram_mcu 0x68320, the MCU's patch 0x68330 --
+ * the same offsets the MT6768's mt6768.h had) as it copies the RAM images in (core/wmt_ic_soc.c), the
+ * patch's after the patch and before the WMT reset -- the first 16 bytes of the file's header, the 16th
+ * made 0. "For debugging", MediaTek says; the Infinix's runs 356-379 went without it, and the WMT reset
+ * after the patch was never answered.
  */
 static void
 connsys_build_time(const uint8_t *file, uint32_t offset)
@@ -715,7 +738,10 @@ connsys_mcu_restart(void)
 		delay_for_interval(20, NSEC_PER_MSEC);
 		version = rd(connsys_mcu, 0x600);
 	}
-	for (unsigned n = 0; n < 100 && (connsys_hif != 0 && rd(connsys_hif, 0x104) != 0xb04); n++) {
+	/* (the Infinix's ROM idled at 0xb04, which the waits through this file watched for; where the MT6785's
+	 * idles is not known yet, so what is waited for is the pc leaving 0 -- a CPU in reset -- and the pc
+	 * said as it is, for the first run to name it) */
+	for (unsigned n = 0; n < 100 && connsys_hif != 0 && rd(connsys_hif, 0x104) == 0; n++) {
 		delay_for_interval(10, NSEC_PER_MSEC);
 	}
 	delay_for_interval(20, NSEC_PER_MSEC);
@@ -896,7 +922,7 @@ connsys_wmt(const char *what, const uint8_t *command, unsigned length, const uin
 	 * with 20 ms settle time and fresh FIFOs, CONNSYS enters STP receive reliably.
 	 */
 	/* boot-arg connsys_wake=N: 0 never (Android, which raises it only out of sleep), 1 before each command and a
-	 * resend (the default), 2 before every frame (runs 356-358) */
+	 * resend, 2 before every frame (the default here; runs 356-358 -- the Infinix's clean start, run 392, used 1) */
 	static uint32_t wake = 2;
 	static bool asked;
 	if (!asked) {
@@ -953,17 +979,18 @@ connsys_wmt(const char *what, const uint8_t *command, unsigned length, const uin
 }
 
 /*
- * Steps 9 and 10 (connsys_step=9, 10): the MCU's patch, which the MT6768 takes over BTIF and not in its memory
- * (pda_dl_patch_flag = 1 in platform/mt6768.c): in STP's mandatory mode, before the full one, as
- * mtk_wcn_soc_sw_init does it for a chip with that flag -- patch, WMT reset, and only then _wmt_soc_mode_ctrl.
- * The options of this chip (wmt_core_hw_check, "options = 3180da8" in Android's log) have no DLM table and no
- * MCU clock tables around it, and OPT_PATCH_CHECKSUM: the patch is the file less its 28-byte header (WMT_PATCH)
- * and 2 bytes of checksum, 25680 bytes of soc1_0_patch_mcu_1a_1_hdr.bin -- the "frag(26, 680)" Android logs.
+ * Steps 9 and 10 (connsys_step=9, 10): the MCU's patch, which this generation takes over BTIF and not in its
+ * memory (pda_dl_patch_flag = 1 in platform/mt6785.c, as the MT6768's): in STP's mandatory mode, before the
+ * full one, as mtk_wcn_soc_sw_init does it for a chip with that flag -- patch, WMT reset, and only then
+ * _wmt_soc_mode_ctrl. The patch is the file less its 28-byte header (WMT_PATCH) and 2 bytes of checksum,
+ * 22400 bytes of soc1_0_patch_mcu_2a_1_hdr.bin -- pieces of 1000, as Android's "frag(22, 400)" would say.
  *
  * Where it goes is what Android's wmt_launcher gives the driver (WMT_IOCTL_SET_PATCH_INFO, addRess[4]): the
- * phone's /vendor/bin/wmt_launcher (sha256 39772aec...) reads 16 bytes, seeks to 22, reads 2 (the sequence,
- * its second byte compared with the patch's number) and then the 4 at offset 24 -- 11 c0 01 00 in this file,
- * whose upper half is the "PhVer=0x0001" the driver prints of the same field. mtk_wcn_soc_pda_patch_dwn
+ * phone's /vendor/bin/wmt_launcher reads 16 bytes, seeks to 22, reads 2 (the sequence, its second byte
+ * compared with the patch's number) and then the 4 at offset 24 -- 11 c0 01 00 in this file too, whose
+ * upper half is the "PhVer=0x0001" the driver prints of the same field, and whose target without its low
+ * byte -- 0x1c000, where the patch is linked to run from (the Infinix's port proved that the hard way,
+ * runs 398-437: sent to 0x1c011 as it is, every hook jumped into the middle of other code). mtk_wcn_soc_pda_patch_dwn
  * then sends, all in the mandatory mode:
  *   WMT_PATCH_PDA_CFG_CMD  01 01 11 00 00, the address (4), the size (4, little-endian), a scramble key of 0,
  *                          2f 02 02 00 -- answered 02 01 01 00 00;
@@ -1046,11 +1073,11 @@ connsys_pda_patch(void)
 
 	connsys_doing = 9;
 	if (file == NULL) {
-		file = connsys_file("soc1_0_patch_mcu_1a_1_hdr.bin", &size);
+		file = connsys_file("soc1_0_patch_mcu_2a_1_hdr.bin", &size);
 		free_file = true;
 	}
 	if (file == NULL || size <= 28 + 2) {
-		redwood_host_keep_add("connsys: step 9 [%u ms]: /fw/connsys/soc1_0_patch_mcu_1a_1_hdr.bin: not read", connsys_ms());
+		redwood_host_keep_add("connsys: step 9 [%u ms]: /fw/connsys/soc1_0_patch_mcu_2a_1_hdr.bin: not read", connsys_ms());
 		if (file != NULL && free_file) {
 			kfree_data(file, size);
 		}
@@ -1058,12 +1085,10 @@ connsys_pda_patch(void)
 	}
 	body = size - 28 - 2;
 	/*
-	 * Where the patch goes: the file's u4PatchVer, 0x0001c011, without its low byte -- 0x1c000. The patch is linked to run
-	 * from 0x1c000: 28 of the 30 replacement addresses of its ROM patch table (0x3fffffff, 30 ROM addresses, then at
-	 * +0x108 the 30 replacements: ROM 0x5200 -> 0x1c808 ...) begin a function only if its first byte is at 0x1c000, none if
-	 * it is at 0x1c010 (nds32le-elf-objdump of the file, 2 November). Sent to 0x1c011 as it is, every hook jumped into the
-	 * middle of other code: the MCU's exception in ROM 0x52A2, inside the hooked 0x5200, runs 398-436. To 0x1c000, run
-	 * 437: the MCU back at 0xb04, WMT reset answered, STP in its full mode. Boot-arg connsys_pda_addr=0xN: N instead.
+	 * Where the patch goes: the file's u4PatchVer -- 0x0001c011, this phone's file says what the Infinix's did --
+	 * without its low byte: 0x1c000, where the patch is linked to run from (sent to 0x1c011 as it is, the
+	 * Infinix's every hook jumped into the middle of other code, the MCU dying in ROM 0x52A2, runs 398-436;
+	 * to 0x1c000, run 437: the WMT reset answered, STP in its full mode). Boot-arg connsys_pda_addr=0xN: N instead.
 	 */
 	{
 		uint32_t target = 0, override = 0;
@@ -1150,33 +1175,41 @@ connsys_pda_patch(void)
 }
 
 /*
- * Step 11 (connsys_step=11): what mtk_wcn_soc_sw_init sends after the full mode (core/wmt_ic_soc.c), for this chip's
- * options (0x3180da8) and this phone's /vendor/firmware/WMT_SOC.cfg (coex_wmt_ant_mode=1, co_clock_flag=1,
- * bt_tssi_from_wifi=3, bt_tssi_target=3776, wifi_ant_swap_mode=0; no wifi_config, no elna_gain_p1_support), in its
- * order -- Android's dmesg of run 354 (logs/android-dmesg-354.txt, 7.266-8.349 s) agrees with each branch taken:
- *   set chip ID          01 02 05 00 11 68 67 00 00       02 02 01 00 00
+ * Step 11 (connsys_step=11): what mtk_wcn_soc_sw_init sends after the full mode (core/wmt_ic_soc.c), for this
+ * phone's /vendor/firmware/WMT_SOC.cfg (coex_wmt_ant_mode=1, co_clock_flag=1, bt_tssi_from_wifi=3,
+ * bt_tssi_target=3744, wifi_ant_swap_mode=1, wifi_main_ant_polarity=0; no wifi_config, no elna_gain_p1_support)
+ * -- the Infinix's order with three of its bytes changed and one command added, as the MT6785's WMT sends it:
+ *   set chip ID          01 02 05 00 11 85 67 00 00       02 02 01 00 00 (0x6785)
  *   A-die                01 02 01 00 12                   02 02 05 00 00 + its ID (OPT_QUERY_ADIE)
  *   LTE coex, table 3    01 10 02 00 15 01                02 10 01 00 00 (coex_wmt_filter_mode 0; 5 ms before it)
- *   BT TSSI from Wi-Fi   01 02 04 00 10 03 c0 0e          02 02 01 00 00 (the new op ID 0x10; 3776 = 0x0ec0)
+ *   BT TSSI from Wi-Fi   01 02 04 00 10 03 a0 0e          02 02 01 00 00 (the new op ID 0x10; 3744 = 0x0ea0)
+ *   antenna swap         01 14 03 00 06 02 00             02 14 02 00 00 06 (ant_swap_mode 1, polarity 0: cmd[6],
+ *                                                                        wmt_stp_init_wifi_ant_swap, its
+ *                                                                        back-compat form without the ant_sel
+ *                                                                        byte -- before the RF calibration)
  *   RF calibration       01 14 01 00 01                   02 14 + data -- 1.08 s on Android and here (439), 3 s allowed
  *   coex adjust (3)      01 10 04 00 1e|1f|20 00 00 00    02 10 01 00 00 (its new flags; Android's values all 0)
  *   FM strap             01 05 02 00 02 02                02 05 02 00 00 02 (WMT_FM_COMM)
  *   UTC time             01 f0 09 00 02, s, us            02 f0 02 00 02 00 (opfunc_utc_time_sync, after a function on)
  * It stops where Android's does (A-die, calibration, FM strap) and goes on past the rest, which Android only logs.
  * Not sent, as Android does not for these options and this file: Wi-Fi's config, the external component, EPA, eLNA,
- * coex before the calibration, antenna swap, the oscillator type, the core-dump level. The BT and Wi-Fi PALDO it
- * raises around the calibration are #if 0 on this chip (platform/mt6768.c): step 3's VCN33 is all there is.
- * Wi-Fi is not a WMT command on a SoC: mtk_wcn_wmt_func_on(WIFI) calls the Wi-Fi driver's probe (gen4m, chips/connac
- * on AXI), which loads WIFI_RAM_CODE itself -- the next step.
+ * coex before the calibration, the oscillator type, the core-dump level. The BT and Wi-Fi PALDO it raises around
+ * the calibration (consys_hw_bt/wifi_vcn33_ctrl of mt6785.c) are VCN33_1's two CON0 enable bits, both set in
+ * step 3. Wi-Fi is not a WMT command on a SoC: mtk_wcn_wmt_func_on(WIFI) calls the Wi-Fi driver's probe (gen4m,
+ * chips/connac on AXI), which loads WIFI_RAM_CODE itself -- the next step.
  */
 static void
 connsys_sw_init(void)
 {
-	static const uint8_t chip_id[] = { 0x01, 0x02, 0x05, 0x00, 0x11, 0x68, 0x67, 0x00, 0x00 };
+	static const uint8_t chip_id[] = { 0x01, 0x02, 0x05, 0x00, 0x11, 0x85, 0x67, 0x00, 0x00 };
 	static const uint8_t a_die[] = { 0x01, 0x02, 0x01, 0x00, 0x12 };
 	static const uint8_t a_die_said[] = { 0x02, 0x02, 0x05, 0x00, 0x00 };
 	static const uint8_t lte_coex[] = { 0x01, 0x10, 0x02, 0x00, 0x15, 0x01 };
-	static const uint8_t tssi[] = { 0x01, 0x02, 0x04, 0x00, 0x10, 0x03, 0xc0, 0x0e };
+	static const uint8_t tssi[] = { 0x01, 0x02, 0x04, 0x00, 0x10, 0x03, 0xa0, 0x0e };
+	/* the antenna swap of WMT_SOC.cfg's wifi_ant_swap_mode=1, before the RF calibration; cmd[6] is
+	 * wifi_main_ant_polarity (0 here), and with no ant_sel gpio the command drops its last byte */
+	static const uint8_t ant_swap[] = { 0x01, 0x14, 0x03, 0x00, 0x06, 0x02, 0x00 };
+	static const uint8_t ant_swap_said[] = { 0x02, 0x14, 0x02, 0x00, 0x00, 0x06 };
 	static const uint8_t calibration[] = { 0x01, 0x14, 0x01, 0x00, 0x01 };
 	/* (its answer is the opcode and data -- run 439: 450 bytes, 00 01 and Bluetooth's 448 of calibration, Android's
 	 * gBTCalResultSize -- and Android compares only that it is 0x14's, wmt_core_init_script_retry: "do not care") */
@@ -1197,10 +1230,11 @@ connsys_sw_init(void)
 		unsigned wait_ms;
 	} script[] = {
 #define S(what, c, e, must, wait) { what, c, e, sizeof(c), sizeof(e), must, wait }
-		S("set chip ID 0x6768", chip_id, wmt_done, false, 0),
+		S("set chip ID 0x6785", chip_id, wmt_done, false, 0),
 		S("A-die", a_die, a_die_said, true, 0),
 		S("LTE coex (table 3)", lte_coex, coex_done, false, 0),
 		S("BT TSSI from Wi-Fi", tssi, wmt_done, false, 0),
+		S("antenna swap (mode 1)", ant_swap, ant_swap_said, false, 0),
 		S("RF calibration", calibration, calibrated, true, 3000),
 		S("coex: BT control", adjust_bt, coex_done, false, 0),
 		S("coex: opp time ratio", adjust_opp, coex_done, false, 0),
@@ -1260,9 +1294,10 @@ connsys_stp_full_mode(void)
 
 	/*
 	 * Can CONNSYS's CPU read its EMI (0xf0000000 = EMI+0 through the remap of step 5)? The RAM image it jumps to after
-	 * the patch's WMT reset is there; runs 371-375 sent the patch whole and the reset went unanswered, the MCU staying
-	 * at the ROM's 0xb04. Read with the same WMT_SET_REG_CMD as the chip ID: soc1_0_ram_mcu_1a_1_hdr.bin begins
-	 * (byte 48) 46 1f 00 05, so the answer should end 46 1f 00 05.
+	 * the patch's WMT reset is there; the Infinix's runs 371-375 sent the patch whole and the reset went unanswered,
+	 * the MCU staying at its ROM's idle. Read with the same WMT_SET_REG_CMD as the chip ID: this phone's
+	 * soc1_0_ram_mcu_2a_1_hdr.bin begins (byte 48) 46 1f 00 05, as the Infinix's did, so the answer should end
+	 * 46 1f 00 05.
 	 */
 	static const uint8_t emi_read[] = {
 		0x01, 0x08, 0x10, 0x00, 0x02, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0xf0, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff,
@@ -1309,7 +1344,7 @@ connsys_stp_full_mode(void)
  * 4194304 bytes", platform/mtk_wcn_consys_hw.c) and its control and paged-dump areas again at every power-on
  * (consys_reset_emi_coredump: EMI+0x68000-0x68400, +0x70400-0x78400). Ours, at 0x51000000, holds whatever the RAM
  * held before -- and that is where CONNSYS's firmware keeps its state, its assert flags and its print buffer
- * (EXP_APMEM_CTRL_*, platform/mt6768.c), and its data. Run 398: the patch whole (DMA), then the MCU's pc 0, as in
+ * (EXP_APMEM_CTRL_*, platform/include/mtk_wcn_consys_hw.h, as platform/mt6785.c takes them), and its data. Run 398: the patch whole (DMA), then the MCU's pc 0, as in
  * reset, and the WMT reset unanswered. Through windows the kernel can take back (512 KB at a time: the 8 MB I/O map
  * did not have 4 MB, run 308), with 64-bit stores (device memory: no DC ZVA). How many words of the control area
  * were not zero is said, to know whether that is what it was.
@@ -1346,7 +1381,7 @@ connsys_emi_clear(void)
 
 /*
  * The firmware's dedicated log path, as Android sets it up before the first power-on (consys_dedicated_log_path_init ->
- * connsys_dedicated_log_path_apsoc_init, common/debug_utility/connsys_debug_utility.c, with mt6768.c's
+ * connsys_dedicated_log_path_apsoc_init, common/debug_utility/connsys_debug_utility.c, with mt6785.c's
  * connsys_fw_log_parameter: EMI+0x36500, 192 KB -- MCU 16 KB, Wi-Fi and BT 64 KB, GPS 32 KB): the area zeroed (done by
  * connsys_emi_clear), at its start each ring's offset and size (connlog_set_ring_buffer_base_addr: base 64, then each
  * ring after the last + 32 reserved + 32 for alignment) and at +56 the ready pattern "EMIFWLOG" (connlog_set_ring_ready).
@@ -1388,8 +1423,8 @@ static void
 connsys_firmware_thread(__unused void *parameter, __unused wait_result_t result)
 {
 	static const char *const files[] = {
-		"soc1_0_ram_mcu_1a_1_hdr.bin", "soc1_0_patch_mcu_1a_1_hdr.bin", "soc1_0_ram_bt_1a_1_hdr.bin",
-		"soc1_0_ram_wifi_1a_1_hdr.bin",
+		"soc1_0_ram_mcu_2a_1_hdr.bin", "soc1_0_patch_mcu_2a_1_hdr.bin", "soc1_0_ram_bt_2a_1_hdr.bin",
+		"soc1_0_ram_wifi_2a_1_hdr.bin",
 	};
 	vm_offset_t emi, infra = ml_io_map(0x10001000u, 0x1000), rgu = ml_io_map(0x10007000u, 0x1000);
 	vm_offset_t mcu = ml_io_map(MCU_PHYS, 0x1000), hif = ml_io_map(0x18007000u, 0x1000);
@@ -1420,7 +1455,7 @@ connsys_firmware_thread(__unused void *parameter, __unused wait_result_t result)
 
 		/* from step 9 the MCU's patch goes over BTIF (connsys_pda_patch), not into EMI: Android puts only the RAM
 		 * images there ("[Rom Patch]" ram_bt, ram_wifi, ram_mcu in its log) */
-		if (connsys_step >= 9 && strcmp(files[i], "soc1_0_patch_mcu_1a_1_hdr.bin") == 0) {
+		if (connsys_step >= 9 && strcmp(files[i], "soc1_0_patch_mcu_2a_1_hdr.bin") == 0) {
 			continue;
 		}
 		file = connsys_file(files[i], &size);
@@ -1451,26 +1486,28 @@ connsys_firmware_thread(__unused void *parameter, __unused wait_result_t result)
 		    size - 48, offset, address);
 		copied++;
 		if (connsys_step >= 9) {
-			connsys_build_time(file, strcmp(files[i], "soc1_0_ram_bt_1a_1_hdr.bin") == 0 ? 0x68300u :
-			    strcmp(files[i], "soc1_0_ram_wifi_1a_1_hdr.bin") == 0 ? 0x68310u : 0x68320u);
+			connsys_build_time(file, strcmp(files[i], "soc1_0_ram_bt_2a_1_hdr.bin") == 0 ? 0x68300u :
+			    strcmp(files[i], "soc1_0_ram_wifi_2a_1_hdr.bin") == 0 ? 0x68310u : 0x68320u);
 		}
 		kfree_data(file, size);
 	}
 	if (connsys_step >= 9 && connsys_patch_file == NULL) {
-		connsys_patch_file = connsys_file("soc1_0_patch_mcu_1a_1_hdr.bin", &connsys_patch_size);
+		connsys_patch_file = connsys_file("soc1_0_patch_mcu_2a_1_hdr.bin", &connsys_patch_size);
 		if (connsys_patch_file != NULL && connsys_patch_size > 28 + 2) {
 			redwood_host_keep_add("connsys: step 5 [%u ms]: patch file preloaded (%u bytes)", connsys_ms(), connsys_patch_size);
 		}
 	}
 	__asm__ volatile ("dsb sy" ::: "memory");
-	*(volatile uint32_t *)(infra + 0x380) = (rd(infra, 0x380) & 0xfffff000u) | ((CONNSYS_EMI_PHYS >> 24) & 0xfffu);
-	*(volatile uint32_t *)(infra + 0x388) = (rd(infra, 0x388) & 0xf000ffffu) | (((0x10003000u >> 24) & 0xfffu) << 16);
+	/* consys_emi_set_remapping_reg of mt6785.c: bits 19-0 of INFRA+0x380 the EMI's address >> 16, of +0x388 the
+	 * peripheral window's (PERICFG, 0x10003000) -- where the MT6768 took bits 11-0 of each >> 24 */
+	*(volatile uint32_t *)(infra + 0x380) = (rd(infra, 0x380) & 0xfff00000u) | ((CONNSYS_EMI_PHYS >> 16) & 0xfffffu);
+	*(volatile uint32_t *)(infra + 0x388) = (rd(infra, 0x388) & 0xfff00000u) | ((0x10003000u >> 16) & 0xfffffu);
 	/*
-	 * The radio PLL's setting Android makes just before it lets CONNSYS's CPU go: consys_afe_reg_setting of
-	 * platform/mt6768.c (CONSYS_AFE_REG_SETTING 1 in mt6768.h, "update WPLL setting for WPLL issue@LT"),
-	 * RG_WBG_PLL_03 at CONSYS_AFE_REG_BASE 0x180B3000 + 0x34, bits 19-20 to 01; called from
-	 * mtk_wcn_consys_hw_reg_ctrl after acr_reg_setting (empty here) and before hw_reset_bit_set(DISABLE).
-	 * Boot-arg connsys_afe=0 leaves it as it is.
+	 * The radio PLL's setting Android makes just before it lets CONNSYS's CPU go: consys_afe_reg_setting
+	 * (CONSYS_AFE_REG_BASE 0x180B3000 of include/mt6785.h, RG_WBG_PLL_03 +0x34, bits 19-20 to 01 --
+	 * "update WPLL setting for WPLL issue@LT", the register the MT6768's own afe_reg_setting wrote too);
+	 * called from mtk_wcn_consys_hw_reg_ctrl before hw_reset_bit_set(DISABLE). Boot-arg connsys_afe=0
+	 * leaves it as it is.
 	 */
 	{
 		uint32_t afe = 1;
@@ -1487,36 +1524,39 @@ connsys_firmware_thread(__unused void *parameter, __unused wait_result_t result)
 		}
 	}
 	/*
-	 * What polling_consys_chipid (platform/mt6768.c) does once the chip ID is read and the RAM images are in, before
-	 * the CPU is let go -- none of which was done here until run 430, and the MCU died as soon as the ROM handed over
-	 * to the RAM image in EMI after the patch (run 429: last pc 0xf000d73e, then 0):
-	 *   - co-clock mode (co_clock_flag=1): MCU_TOP_MISC_ON+0x200 (CONSYS_COCLOCK_STABLE_TIME_BASE 0x180C1200) low half
-	 *     0x708 -- "vcore ready stable time", "XO initial stable time", "XO bg stable time" -- and +0x204 bits 0 and
-	 *     8-15 to 0x600: "clear 'source clock enable ack to XO state' mask";
-	 *   - "EMI control CR setting (hw mode)": MCU+0x150 (CONSYS_SW_IRQ_OFFSET) bit 21 cleared;
-	 *   - "toppose_restore_done rollback": MCU_TOP_MISC_ON+0x600 bit 23 set.
-	 * Boot-arg connsys_post=0: none of it.
+	 * What polling_consys_chipid (platform/mt6785.c) does once the chip ID is read and the RAM images are in, before
+	 * the CPU is let go -- none of which was done here until the Infinix's run 430, and its MCU died as soon as the
+	 * ROM handed over to the RAM image in EMI after the patch (run 429: last pc 0xf000d73e, then 0):
+	 *   - co-clock mode (co_clock_flag=1): CONSYS_COCLOCK_STABLE_TIME_BASE 0x180C1200 low half 0x708 -- "vcore
+	 *     ready stable time", "XO initial stable time", "XO bg stable time" -- and +0x204 (r & 0xffff00fe) | 0x600:
+	 *     "clear 'source clock enable ack to XO state' mask", the register the MT6768's own recipe wrote;
+	 *   - "CONN2EMI HW slpprot control enable": 0x18004160[4] 1'b1 -- the CONN HIF PDMA's sleep protect, the
+	 *     MT6785's own step;
+	 *   - "toppose_restore_done rollback": 0x180C1600 bit 23.
+	 * (The MT6768's third step, MCU+0x150 bit 21, has no counterpart here.) Boot-arg connsys_post=0: none of it.
 	 */
 	{
 		uint32_t post = 1;
 
 		(void)PE_parse_boot_argn("connsys_post", &post, sizeof(post));
 		if (post != 0) {
-			/* (a window taken back after: one more permanent one filled the kernel's 8 MB I/O map, and another driver's
-			 * later mapping panicked, "kmem_alloc ... failed with 3" -- runs 430-435; 16 KB aligned) */
+			/* (windows taken back after: one more permanent one filled the kernel's 8 MB I/O map, and another driver's
+			 * later mapping panicked, "kmem_alloc ... failed with 3" -- the Infinix's runs 430-435; 16 KB aligned) */
 			vm_offset_t misc_on_window = ml_io_map_unmappable(0x180C0000u, 0x4000, 0x7 /* VM_WIMG_IO */);
 			vm_offset_t misc_on = misc_on_window + 0x1000;
-			uint32_t stable = rd(misc_on, 0x200), ack = rd(misc_on, 0x204), emi = rd(mcu, 0x150), toppose = rd(misc_on, 0x600);
+			vm_offset_t pdma_window = ml_io_map_unmappable(0x18004000u, 0x4000, 0x7 /* VM_WIMG_IO */);
+			uint32_t stable = rd(misc_on, 0x200), ack = rd(misc_on, 0x204), slpprot = rd(pdma_window, 0x160), toppose = rd(misc_on, 0x600);
 
 			*(volatile uint32_t *)(misc_on + 0x200) = (stable & 0xffff0000u) | 0x708u;
 			*(volatile uint32_t *)(misc_on + 0x204) = (ack & 0xffff00feu) | 0x600u;
-			*(volatile uint32_t *)(mcu + 0x150) = emi & ~(1u << 21);
+			*(volatile uint32_t *)(pdma_window + 0x160) = (slpprot & 0xffffffefu) | (1u << 4);
 			*(volatile uint32_t *)(misc_on + 0x600) = (toppose & 0xff7fffffu) | (1u << 23);
 			__asm__ volatile ("dsb sy" ::: "memory");
 			redwood_host_keep_add("connsys: step 5 [%u ms]: as polling_consys_chipid: XO stable time %#x -> %#x, ack mask %#x -> %#x, "
-			    "EMI control (MCU+0x150) %#x -> %#x, toppose restore %#x -> %#x", connsys_ms(), stable, rd(misc_on, 0x200), ack,
-			    rd(misc_on, 0x204), emi, rd(mcu, 0x150), toppose, rd(misc_on, 0x600));
+			    "PDMA slpprot %#x -> %#x, toppose restore %#x -> %#x", connsys_ms(), stable, rd(misc_on, 0x200), ack,
+			    rd(misc_on, 0x204), slpprot, rd(pdma_window, 0x160), toppose, rd(misc_on, 0x600));
 			ml_io_unmap(misc_on_window, 0x4000);
+			ml_io_unmap(pdma_window, 0x4000);
 		}
 	}
 	uint32_t ms_rel = connsys_ms();
@@ -1529,10 +1569,11 @@ connsys_firmware_thread(__unused void *parameter, __unused wait_result_t result)
 	    connsys_ms(), ms_rel, copied, rd(infra, 0x380), rd(infra, 0x388), version, version == 0x1D1E ? "CONNSYS'S ROM TOOK IT" : "not 0x1D1E",
 	    rd(hif, 0x104), (delay_for_interval(10, NSEC_PER_MSEC), rd(hif, 0x104)));
 	redwood_host_keep_add("connsys: %s", connsys_said);
-	for (unsigned n = 0; n < 100 && (connsys_hif != 0 && rd(connsys_hif, 0x104) != 0xb04); n++) {
+	for (unsigned n = 0; n < 100 && connsys_hif != 0 && rd(connsys_hif, 0x104) == 0; n++) {
 		delay_for_interval(10, NSEC_PER_MSEC);
 	}
-	redwood_host_keep_add("connsys: step 5 [%u ms]: MCU reached 0xb04 (CPUPCR %#x)", connsys_ms(), connsys_hif != 0 ? rd(connsys_hif, 0x104) : 0);
+	redwood_host_keep_add("connsys: step 5 [%u ms]: MCU at %#x (the Infinix's ROM idled at 0xb04; where this one's does, "
+	    "this run is to say)", connsys_ms(), connsys_hif != 0 ? rd(connsys_hif, 0x104) : 0);
 	if (connsys_step >= 7) {
 		delay_for_interval(20, NSEC_PER_MSEC);          /* Android's msleep(20) after the reset bit */
 		connsys_btif_init();
@@ -1558,11 +1599,11 @@ redwood_connsys_init(void)
 		redwood_mtkwifi_net_early();
 	}
 	spm = ml_io_map(SPM_PHYS, 0x1000);
-	ctrl = rd(spm, SPM_TOP1_PWR_CTRL);
+	ctrl = rd(spm, SPM_CONN_PWR_CON);
 	status = rd(spm, SPM_PWR_STATUS);
 	status2 = rd(spm, SPM_PWR_STATUS_2ND);
-	on = (status & status2 & PWR_STATUS_CONN) && (status & status2 & PWR_STATUS_CONN_TOP2);
-	redwood_host_keep_add("connsys: step 1: SPM TOP1_PWR_CTRL %#x (reset %s, iso %s, on %u/%u, clock %u), PWR_STATUS %#x/%#x: "
+	on = (status & status2 & PWR_STATUS_CONN) != 0;
+	redwood_host_keep_add("connsys: step 1: SPM CONN_PWR_CON %#x (reset %s, iso %s, on %u/%u, clock %u), PWR_STATUS %#x/%#x: "
 	    "CONNSYS %s", ctrl, (ctrl & 1) ? "released" : "held", (ctrl & 2) ? "on" : "off", (ctrl >> 2) & 1, (ctrl >> 3) & 1,
 	    (ctrl >> 4) & 1, status, status2, on ? "ON" : "off");
 	if (step >= 2) {
@@ -1595,6 +1636,6 @@ redwood_connsys_init(void)
 	misc = ml_io_map(MCU_TOP_MISC_OFF_PHYS, 0x1000);
 	mcu = ml_io_map(MCU_PHYS, 0x1000);
 	redwood_host_keep_add("connsys: step 1: IP version %#x (%s), configuration %#x, hardware %#x, firmware %#x",
-	    rd(misc, CONSYS_IP_VER), rd(misc, CONSYS_IP_VER) == CONSYS_IP_VER_ID ? "the MT6768's" : "NOT the expected 0x10020501",
+	    rd(misc, CONSYS_IP_VER), rd(misc, CONSYS_IP_VER) == CONSYS_IP_VER_ID ? "the MT6785's" : "NOT the expected 0x10020600",
 	    rd(misc, CONSYS_CONF_ID) & 0xF, rd(mcu, CONSYS_HW_ID) & 0xFFFF, rd(mcu, CONSYS_FW_ID) & 0xFFFF);
 }
