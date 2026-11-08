@@ -88,9 +88,10 @@ connsys_ms(void)
  * registers.h and mt-plat/mt6785/include/mach/upmu_hw.h of this phone's kernel), read through the
  * PMIC wrapper's WACS2 channel as redwood_mtkkeys.c reads the PMIC: the wrapper is the MT6768's own.
  * Android turns VCN18 and VCN33_1 on before it powers CONNSYS up (consys_hw_vcn18_ctrl, mt6785.c).
- * Which OP_EN bit software control is, and what LK leaves in these at all, the sources name only
- * through an enum that never leaves the vendor's binary: step 3 writes no OP_EN until this has been
- * read and said (boot-arg connsys_op_en=N there, once known).
+ * Run connsys2 answered what the sources had left open: OP_EN 0x8000 on all three -- bit 15, SW_OP_EN
+ * (the last of HW0-HW14, bits 0-14, mt-plat/mt6785/include/mach/upmu_hw.h), software control already
+ * on and the rails only disabled; the VOSELs at 15 (3.5 V, vcn33_voltages of
+ * drivers/regulator/mt6359-regulator.c: 13 is 3.3 V, 9 is 2.8 V); DCXO_CW00 0x4f1d.
  */
 #define PWRAP_PHYS              0x1000d000u
 #define PWRAP_WACS2_CMD         0xc20
@@ -215,34 +216,26 @@ connsys_xo_wcn_on(void)
 /*
  * Step 3 (connsys_step=3): the supplies on, as consys_hw_vcn18_ctrl, consys_hw_bt/wifi_vcn33_ctrl and
  * mtk_wcn_consys_hw_efuse_paldo_ctrl do it (mt6785.c, mtk_wcn_consys_hw.c): VCN18 (fixed 1.8 V) on,
- * VCN33_1 to 3.3 V (its VOSEL, VCN33_1_ANA_CON0 bits 11-8, to 1) with both its enables -- bit 0 and
- * bit 15 of the one CON0, what the MT6768 had two registers for -- and VCN33_2 on at its default
- * 2.8 V (the efuse read's rail). What Android's PMIC driver also does is put each LDO under software
- * control through its OP_EN register (pmic_ldo_*_lp of pmic_lp_api.c) -- a bit the sources name only
- * through the enum of the last comment, so none is written until run 1 of step 2 has said what LK
- * leaves: boot-arg connsys_op_en=N then writes N into all three. Then all three read again, and the
- * clock buffer of co-clock mode turned on.
+ * VCN33_1 to 3.3 V and VCN33_2 to 2.8 V (their VOSEL, bits 11-8 of the ANA_CON0: 13 is 3.3 V and 9 is
+ * 2.8 V of vcn33_voltages, drivers/regulator/mt6359-regulator.c -- run 1 of step 2 found LK leaves
+ * both at 15, 3.5 V), VCN33_1 with both its enables -- bit 0 and bit 15 of the one CON0, what the
+ * MT6768 had two registers for. Their OP_EN registers are not written at all: bit 15 of each is
+ * SW_OP_EN (the last of HW0-HW14 at bits 0-14, mt-plat/mt6785/include/mach/upmu_hw.h), and run 1 of
+ * step 2 read all three as 0x8000 -- software control already on, the rails only disabled. Then all
+ * three read again, and the clock buffer of co-clock mode turned on.
  */
 static void
 connsys_supplies_on(void)
 {
-	uint32_t op_en = 0;
-	bool ok;
-
-	(void)PE_parse_boot_argn("connsys_op_en", &op_en, sizeof(op_en));
-	ok = connsys_pmic_update(0x1c2a, 1, 1);                /* LDO_VCN18_CON0: EN */
-	ok &= connsys_pmic_update(0x1f98, 0xf00u, 0x100u);     /* VCN33_1_ANA_CON0: VOSEL (bits 11-8) 3.3 V */
-	ok &= connsys_pmic_update(0x1bd8, 0x8001u, 0x8001u);   /* LDO_VCN33_1_CON0: EN_0 and EN_1 (bits 0 and 15) */
-	ok &= connsys_pmic_update(0x1c08, 1, 1);               /* LDO_VCN33_2_CON0: EN (2.8 V as it stands) */
-	if (op_en != 0) {
-		ok &= connsys_pmic_update(0x1c2e, 0xffu, op_en & 0xffu);   /* the three OP_EN registers, once step 2 */
-		ok &= connsys_pmic_update(0x1bdc, 0xffu, op_en & 0xffu);   /* has said which bit software control is */
-		ok &= connsys_pmic_update(0x1c0c, 0xffu, op_en & 0xffu);
-	}
+	bool ok = connsys_pmic_update(0x1c2a, 1, 1);                /* LDO_VCN18_CON0: EN */
+	ok &= connsys_pmic_update(0x1f98, 0xf00u, 0xd00u);          /* VCN33_1_ANA_CON0: VOSEL (bits 11-8) 13 = 3.3 V */
+	ok &= connsys_pmic_update(0x1bd8, 0x8001u, 0x8001u);       /* LDO_VCN33_1_CON0: EN_0 and EN_1 (bits 0 and 15) */
+	ok &= connsys_pmic_update(0x1f9c, 0xf00u, 0x900u);          /* VCN33_2_ANA_CON0: VOSEL 9 = 2.8 V */
+	ok &= connsys_pmic_update(0x1c08, 1, 1);                    /* LDO_VCN33_2_CON0: EN */
 
 	delay(1000);
-	redwood_host_keep_add("connsys: step 3: VCN18, VCN33_1 (3.3 V) and VCN33_2 turned on: %s%s", ok ? "written" :
-	    "THE WRAPPER DID NOT ANSWER", op_en != 0 ? ", OP_EN written" : " (OP_EN left as LK had it: connsys_op_en=0)");
+	redwood_host_keep_add("connsys: step 3: VCN18, VCN33_1 (3.3 V) and VCN33_2 (2.8 V) turned on: %s "
+	    "(OP_EN not written: SW_OP_EN, bit 15, was already set)", ok ? "written" : "THE WRAPPER DID NOT ANSWER");
 	connsys_power_report();
 	connsys_xo_wcn_on();
 }
