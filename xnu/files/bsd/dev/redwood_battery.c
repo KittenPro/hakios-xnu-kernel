@@ -823,6 +823,35 @@ pd_pdo_say(uint32_t pdo, char *out, int len)
 	}
 }
 
+/* the port as the negotiator itself sees it: the CC lines and the power status, said
+ * when they change -- the plug going in or out, told from the inside */
+static uint8_t tcpc_last_cc = 0xff, tcpc_last_ps = 0xff;
+
+static void
+tcpc_watch_cc(void)
+{
+	uint8_t cc = 0, ps = 0;
+
+	if (!rm_dev_read(TCPC_ADDR, TCPC_CC_STATUS, &cc) ||
+	    !rm_dev_read(TCPC_ADDR, TCPC_POWER_STATUS, &ps)) {
+		return;
+	}
+	if (cc == tcpc_last_cc && ps == tcpc_last_ps) {
+		return;
+	}
+	bool first = tcpc_last_cc == 0xff;
+
+	tcpc_last_cc = cc;
+	tcpc_last_ps = ps;
+	printf("pd: the port as the TCPC sees it%s: cc %#x (looking %u, result %u, cc1 %u cc2 %u), "
+	    "vbus %u\n", first ? " now" : " changed", cc, cc >> 7 & 1, cc >> 5 & 3, cc & 3, cc >> 2 & 3,
+	    ps >> 2 & 1);
+	if (!first) {
+		redwood_host_keep_add("pd: the port changed: cc %#x (result %u, cc1 %u cc2 %u), vbus %u",
+		    cc, cc >> 5 & 3, cc & 3, cc >> 2 & 3, ps >> 2 & 1);
+	}
+}
+
 /* A message from the brick, if one waits: read, said, and its alert handed back cleared --
  * the vendor's own get_message handshake, nothing else touched. The FIFO is asked at its
  * own door as well as through the alert: a message can sit unannounced if the alert mask
@@ -1110,8 +1139,10 @@ rosemary_battery_thread(__unused void *parameter, __unused wait_result_t result)
 		}
 
 		/* the brick's own words, if it sends any while we watch (read and handed back;
-		 * with pd_listen the ear is on, so its offers land here) */
+		 * with pd_listen the ear is on, so its offers land here), and the port itself
+		 * through the negotiator's eyes whenever it changes */
 		if ((pd_probe || pd_listen) && tcpc_ok) {
+			tcpc_watch_cc();
 			tcpc_drain_rx();
 		}
 
