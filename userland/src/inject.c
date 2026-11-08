@@ -1575,7 +1575,8 @@ make_service(IOHIDEventSystemClientRef client, const char *product, int page, in
 		if (made->opened) {
 			break;
 		}
-		say("redwood: input: the event server has not opened \"%s\" (attempt %d): making it again\n", product, attempt);
+		keep_line("redwood: input: the event server has not opened \"%s\" (attempt %d): making it again\n",
+		    product, attempt);
 		IOHIDVirtualServiceClientRemove(service);
 		CFRelease(service);
 		service = NULL;
@@ -1650,7 +1651,8 @@ send_button(IOHIDServiceClientRef buttons, const struct redwood_touch *t)
 	    HID_USAGE_VOLUME_DOWN : 0;
 	IOHIDEventRef event;
 
-	say("redwood: input: button %u %s, usage %#x, service %p\n", t->finger,
+	/* kept: whether a press reached the event system is the one thing the ring's middle eats */
+	keep_line("redwood: input: button %u %s, usage %#x, service %p\n", t->finger,
 	    t->type == REDWOOD_BUTTON_DOWN ? "down" : "up", usage, (void *)buttons);
 	if (usage == 0) {
 		return;
@@ -1700,7 +1702,7 @@ input_thread(__unused void *arg)
 	}
 	device = open(REDWOOD_TOUCH_DEVICE, O_RDONLY);
 	if (device < 0) {
-		say("redwood: input: %s: %s\n", REDWOOD_TOUCH_DEVICE, strerror(errno));
+		keep_line("redwood: input: %s: %s\n", REDWOOD_TOUCH_DEVICE, strerror(errno));
 		return NULL;
 	}
 	sleep(3);                       /* let backboardd get as far as starting its event server */
@@ -1720,7 +1722,7 @@ input_thread(__unused void *arg)
 	if (screen != NULL) {
 		buttons = make_service(client, "Redwood buttons", HID_PAGE_CONSUMER, HID_USAGE_CONSUMER_CONTROL, false);
 	}
-	say("redwood: input: touch screen service %p, buttons %p\n", (void *)screen, (void *)buttons);
+	keep_line("redwood: input: touch screen service %p, buttons %p\n", (void *)screen, (void *)buttons);
 	dispatch_semaphore_signal(input_services_made); /* see wait_for_als_arrival() */
 	if (screen == NULL) {
 		return NULL;
@@ -1730,13 +1732,13 @@ input_thread(__unused void *arg)
 		uint64_t read_at = mach_absolute_time();
 
 		if (count++ < 4) {
-			say("redwood: input: sample type %u finger %u at %u %u\n", t.type, t.finger, t.x, t.y);
+			keep_line("redwood: input: sample type %u finger %u at %u %u\n", t.type, t.finger, t.x, t.y);
 		}
 		if (t.type > REDWOOD_TOUCH_UP) {
 			if (buttons != NULL) {
 				send_button(buttons, &t);
 			} else {
-				say("redwood: input: button %u %s, but no buttons service\n", t.finger,
+				keep_line("redwood: input: button %u %s, but no buttons service\n", t.finger,
 				    t.type == REDWOOD_BUTTON_DOWN ? "down" : "up");
 			}
 		} else if (t.type == REDWOOD_TOUCH_DOWN && (touch_mode & 0xff) == TOUCH_MODE_WAKE && buttons != NULL) {
@@ -1762,7 +1764,7 @@ input_thread(__unused void *arg)
 			}
 		}
 	}
-	say("redwood: input: %s: %s\n", REDWOOD_TOUCH_DEVICE, strerror(errno));
+	keep_line("redwood: input: %s: %s\n", REDWOOD_TOUCH_DEVICE, strerror(errno));
 	return NULL;
 }
 

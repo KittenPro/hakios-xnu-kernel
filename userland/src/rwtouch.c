@@ -27,7 +27,9 @@
 #include <mach/mach_time.h>
 #include <notify.h>
 #include <pthread.h>
+#include <stdarg.h>
 #include <sys/qos.h>
+#include <sys/sysctl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -36,6 +38,20 @@
 #include "redwood_input.h"
 
 static int device;
+
+/* A line the kernel keeps and says again every minute (kern.redwood.say): a run's log keeps only
+ * its head and tail, and what a script pressed in the middle has to survive somehow. */
+static void
+keep(const char *format, ...)
+{
+	char line[200] = "!";
+	va_list arguments;
+
+	va_start(arguments, format);
+	vsnprintf(line + 1, sizeof(line) - 1, format, arguments);
+	va_end(arguments);
+	sysctlbyname("kern.redwood.say", NULL, NULL, line, strlen(line));
+}
 
 static void
 post(uint32_t type, double x, double y)
@@ -57,9 +73,11 @@ button(uint32_t which, int ms)
 		perror("rwtouch: write");
 		exit(1);
 	}
+	keep("rwtouch: button %u down written", which);
 	usleep((useconds_t)ms * 1000);
 	t.type = REDWOOD_BUTTON_UP;
 	write(device, &t, sizeof(t));
+	keep("rwtouch: button %u up written", which);
 }
 
 #define SAMPLE_MS       8               /* a sample every so many milliseconds: what the touch screen gives */

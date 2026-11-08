@@ -174,6 +174,11 @@ touch_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
 		if (error) {
 			break;
 		}
+		if (t.type >= REDWOOD_BUTTON_DOWN) {
+			/* a press is rare and precious: say who took it, for the queue is everyone's */
+			printf("redwood-touch: button %u %s read by pid %d\n", t.finger,
+			    t.type == REDWOOD_BUTTON_DOWN ? "down" : "up", proc_pid(current_proc()));
+		}
 		moved++;
 	}
 	lck_mtx_unlock(&touch_lock);
@@ -193,6 +198,10 @@ touch_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
 		}
 		if (t.type < REDWOOD_TOUCH_DOWN || t.type > REDWOOD_BUTTON_UP) {
 			return EINVAL;
+		}
+		if (t.type >= REDWOOD_BUTTON_DOWN) {
+			printf("redwood-touch: button %u %s written by pid %d\n", t.finger,
+			    t.type == REDWOOD_BUTTON_DOWN ? "down" : "up", proc_pid(current_proc()));
 		}
 		touch_post(t.type, t.finger, t.x, t.y, false);
 	}
