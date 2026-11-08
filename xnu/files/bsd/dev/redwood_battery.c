@@ -263,6 +263,12 @@ battery_thread(__unused void *parameter, __unused wait_result_t result)
 #define MT6360_CHG_CTRL7    0x17            /* bits 7:2 the battery's current: 100 mA and 100 mA a step to 5 A */
 #define MT6360_CHG_CTRL13   0x1d            /* bit 7 the charger's watchdog, nobody here to pet it -- said in the log */
 #define MT6360_CHG_CTRL17   0x2b            /* PUMPX: bit 7 the engine's switch, bit 6 the 2.0 mode, bits 4:0 the target */
+#define MT6360_DEV_TYPE     0x22            /* bit 7: the BC1.2 detection -- the D+/D- dance that latches a speaking brick */
+#define MT6360_USB_STATUS1  0x27            /* bits 6:4: what the detection found -- 4 a plain DCP, the brick's own kind */
+#define MT6360_DPDM_CTRL    0x28            /* the data lines' own driver: levels a QC2 brick reads as its commands */
+#define MT6360_CHG_CTRL19   0x61            /* bits 6:5: the input's overvoltage lid, the vendor's list 5.5/6.5/10.5/14.5 V */
+#define MT6360_DPDM_RELEASE 0x00            /* both data lines let go */
+#define MT6360_QC2_9V       0x18            /* D+ 3.3 V, D- 0.6 V: QC2's nine-volt command, the vendor's DP_33_DM_06 */
 
 /* The MT6360's own ADC (mt6360_pmu_adc.c, the same i2c address as the charger): the channel
  * asked of RPT_1's bits 7:4, the ADC's switch and the channel's bit written to CONFIG, the
@@ -281,13 +287,20 @@ battery_thread(__unused void *parameter, __unused wait_result_t result)
 #define MT6360_ADC_IBAT     6               /* the battery's, at the charger's own pin */
 #define MT6360_ADC_TEMP_JC  8               /* the charger's own junction, in centigrade */
 
-/* The brick's high voltage, the way the phone's own stock asks for it: MTK Pump Express
- * 2.0, spoken by the charger's PUMPX engine on the data lines (CTRL17, the vendor's
- * mt6360_pmu_chg.h, its set_pep20_current_pattern and enable_pump_express). Bit 6
- * chooses the 2.0 mode, bits 4:0 carry the target -- 5.5 V and half a volt a step, the
- * code the vendor's own encoding makes of the microvolts past five and a half million,
- * its ceiling 0x1d. Bit 7 is the engine's switch, cleared and then set to speak. The
- * stock's own ladder, the efficiency table the vendor sets: 8.0, 8.5, 9.0 and 9.5 V. */
+/* The brick's high voltage, the way the phone's own stock asks for it. The door first:
+ * no brick listens to anything until it is latched, and the latch is the BC1.2 detection's
+ * own D+/D- dance -- D+ held at 0.6 V past a second and a quarter with D- left to float,
+ * the phase the charger's usbchgen bit runs by itself (the vendor's rerun_apsd flow; what
+ * PE 2.0 and QC 2.0 share as an entry, each spec's own words). With the door open, two
+ * languages, the stock's first: MTK Pump Express 2.0, spoken by the charger's PUMPX
+ * engine on the data lines (CTRL17, the vendor's mt6360_pmu_chg.h, its
+ * set_pep20_current_pattern and enable_pump_express -- bit 6 the 2.0 mode, bits 4:0 the
+ * target, 5.5 V and half a volt a step, ceiling 0x1d, bit 7 the switch cleared then set;
+ * the stock's ladder 8.0, 8.5, 9.0, 9.5 V). And if the brick does not answer that, QC2's
+ * own command held on the lines by the charger's DPDM driver (the vendor's
+ * get_hvdcp_work: D+ 3.3 V and D- 0.6 V, its nine volts, then the port read back against
+ * its own 7.2 V line). The input's overvoltage lid the vendor's probe lifts out of the
+ * way for all of this -- CTRL19 bits 6:5, its list 5.5/6.5/10.5/14.5 V, the top one. */
 #define MT6360_PUMPX_EN     0x80            /* the engine's switch: cleared, then set to speak */
 #define MT6360_PUMPX_20     0x40            /* the 2.0 mode against the 1.0's up-and-down */
 #define MT6360_PUMPX_DEC    0x1f            /* the target, 5.5 V and half a volt a step */
@@ -302,13 +315,15 @@ battery_thread(__unused void *parameter, __unused wait_result_t result)
 static int chg_aicr_ma, chg_ichg_ma, chg_cv_mv;
 
 /* pe_vbus, in millivolts, asks the brick for high voltage once the port has settled at
- * five volts: the PUMPX engine speaks the 2.0 pattern for that target, and the port's
- * own voltage -- watched on the charger's ADC -- says what the brick answered. The
- * currents of the asking are the vendor's own negotiation pair, the input at 800 mA and
- * the battery at 2 A; whichever limit the boot-args named before is written back after
- * the brick has answered or plainly refused. */
+ * five volts: the detection's dance latches the brick's ear, the input's lid is lifted
+ * out of the way, and then the PUMPX engine speaks the 2.0 pattern for that target --
+ * and if the port does not rise, QC2's nine-volt command is held on the lines instead.
+ * The port's own voltage, watched on the charger's ADC, says what the brick answered.
+ * The currents of the asking are the vendor's own negotiation pair, the input at 800 mA
+ * and the battery at 2 A; whichever limit the boot-args named before is written back
+ * after the brick has answered or plainly refused both languages. */
 static int pe_vbus_mv;
-static int pe_state;                         /* 0 waiting for the port to settle, 1 asked, 2 answered, 3 refused */
+static int pe_state;                         /* 0 settling, 1 detecting, 2 PE asked, 3 refused, 4 PE answered, 5 QC answered */
 static unsigned pe_stable, pe_wait, pe_tries;
 
 static vm_offset_t rm_gpio;
@@ -958,28 +973,52 @@ rosemary_battery_thread(__unused void *parameter, __unused wait_result_t result)
 			ibus2_ma = (int)adc_ibus * (((ctrl3 >> 2) & 0x3f) < 6 ? 19 : 25) / 10;
 		}
 
-		/* the brick asked for high voltage, once it has sat at five volts for a minute:
-		 * the engine speaks, and the port's own voltage says what the brick answered.
-		 * Three tries, a plug-out or a burp starts the settling over, and whichever
-		 * limit the boot-args named is written back after the brick has spoken. */
+		/* the brick asked for high voltage, once it has sat at five volts for a
+		 * minute. First the vendor's own preparation: the input's overvoltage lid
+		 * lifted to 14.5 V and the BC1.2 detection on -- its D+/D- dance is the
+		 * latch that opens a speaking brick's ear. Then the stock's language, PE
+		 * 2.0 through the engine; thirty seconds of silence and QC2's nine-volt
+		 * command is held on the lines instead; neither answered and the port
+		 * stays at five volts. A plug-out or a burp starts the settling over,
+		 * and whichever limit the boot-args named is written back once the
+		 * brick has spoken. */
 		if (pe_vbus_mv > 0 && mt6360 && pe_state != 3) {
 			if (pe_state == 0) {
 				if (adc_ok && vbus2_mv > 4000 && vbus2_mv < 5600) {
 					if (++pe_stable >= 12 && pe_tries < 3) {
-						mt6360_pe20_ask(pe_vbus_mv);
+						pe_tries++;
+						(void)mt6360_update(MT6360_CHG_CTRL19, 0x60, 3 << 5);
+						(void)mt6360_update(MT6360_DEV_TYPE, 0x80, 0x80);
 						pe_state = 1;
 						pe_wait = 0;
-						pe_tries++;
-						printf("battery: PE 2.0 asked: %d mV, try %u\n", pe_vbus_mv, pe_tries);
-						redwood_host_keep_add("battery: PE 2.0 asked: %d mV, try %u",
-						    pe_vbus_mv, pe_tries);
+						printf("battery: the input's lid lifted to 14.5 V, the detection on; "
+						    "the brick's ear opens with its dance\n");
+						redwood_host_keep_add("battery: the input's lid lifted, the detection on");
 					}
 				} else if (!adc_ok || vbus2_mv < 4000) {
 					pe_stable = 0;      /* the port went away; the settling starts over */
 				}
 			} else if (pe_state == 1) {
-				if (adc_ok && vbus2_mv > 6500) {
+				uint8_t usbstat = 0;
+
+				(void)mt6360_read(MT6360_USB_STATUS1, &usbstat);
+				if (pe_wait == 0) {
+					printf("battery: the detection reads %#x (type %u, %s)\n", usbstat,
+					    usbstat >> 4 & 7, (usbstat >> 4 & 7) == 4 ? "a DCP" : "not a DCP yet");
+				}
+				pe_wait++;
+				if ((usbstat >> 4 & 7) == 4 || pe_wait >= 2) {
+					/* a DCP, or the dance had its two ticks: the stock's language first */
+					mt6360_pe20_ask(pe_vbus_mv);
 					pe_state = 2;
+					pe_wait = 0;
+					printf("battery: PE 2.0 asked: %d mV, try %u\n", pe_vbus_mv, pe_tries);
+					redwood_host_keep_add("battery: PE 2.0 asked: %d mV, try %u",
+					    pe_vbus_mv, pe_tries);
+				}
+			} else if (pe_state == 2) {
+				if (adc_ok && vbus2_mv > 6500) {
+					pe_state = 4;       /* the stock's own language, spoken and answered */
 					printf("battery: PE 2.0: the brick answered, the port %d mV\n", vbus2_mv);
 					redwood_host_keep_add("battery: PE 2.0: the brick answered, the port %d mV",
 					    vbus2_mv);
@@ -989,16 +1028,46 @@ rosemary_battery_thread(__unused void *parameter, __unused wait_result_t result)
 				} else if (adc_ok && vbus2_mv < 3000) {
 					pe_state = 0;       /* the brick dropped the port: burped or unplugged */
 					pe_stable = 0;
-				} else if (++pe_wait > 24) {
-					pe_state = 3;
-					printf("battery: PE 2.0: no answer, the port stays at five volts\n");
-					redwood_host_keep_add("battery: PE 2.0: no answer, the port stays at five volts");
-					if (chg_aicr_ma > 0) {
-						mt6360_set_aicr(chg_aicr_ma);
+				} else if (++pe_wait > 6) {
+					/* the brick does not answer the stock's language: QC2's own
+					 * nine-volt command, held on the lines, the port read back
+					 * against the vendor's own line */
+					int32_t v = 0;
+					bool qc;
+
+					(void)mt6360_write(MT6360_DPDM_CTRL, MT6360_QC2_9V);
+					delay_for_interval(300, NSEC_PER_MSEC);
+					qc = mt6360_adc(MT6360_ADC_VBUSDIV5, &v) && v * 6250 / 1000 > 7200;
+					if (!qc) {          /* one more look, the brick's own settle time */
+						delay_for_interval(100, NSEC_PER_MSEC);
+						qc = mt6360_adc(MT6360_ADC_VBUSDIV5, &v) && v * 6250 / 1000 > 7200;
+					}
+					pe_wait = 0;
+					if (qc) {
+						pe_state = 5;
+						printf("battery: QC2: the brick answered nine volts, the port %d mV\n",
+						    (int)(v * 6250 / 1000));
+						redwood_host_keep_add("battery: QC2: the brick answered, the port %d mV",
+						    (int)(v * 6250 / 1000));
+						if (chg_aicr_ma > 0) {
+							mt6360_set_aicr(chg_aicr_ma);
+						}
+					} else {
+						(void)mt6360_write(MT6360_DPDM_CTRL, MT6360_DPDM_RELEASE);
+						(void)mt6360_update(MT6360_DEV_TYPE, 0x80, 0);
+						pe_state = 3;
+						printf("battery: neither language: the port stays at five volts\n");
+						redwood_host_keep_add("battery: neither language: the port stays at five volts");
+						if (chg_aicr_ma > 0) {
+							mt6360_set_aicr(chg_aicr_ma);
+						}
 					}
 				}
-			} else if (pe_state == 2 && adc_ok && vbus2_mv < 3000) {
-				pe_state = 0;           /* unplugged at high voltage: ready to ask again */
+			} else if (pe_state >= 4 && adc_ok && vbus2_mv < 3000) {
+				/* unplugged at high voltage: the lines let go, ready to ask again */
+				(void)mt6360_write(MT6360_DPDM_CTRL, MT6360_DPDM_RELEASE);
+				(void)mt6360_update(MT6360_DEV_TYPE, 0x80, 0);
+				pe_state = 0;
 				pe_stable = 0;
 			}
 		}
