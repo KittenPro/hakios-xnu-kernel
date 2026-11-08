@@ -208,10 +208,10 @@ battery_thread(__unused void *parameter, __unused wait_result_t result)
  * input's limit and the battery's own current, conservative steps from half an ampere.
  * The one voltage ever written is the ceiling, and only when chg_cv asks for it -- the
  * battery's own hundred percent where Android fills it to; the port's own negotiation
- * is a story of its own. That story begins here too, read-only: the same companion's
- * TCPC half (the standard TCPCI v1.0 register map at another address of the same bus)
- * is the port's negotiator, and pd_probe opens eyes on it -- its identity, its state,
- * and every offer the brick makes, said and nothing more until negotiation is written.
+ * is a story of its own. That story is the phone's own: MTK Pump Express 2.0, asked
+ * through the charger's PUMPX engine when pe_vbus names a voltage -- the engine speaks
+ * the pattern to the brick on the data lines by itself, and the port's voltage, watched
+ * on the charger's own ADC, says what the brick answered.
  */
 #define RM_GPIO_PHYS        0x10005000
 #define RM_DIR_AT(pin)      (0x0000 + 0x10 * ((pin) / 32))
@@ -262,6 +262,7 @@ battery_thread(__unused void *parameter, __unused wait_result_t result)
 #define MT6360_CHG_CTRL6    0x16            /* bits 7:1 the port's droop floor: 3900 mV and 100 mV a step, the input's own guard */
 #define MT6360_CHG_CTRL7    0x17            /* bits 7:2 the battery's current: 100 mA and 100 mA a step to 5 A */
 #define MT6360_CHG_CTRL13   0x1d            /* bit 7 the charger's watchdog, nobody here to pet it -- said in the log */
+#define MT6360_CHG_CTRL17   0x2b            /* PUMPX: bit 7 the engine's switch, bit 6 the 2.0 mode, bits 4:0 the target */
 
 /* The MT6360's own ADC (mt6360_pmu_adc.c, the same i2c address as the charger): the channel
  * asked of RPT_1's bits 7:4, the ADC's switch and the channel's bit written to CONFIG, the
@@ -280,40 +281,17 @@ battery_thread(__unused void *parameter, __unused wait_result_t result)
 #define MT6360_ADC_IBAT     6               /* the battery's, at the charger's own pin */
 #define MT6360_ADC_TEMP_JC  8               /* the charger's own junction, in centigrade */
 
-/* The port's own negotiator: the TCPC half of the same MT6360, at the companion's other
- * address (0x4e, as the upstream mt6360 core hands it out). Its register map is the
- * standard TCPCI v1.0 one (std_tcpci_v10.h of the vendor tree) over the vendor's own
- * extensions at 0x80 and above (mt6360.h). This is read-only eyes yet: pd_probe asks for
- * the identification and the status registers once, and then watches the receive alert --
- * a message waiting in the FIFO is read, said, and its alert handed back cleared, the
- * get_message handshake of tcpc_mt6360.c with nothing else touched. The PD message format
- * itself: a 16-bit header (the type in bits 4:0, the count of objects in 14:12), then the
- * objects; a source's capabilities are data type 1, each object a power offer. */
-#define TCPC_ADDR           0x4e            /* the negotiator half of the companion, on i2c5 */
-#define TCPC_VID            0x00            /* the identity the vendor's tree says: 0x29cf */
-#define TCPC_PID            0x02            /* 0x6360 */
-#define TCPC_DID            0x04
-#define TCPC_ALERT          0x10            /* 16 bits, write-one-to-clear */
-#define TCPC_ALERT_MASK     0x12            /* 16 bits */
-#define TCPC_CTRL           0x19
-#define TCPC_ROLE_CTRL      0x1a
-#define TCPC_POWER_CTRL     0x1c
-#define TCPC_CC_STATUS      0x1d
-#define TCPC_POWER_STATUS   0x1e
-#define TCPC_MSG_HDR_INFO   0x2e
-#define TCPC_RX_DETECT      0x2f            /* the PD receiver's switch: bits for the SOPs */
-#define TCPC_RX_BYTE_CNT    0x30            /* then the frame type, then the header's two */
-#define TCPC_RX_DATA        0x34            /* the objects, up to twenty-eight bytes */
-#define TCPC_MTK_MODE_CTRL3 0x90            /* the vendor's: the PD bias and the oscillator */
-#define TCPC_MTK_CLK_CTRL1  0x87            /* the PD clocks: un-gated 0xca (the vendor's own value) */
-#define TCPC_MTK_CLK_CTRL2  0x88            /* un-gated 0x54: the 24M and the protocol clocks */
-#define TCPC_RX_DETECT_ON   0x21            /* SOP messages and hard resets: a listening sink's ear */
-#define TCPC_ALERT_ON       0x867f          /* the vendor's own set: the receive and its overflow, the line and power
-	                                        * events, the transmit's three verdicts, fault and vendor -- ones, the
-	                                        * TCPCI v1.0 way of saying these alerts may speak */
-#define TCPC_HDR_SINK20     0x02            /* MSG_HDR_INFO: a PD 2.0 sink, UFP -- what the hardware's own GoodCRC says */
-#define TCPC_ALERT_RX_STATUS (1u << 2)      /* a message waits in the FIFO */
-#define TCPC_ALERT_RX_OVERFLOW (1u << 10)   /* the FIFO overflowed; the oldest are lost */
+/* The brick's high voltage, the way the phone's own stock asks for it: MTK Pump Express
+ * 2.0, spoken by the charger's PUMPX engine on the data lines (CTRL17, the vendor's
+ * mt6360_pmu_chg.h, its set_pep20_current_pattern and enable_pump_express). Bit 6
+ * chooses the 2.0 mode, bits 4:0 carry the target -- 5.5 V and half a volt a step, the
+ * code the vendor's own encoding makes of the microvolts past five and a half million,
+ * its ceiling 0x1d. Bit 7 is the engine's switch, cleared and then set to speak. The
+ * stock's own ladder, the efficiency table the vendor sets: 8.0, 8.5, 9.0 and 9.5 V. */
+#define MT6360_PUMPX_EN     0x80            /* the engine's switch: cleared, then set to speak */
+#define MT6360_PUMPX_20     0x40            /* the 2.0 mode against the 1.0's up-and-down */
+#define MT6360_PUMPX_DEC    0x1f            /* the target, 5.5 V and half a volt a step */
+#define MT6360_PUMPX_MAXVAL 0x1d            /* the vendor's own ceiling: the ladder stops at 9.5 V */
 
 /* boot-args chg_aicr / chg_ichg / chg_cv, in milliamperes and millivolts: the currents the
  * charger is given when the battery is asked to actually fill, and the ceiling it fills to
@@ -323,16 +301,15 @@ battery_thread(__unused void *parameter, __unused wait_result_t result)
  * percent. The port's droop floor (CTRL6) and every other voltage stay as found. */
 static int chg_aicr_ma, chg_ichg_ma, chg_cv_mv;
 
-/* pd_probe: read-only eyes on the port's negotiator -- the identification and the status
- * registers once, then every message the brick sends, read and said and nothing more.
- * pd_listen, one step further: the receiver's switch on -- the vendor's own set_rx_enable
- * sequence, the clocks un-gated then RX_DETECT set to SOP|HARD_RESET, its value for a
- * listening sink. Nothing else changes: no message is ever sent, the hardware's own
- * GoodCRC answers the brick (the TCPC's protocol layer does that alone), and without a
- * Request from here the brick keeps VBUS at five volts. */
-static int pd_probe, pd_listen;
-static bool tcpc_ok;
-static unsigned tcpc_rx_seen;
+/* pe_vbus, in millivolts, asks the brick for high voltage once the port has settled at
+ * five volts: the PUMPX engine speaks the 2.0 pattern for that target, and the port's
+ * own voltage -- watched on the charger's ADC -- says what the brick answered. The
+ * currents of the asking are the vendor's own negotiation pair, the input at 800 mA and
+ * the battery at 2 A; whichever limit the boot-args named before is written back after
+ * the brick has answered or plainly refused. */
+static int pe_vbus_mv;
+static int pe_state;                         /* 0 waiting for the port to settle, 1 asked, 2 answered, 3 refused */
+static unsigned pe_stable, pe_wait, pe_tries;
 
 static vm_offset_t rm_gpio;
 static bool rm_pushpull;                    /* i2c5's ones driven instead of only released */
@@ -779,131 +756,39 @@ mt6360_adc(uint8_t channel, int32_t *raw)
 	return done;
 }
 
-/* ---- the port's own negotiator, read-only: the TCPC half of the MT6360 -------------------- */
+/* ---- the brick's high voltage: PUMPX, the stock's own way of asking ----------------------- */
 
-static bool
-tcpc_read_word(uint8_t reg, uint16_t *value)
-{
-	uint8_t buf[2];
-
-	if (!rm_dev_read_block(TCPC_ADDR, reg, buf, 2)) {
-		return false;
-	}
-	*value = (uint16_t)(buf[0] | buf[1] << 8);
-	return true;
-}
-
-static bool
-tcpc_write_word(uint8_t reg, uint16_t value)
-{
-	uint8_t buf[2] = { (uint8_t)value, (uint8_t)(value >> 8) };
-
-	return rm_dev_write_block(TCPC_ADDR, reg, buf, 2);
-}
-
-/* One power offer, said the way a person reads a brick's label: a fixed one by its voltage
- * and current, a ranged one (the APDO a programmable brick offers) by its window. The
- * encodings are the spec's own, fixed supply PDO bits 19:10 the voltage in fifties and
- * 9:0 the current in tens, the APDO its window in hundreds and its current in fifties. */
+/* The vendor's set_pep20_current_pattern and enable_pump_express as one: the 2.0 mode
+ * and the target in CTRL17 -- the code its own encoding makes of the millivolts past
+ * five and a half thousand, half a volt a step -- then the negotiation's own pair, the
+ * input at 800 mA and the battery at 2 A with the charger on, and the engine's switch
+ * cleared and set to speak. From there the engine drives the data lines itself; what
+ * the brick answered is read off the port, not off a register. */
 static void
-pd_pdo_say(uint32_t pdo, char *out, int len)
+mt6360_pe20_ask(int target_mv)
 {
-	uint32_t kind = pdo >> 30;
+	uint8_t code = target_mv > 5500 ? (uint8_t)((target_mv - 5500 + 499) / 500) : 0;
 
-	if (kind == 0) {
-		snprintf(out, len, "%lu mV @ %lu mA", (unsigned long)(((pdo >> 10) & 0x3ff) * 50),
-		    (unsigned long)((pdo & 0x3ff) * 10));
-	} else if (kind == 3) {
-		snprintf(out, len, "%lu-%lu mV @ %lu mA (ranged)",
-		    (unsigned long)(((pdo >> 8) & 0x7f) * 100),
-		    (unsigned long)(((pdo >> 17) & 0xff) * 100),
-		    (unsigned long)((pdo & 0x7f) * 50));
-	} else {
-		snprintf(out, len, "kind %lu: %#lx", (unsigned long)kind, (unsigned long)pdo);
+	if (code > MT6360_PUMPX_MAXVAL) {
+		code = MT6360_PUMPX_MAXVAL;
 	}
+	(void)mt6360_update(MT6360_CHG_CTRL17, MT6360_PUMPX_20, MT6360_PUMPX_20);
+	(void)mt6360_update(MT6360_CHG_CTRL17, MT6360_PUMPX_DEC, code);
+	(void)mt6360_update(MT6360_CHG_CTRL3, 0xfc, (uint8_t)((800 - 100) / 50) << 2);
+	(void)mt6360_update(MT6360_CHG_CTRL7, 0xfc, (uint8_t)((2000 - 100) / 100) << 2);
+	(void)mt6360_update(MT6360_CHG_CTRL2, 0x01, 1);
+	(void)mt6360_update(MT6360_CHG_CTRL17, MT6360_PUMPX_EN, 0);
+	(void)mt6360_update(MT6360_CHG_CTRL17, MT6360_PUMPX_EN, MT6360_PUMPX_EN);
 }
 
-/* the port as the negotiator itself sees it: the CC lines and the power status, said
- * when they change -- the plug going in or out, told from the inside */
-static uint8_t tcpc_last_cc = 0xff, tcpc_last_ps = 0xff;
-
+/* the input's limit, the register's own fifties -- for writing back what the boot-args
+ * named once the asking's own 800 mA is past */
 static void
-tcpc_watch_cc(void)
+mt6360_set_aicr(int ma)
 {
-	uint8_t cc = 0, ps = 0;
-
-	if (!rm_dev_read(TCPC_ADDR, TCPC_CC_STATUS, &cc) ||
-	    !rm_dev_read(TCPC_ADDR, TCPC_POWER_STATUS, &ps)) {
-		return;
-	}
-	if (cc == tcpc_last_cc && ps == tcpc_last_ps) {
-		return;
-	}
-	bool first = tcpc_last_cc == 0xff;
-
-	tcpc_last_cc = cc;
-	tcpc_last_ps = ps;
-	printf("pd: the port as the TCPC sees it%s: cc %#x (looking %u, result %u, cc1 %u cc2 %u), "
-	    "vbus %u\n", first ? " now" : " changed", cc, cc >> 7 & 1, cc >> 5 & 3, cc & 3, cc >> 2 & 3,
-	    ps >> 2 & 1);
-	if (!first) {
-		redwood_host_keep_add("pd: the port changed: cc %#x (result %u, cc1 %u cc2 %u), vbus %u",
-		    cc, cc >> 5 & 3, cc & 3, cc >> 2 & 3, ps >> 2 & 1);
-	}
-}
-
-/* A message from the brick, if one waits: read, said, and its alert handed back cleared --
- * the vendor's own get_message handshake, nothing else touched. The FIFO is asked at its
- * own door as well as through the alert: a message can sit unannounced if the alert mask
- * was left without the receive's bits, and the count register says what waits whatever
- * the alert says. */
-static void
-tcpc_drain_rx(void)
-{
-	uint16_t alert = 0;
-	uint8_t head[4] = { 0, 0, 0, 0 }, payload[28];
-
-	(void)tcpc_read_word(TCPC_ALERT, &alert);
-	if (!rm_dev_read_block(TCPC_ADDR, TCPC_RX_BYTE_CNT, head, 4)) {
-		return;
-	}
-	if (!(alert & TCPC_ALERT_RX_STATUS) && head[0] == 0) {
-		return;                      /* nothing anywhere */
-	}
-	int n = head[0] > 3 ? head[0] - 3 : 0;
-
-	if (n > 28) {
-		n = 28;                     /* the frame's own count, clamped to the objects' room */
-	}
-	if (n > 0 && !rm_dev_read_block(TCPC_ADDR, TCPC_RX_DATA, payload, n)) {
-		n = 0;
-	}
-	uint16_t hdr = (uint16_t)(head[2] | head[3] << 8);
-	int objects = (hdr >> 12) & 7, type = hdr & 0x1f;
-
-	if (objects > 7) {
-		objects = 7;
-	}
-	if (objects * 4 > n) {
-		objects = n / 4;            /* whatever the FIFO actually holds */
-	}
-	printf("pd: a message, type %d%s%s, %d objects, alert %#06x:", type,
-	    type == 1 ? " (the source's offers)" : "", type == 13 ? " (a soft reset)" : "",
-	    objects, alert);
-	for (int i = 0; i < objects; i++) {
-		char said[48];
-		uint32_t pdo = payload[i * 4] | payload[i * 4 + 1] << 8 |
-		    (uint32_t)payload[i * 4 + 2] << 16 | (uint32_t)payload[i * 4 + 3] << 24;
-
-		pd_pdo_say(pdo, said, sizeof(said));
-		printf(" [%s]", said);
-	}
-	printf("\n");
-	if (tcpc_rx_seen == 0) {
-		redwood_host_keep_add("pd: the brick's first message, type %d, %d objects", type, objects);
-	}
-	tcpc_rx_seen++;
-	(void)tcpc_write_word(TCPC_ALERT, TCPC_ALERT_RX_STATUS | TCPC_ALERT_RX_OVERFLOW);
+	if (ma < 100) ma = 100;
+	if (ma > 3250) ma = 3250;
+	(void)mt6360_update(MT6360_CHG_CTRL3, 0xfc, (uint8_t)((ma - 100) / 50) << 2);
 }
 
 static void
@@ -1032,71 +917,6 @@ rosemary_battery_thread(__unused void *parameter, __unused wait_result_t result)
 		}
 	}
 
-	/* the port's own negotiator, read-only eyes when pd_probe asks: who it is, and the
-	 * state the bootloader left it in -- the attachment, the receiver's switch, the PD
-	 * bias. Everything but the alert handshake is left exactly as found. pd_listen goes
-	 * one step on: the receiver's switch turned to the vendor's listening value, so the
-	 * brick's own words land in the log; no word is ever sent back. */
-	if (pd_probe || pd_listen) {
-		uint16_t vid = 0, pid = 0, did = 0;
-
-		tcpc_ok = tcpc_read_word(TCPC_VID, &vid) && tcpc_read_word(TCPC_PID, &pid) &&
-		    tcpc_read_word(TCPC_DID, &did);
-		if (!tcpc_ok) {
-			printf("battery: no answer at %#x on i2c5; the negotiator is elsewhere\n", TCPC_ADDR);
-			redwood_host_keep_add("battery: no answer at %#x; the negotiator is elsewhere", TCPC_ADDR);
-		} else {
-			uint16_t alert = 0, amask = 0;
-			uint8_t tctrl = 0, role = 0, pctrl = 0, cc = 0, pstat = 0, hdr = 0, rxdet = 0;
-			uint8_t mode3 = 0, clk1 = 0, clk2 = 0;
-
-			(void)tcpc_read_word(TCPC_ALERT, &alert);
-			(void)tcpc_read_word(TCPC_ALERT_MASK, &amask);
-			(void)rm_dev_read(TCPC_ADDR, TCPC_CTRL, &tctrl);
-			(void)rm_dev_read(TCPC_ADDR, TCPC_ROLE_CTRL, &role);
-			(void)rm_dev_read(TCPC_ADDR, TCPC_POWER_CTRL, &pctrl);
-			(void)rm_dev_read(TCPC_ADDR, TCPC_CC_STATUS, &cc);
-			(void)rm_dev_read(TCPC_ADDR, TCPC_POWER_STATUS, &pstat);
-			(void)rm_dev_read(TCPC_ADDR, TCPC_MSG_HDR_INFO, &hdr);
-			(void)rm_dev_read(TCPC_ADDR, TCPC_RX_DETECT, &rxdet);
-			(void)rm_dev_read(TCPC_ADDR, TCPC_MTK_CLK_CTRL1, &clk1);
-			(void)rm_dev_read(TCPC_ADDR, TCPC_MTK_CLK_CTRL2, &clk2);
-			(void)rm_dev_read(TCPC_ADDR, TCPC_MTK_MODE_CTRL3, &mode3);
-			printf("battery: the TCPC at %#x: id %04x:%04x did %04x, cc %#x (looking %u, "
-			    "result %u, cc1 %u cc2 %u), vbus %u, rx-detect %#x, hdr-info %#x, mode3 %#x, "
-			    "clks %#x/%#x, alert %04x (mask %04x)\n", TCPC_ADDR, vid, pid, did, cc,
-			    cc >> 7 & 1, cc >> 5 & 3, cc & 3, cc >> 2 & 3,
-			    (pstat >> 2) & 1, rxdet, hdr, mode3, clk1, clk2, alert, amask);
-			redwood_host_keep_add("battery: the TCPC at %#x: id %04x:%04x did %04x, cc %#x, "
-			    "vbus %u, rx-detect %#x, mode3 %#x", TCPC_ADDR, vid, pid, did, cc,
-			    (pstat >> 2) & 1, rxdet, mode3);
-			if (alert & TCPC_ALERT_RX_STATUS) {
-				tcpc_drain_rx();    /* whatever waited through the boot, said now */
-			}
-			if (pd_listen) {
-				/* the vendor's set_rx_enable and init_alert_mask, and the header info its
-				 * policy engine sets for a PD 2.0 sink: clocks un-gated, the ear on, the
-				 * alerts allowed to speak, and the hardware's GoodCRC saying who it
-				 * answers for. Still no word of our own, ever. */
-				uint8_t rxdet = 0, hdr = 0;
-				uint16_t amask = 0;
-
-				(void)rm_dev_write(TCPC_ADDR, TCPC_MTK_CLK_CTRL1, 0xca);
-				(void)rm_dev_write(TCPC_ADDR, TCPC_MTK_CLK_CTRL2, 0x54);
-				(void)rm_dev_write(TCPC_ADDR, TCPC_RX_DETECT, TCPC_RX_DETECT_ON);
-				(void)tcpc_write_word(TCPC_ALERT_MASK, TCPC_ALERT_ON);
-				(void)rm_dev_write(TCPC_ADDR, TCPC_MSG_HDR_INFO, TCPC_HDR_SINK20);
-				(void)rm_dev_read(TCPC_ADDR, TCPC_RX_DETECT, &rxdet);
-				(void)rm_dev_read(TCPC_ADDR, TCPC_MSG_HDR_INFO, &hdr);
-				(void)tcpc_read_word(TCPC_ALERT_MASK, &amask);
-				printf("battery: the TCPC's ear on (rx-detect %#x, mask %04x, hdr-info %#x); "
-				    "listening, never speaking\n", rxdet, amask, hdr);
-				redwood_host_keep_add("battery: the TCPC's ear on (rx-detect %#x, mask %04x, hdr %#x); "
-				    "listening, never speaking", rxdet, amask, hdr);
-			}
-		}
-	}
-
 	for (unsigned tick = 0;; tick++) {
 		uint32_t batadc = 0, vcdt = 0, ntc = 0, chrdet = 0;
 		uint8_t stat = 0, stat1 = 0;
@@ -1138,12 +958,49 @@ rosemary_battery_thread(__unused void *parameter, __unused wait_result_t result)
 			ibus2_ma = (int)adc_ibus * (((ctrl3 >> 2) & 0x3f) < 6 ? 19 : 25) / 10;
 		}
 
-		/* the brick's own words, if it sends any while we watch (read and handed back;
-		 * with pd_listen the ear is on, so its offers land here), and the port itself
-		 * through the negotiator's eyes whenever it changes */
-		if ((pd_probe || pd_listen) && tcpc_ok) {
-			tcpc_watch_cc();
-			tcpc_drain_rx();
+		/* the brick asked for high voltage, once it has sat at five volts for a minute:
+		 * the engine speaks, and the port's own voltage says what the brick answered.
+		 * Three tries, a plug-out or a burp starts the settling over, and whichever
+		 * limit the boot-args named is written back after the brick has spoken. */
+		if (pe_vbus_mv > 0 && mt6360 && pe_state != 3) {
+			if (pe_state == 0) {
+				if (adc_ok && vbus2_mv > 4000 && vbus2_mv < 5600) {
+					if (++pe_stable >= 12 && pe_tries < 3) {
+						mt6360_pe20_ask(pe_vbus_mv);
+						pe_state = 1;
+						pe_wait = 0;
+						pe_tries++;
+						printf("battery: PE 2.0 asked: %d mV, try %u\n", pe_vbus_mv, pe_tries);
+						redwood_host_keep_add("battery: PE 2.0 asked: %d mV, try %u",
+						    pe_vbus_mv, pe_tries);
+					}
+				} else if (!adc_ok || vbus2_mv < 4000) {
+					pe_stable = 0;      /* the port went away; the settling starts over */
+				}
+			} else if (pe_state == 1) {
+				if (adc_ok && vbus2_mv > 6500) {
+					pe_state = 2;
+					printf("battery: PE 2.0: the brick answered, the port %d mV\n", vbus2_mv);
+					redwood_host_keep_add("battery: PE 2.0: the brick answered, the port %d mV",
+					    vbus2_mv);
+					if (chg_aicr_ma > 0) {
+						mt6360_set_aicr(chg_aicr_ma);
+					}
+				} else if (adc_ok && vbus2_mv < 3000) {
+					pe_state = 0;       /* the brick dropped the port: burped or unplugged */
+					pe_stable = 0;
+				} else if (++pe_wait > 24) {
+					pe_state = 3;
+					printf("battery: PE 2.0: no answer, the port stays at five volts\n");
+					redwood_host_keep_add("battery: PE 2.0: no answer, the port stays at five volts");
+					if (chg_aicr_ma > 0) {
+						mt6360_set_aicr(chg_aicr_ma);
+					}
+				}
+			} else if (pe_state == 2 && adc_ok && vbus2_mv < 3000) {
+				pe_state = 0;           /* unplugged at high voltage: ready to ask again */
+				pe_stable = 0;
+			}
 		}
 
 		car_ok = rosemary_fg_car(&car);
@@ -1245,8 +1102,7 @@ redwood_battery_init(void)
 		(void)PE_parse_boot_argn("chg_aicr", &chg_aicr_ma, sizeof(chg_aicr_ma));
 		(void)PE_parse_boot_argn("chg_ichg", &chg_ichg_ma, sizeof(chg_ichg_ma));
 		(void)PE_parse_boot_argn("chg_cv", &chg_cv_mv, sizeof(chg_cv_mv));
-		(void)PE_parse_boot_argn("pd_probe", &pd_probe, sizeof(pd_probe));
-	(void)PE_parse_boot_argn("pd_listen", &pd_listen, sizeof(pd_listen));
+		(void)PE_parse_boot_argn("pe_vbus", &pe_vbus_mv, sizeof(pe_vbus_mv));
 		if (kernel_thread_start(rosemary_battery_thread, NULL, &thread) == KERN_SUCCESS) {
 			thread_deallocate(thread);
 			printf("battery: this phone's own, read every 5 seconds\n");
