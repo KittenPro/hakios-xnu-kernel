@@ -205,9 +205,10 @@ battery_thread(__unused void *parameter, __unused wait_result_t result)
  * the fuel gauge's own, the FGADC block below: the counter's coulombs from a voltage
  * anchor, the averaged current beside the voltage in the log. The charger's currents the
  * MT6360's registers set, when the boot-args chg_aicr and chg_ichg ask for them: the
- * input's limit and the battery's own current, conservative steps from half an ampere,
- * the battery's ceiling and every voltage left alone -- the fast charge through the
- * port's own negotiation is a story of its own.
+ * input's limit and the battery's own current, conservative steps from half an ampere.
+ * The one voltage ever written is the ceiling, and only when chg_cv asks for it -- the
+ * battery's own hundred percent where Android fills it to; the port's own negotiation
+ * is a story of its own.
  */
 #define RM_GPIO_PHYS        0x10005000
 #define RM_DIR_AT(pin)      (0x0000 + 0x10 * ((pin) / 32))
@@ -254,7 +255,7 @@ battery_thread(__unused void *parameter, __unused wait_result_t result)
 #define MT6360_CHG_STAT1    0xe0            /* bit 7: the port's power good */
 #define MT6360_CHG_CTRL2    0x12            /* bit 0 the charger's own switch; bits 3:2 where the input's limit comes from, 2 the AICR register */
 #define MT6360_CHG_CTRL3    0x13            /* bits 7:2 the input's limit: 100 mA and 50 mA a step to 3250; bit 0 the limit applied */
-#define MT6360_CHG_CTRL4    0x14            /* bits 7:1 the battery's ceiling: 3900 mV and 10 mV a step -- read, never written here */
+#define MT6360_CHG_CTRL4    0x14            /* bits 7:1 the battery's ceiling: 3900 mV and 10 mV a step -- written only by the boot-arg chg_cv, to the battery's own hundred percent */
 #define MT6360_CHG_CTRL6    0x16            /* bits 7:1 the port's droop floor: 3900 mV and 100 mV a step, the input's own guard */
 #define MT6360_CHG_CTRL7    0x17            /* bits 7:2 the battery's current: 100 mA and 100 mA a step to 5 A */
 #define MT6360_CHG_CTRL13   0x1d            /* bit 7 the charger's watchdog, nobody here to pet it -- said in the log */
@@ -276,11 +277,13 @@ battery_thread(__unused void *parameter, __unused wait_result_t result)
 #define MT6360_ADC_IBAT     6               /* the battery's, at the charger's own pin */
 #define MT6360_ADC_TEMP_JC  8               /* the charger's own junction, in centigrade */
 
-/* boot-args chg_aicr / chg_ichg, in milliamperes: the currents the charger is given when the
- * battery is asked to actually fill, 0 to leave whatever the bootloader left. The ceiling
- * (CTRL4) and the port's voltage are never written here; the port's own droop floor (CTRL6)
- * stays as found too. A fifth of what the battery could take is where these start. */
-static int chg_aicr_ma, chg_ichg_ma;
+/* boot-args chg_aicr / chg_ichg / chg_cv, in milliamperes and millivolts: the currents the
+ * charger is given when the battery is asked to actually fill, and the ceiling it fills to
+ * -- 0 leaves whatever the bootloader left. The ceiling (CTRL4) is the one voltage ever
+ * written here, and only for the battery's own good: the phone's curve tops at 4412 mV and
+ * Android itself charges to 4420, where the bootloader's 4350 stops the fill at ninety-four
+ * percent. The port's droop floor (CTRL6) and every other voltage stay as found. */
+static int chg_aicr_ma, chg_ichg_ma, chg_cv_mv;
 
 static vm_offset_t rm_gpio;
 static bool rm_pushpull;                    /* i2c5's ones driven instead of only released */
@@ -756,7 +759,7 @@ rosemary_battery_thread(__unused void *parameter, __unused wait_result_t result)
 		/* the currents, if asked for: the input's limit turned to the AICR register first
 		 * (the source the bootloader left may not honor it), the input brought up from
 		 * 500 mA the way the vendor's probe settles it, then the battery's own current */
-		if (chg_aicr_ma > 0 || chg_ichg_ma > 0) {
+		if (chg_aicr_ma > 0 || chg_ichg_ma > 0 || chg_cv_mv > 0) {
 			int aicr = chg_aicr_ma;
 
 			if (aicr <= 0) {
@@ -775,15 +778,23 @@ rosemary_battery_thread(__unused void *parameter, __unused wait_result_t result)
 
 				(void)mt6360_update(MT6360_CHG_CTRL7, 0xfc, (uint8_t)((ichg - 100) / 100) << 2);
 			}
+			if (chg_cv_mv > 0) {
+				int cv = chg_cv_mv < 3900 ? 3900 : chg_cv_mv > 4710 ? 4710 : chg_cv_mv;
+
+				(void)mt6360_update(MT6360_CHG_CTRL4, 0xfe, (uint8_t)((cv - 3900) / 10) << 1);
+			}
 			(void)mt6360_read(MT6360_CHG_CTRL2, &ctrl2);
 			(void)mt6360_read(MT6360_CHG_CTRL3, &ctrl3);
+			(void)mt6360_read(MT6360_CHG_CTRL4, &ctrl4);
 			(void)mt6360_read(MT6360_CHG_CTRL7, &ctrl7);
 			printf("battery: the MT6360 set: charge %s, the limit's source %u, the input %u mA, "
-			    "the battery %u mA\n", ctrl2 & 1 ? "on" : "off", (ctrl2 >> 2) & 3,
-			    100 + ((ctrl3 >> 2) & 0x3f) * 50, 100 + ((ctrl7 >> 2) & 0x3f) * 100);
+			    "the battery %u mA, the ceiling %u mV\n", ctrl2 & 1 ? "on" : "off", (ctrl2 >> 2) & 3,
+			    100 + ((ctrl3 >> 2) & 0x3f) * 50, 100 + ((ctrl7 >> 2) & 0x3f) * 100,
+			    3900 + ((ctrl4 >> 1) & 0x7f) * 10);
 			redwood_host_keep_add("battery: the MT6360 set: charge %s, the limit's source %u, "
-			    "the input %u mA, the battery %u mA", ctrl2 & 1 ? "on" : "off", (ctrl2 >> 2) & 3,
-			    100 + ((ctrl3 >> 2) & 0x3f) * 50, 100 + ((ctrl7 >> 2) & 0x3f) * 100);
+			    "the input %u mA, the battery %u mA, the ceiling %u mV", ctrl2 & 1 ? "on" : "off",
+			    (ctrl2 >> 2) & 3, 100 + ((ctrl3 >> 2) & 0x3f) * 50, 100 + ((ctrl7 >> 2) & 0x3f) * 100,
+			    3900 + ((ctrl4 >> 1) & 0x7f) * 10);
 		}
 	}
 
@@ -926,6 +937,7 @@ redwood_battery_init(void)
 		/* the Redmi Note 10S's own: the PMIC's AUXADC and the charger companion, above */
 		(void)PE_parse_boot_argn("chg_aicr", &chg_aicr_ma, sizeof(chg_aicr_ma));
 		(void)PE_parse_boot_argn("chg_ichg", &chg_ichg_ma, sizeof(chg_ichg_ma));
+		(void)PE_parse_boot_argn("chg_cv", &chg_cv_mv, sizeof(chg_cv_mv));
 		if (kernel_thread_start(rosemary_battery_thread, NULL, &thread) == KERN_SUCCESS) {
 			thread_deallocate(thread);
 			printf("battery: this phone's own, read every 5 seconds\n");
