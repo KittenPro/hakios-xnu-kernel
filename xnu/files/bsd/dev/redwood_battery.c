@@ -199,8 +199,9 @@ battery_thread(__unused void *parameter, __unused wait_result_t result)
  * charge curve is the phone's own, battery0_profile_t0 of bat_setting/
  * mt6785_battery_table.dtsi: a hundred rows a percent apart, 4412 mV at full down to
  * 2857 mV, its middle column in tenth-millivolts read here in millivolts. The battery's
- * temperature the NTC curve would ask for is not brought yet -- the thermistor's
- * millivolts are in the log, and 25 C is said meanwhile. The percent and the current are
+ * temperature is the thermistor's millivolts through the mt6785 platform's own 100K NTC
+ * table (mtk_battery_table.h), and the charger's its ADC's junction reading -- both in
+ * the log now, in degrees. The percent and the current are
  * the fuel gauge's own, the FGADC block below: the counter's coulombs from a voltage
  * anchor, the averaged current beside the voltage in the log. The charger's currents the
  * MT6360's registers set, when the boot-args chg_aicr and chg_ichg ask for them: the
@@ -257,6 +258,23 @@ battery_thread(__unused void *parameter, __unused wait_result_t result)
 #define MT6360_CHG_CTRL6    0x16            /* bits 7:1 the port's droop floor: 3900 mV and 100 mV a step, the input's own guard */
 #define MT6360_CHG_CTRL7    0x17            /* bits 7:2 the battery's current: 100 mA and 100 mA a step to 5 A */
 #define MT6360_CHG_CTRL13   0x1d            /* bit 7 the charger's watchdog, nobody here to pet it -- said in the log */
+
+/* The MT6360's own ADC (mt6360_pmu_adc.c, the same i2c address as the charger): the channel
+ * asked of RPT_1's bits 7:4, the ADC's switch and the channel's bit written to CONFIG, the
+ * report the three bytes at RPT_1..3 once its low nibble names the channel asked of it, the
+ * conversion done in well under a tenth of a second. Teardown is the driver's: no channel
+ * left asked for, the ADC itself left on. The channels, and what a count of each is worth:
+ * the port's voltage a fifth of it, 6.25 mV a count; the battery's 1.25 mV; the port's
+ * current 1.9 mA a count under a 400 mA input's limit and 2.5 mA above it; the battery's
+ * current 2.5 mA a count, its sign the top bit (an assumption this log will check against
+ * the gauge's own current); the charger's junction (counts*105-8000)/100 centigrade. */
+#define MT6360_ADC_CONFIG   0x56            /* bit 7 the ADC's switch; channels 8 to 15 a bit each below */
+#define MT6360_ADC_RPT1     0x5a            /* the wanted channel in bits 7:4, the reported one in bits 3:0 */
+#define MT6360_ADC_VBUSDIV5 1               /* the port's voltage, a fifth of it */
+#define MT6360_ADC_VBAT     4               /* the battery's, at the charger's own pin */
+#define MT6360_ADC_IBUS     5               /* the port's current */
+#define MT6360_ADC_IBAT     6               /* the battery's, at the charger's own pin */
+#define MT6360_ADC_TEMP_JC  8               /* the charger's own junction, in centigrade */
 
 /* boot-args chg_aicr / chg_ichg, in milliamperes: the currents the charger is given when the
  * battery is asked to actually fill, 0 to leave whatever the bootloader left. The ceiling
@@ -396,6 +414,36 @@ rosemary_fg_iavg(int64_t *ua)
 
 	*ua = signed_raw * 305176 / 1000;
 	return true;
+}
+
+/* The battery's thermistor: a 100K NTC pulled up by 100K from 2800 mV, the mt6785's own
+ * platform table (mtk_battery_table.h, BAT_NTC_100: "we use 100K Rp and 100K NTC"; the
+ * resistance from the millivolts the way battery_meter.c has it, R = V * Rpu / (2800 - V)).
+ * The rows are the resistance in kilo-ohms every five degrees, -40 to 70 C -- the phone's
+ * own dts may lay a different table over the driver's, but the evening's readings (1331 mV
+ * after a day of runs) land where a warm room should. */
+static const uint16_t rosemary_ntc_kohm[23] = {
+	4251, 3005, 2149, 1554, 1135, 838, 624, 469, 356, 272, 209, 163,
+	127, 100, 79, 63, 51, 41, 33, 27, 22, 18, 15,
+};
+
+static int
+rosemary_ntc_c(int ntc_mv)
+{
+	int r;
+
+	if (ntc_mv <= 0 || ntc_mv >= 2800) {
+		return -273;
+	}
+	r = ntc_mv * 100 / (2800 - ntc_mv);      /* kilo-ohms */
+	for (int i = 1; i < 23; i++) {
+		if (r >= rosemary_ntc_kohm[i]) {
+			int r1 = rosemary_ntc_kohm[i - 1], r2 = rosemary_ntc_kohm[i];
+
+			return -40 + 5 * (i - 1) + (r1 - r) * 5 / (r1 - r2);
+		}
+	}
+	return 70;
 }
 
 /* ---- i2c5 by hand, for the MT6360: the touch's own copy of this is busy on i2c0 -------------------- */
@@ -582,6 +630,45 @@ mt6360_update(uint8_t reg, uint8_t mask, uint8_t value)
 	return mt6360_write(reg, (uint8_t)((v & ~mask) | (value & mask)));
 }
 
+/* One channel of the charger's own ADC, the mt6360_pmu_adc.c way without its interrupt:
+ * the channel asked of the report's selector, the ADC and the channel switched on, the
+ * report watched until its low nibble names the channel (the cycle never asks twice in a
+ * row, so the name means fresh), and the teardown the driver leaves behind. */
+static bool
+mt6360_adc(uint8_t channel, int32_t *raw)
+{
+	uint8_t cfg_hi = 0x80, cfg_lo = 0, rpt0 = 0, hi = 0, lo = 0;
+	bool done = false;
+
+	if (channel >= 8) {
+		cfg_hi |= (uint8_t)(1u << (channel - 8));
+	} else {
+		cfg_lo = (uint8_t)(1u << channel);
+	}
+	if (!mt6360_update(MT6360_ADC_RPT1, 0xf0, channel << 4) ||
+	    !mt6360_write(MT6360_ADC_CONFIG, cfg_hi) || !mt6360_write(MT6360_ADC_CONFIG + 1, cfg_lo)) {
+		return false;
+	}
+	delay_for_interval(25, NSEC_PER_MSEC);   /* the conversion's own time */
+	for (uint32_t spin = 0; spin < 15; spin++) {
+		if (!mt6360_read(MT6360_ADC_RPT1, &rpt0)) {
+			break;
+		}
+		if ((rpt0 & 0x0f) == channel) {
+			done = true;
+			break;
+		}
+		delay_for_interval(10, NSEC_PER_MSEC);
+	}
+	if (done && mt6360_read(MT6360_ADC_RPT1 + 1, &hi) && mt6360_read(MT6360_ADC_RPT1 + 2, &lo)) {
+		*raw = (int32_t)((hi << 8) | lo);
+	}
+	(void)mt6360_write(MT6360_ADC_CONFIG, 0x80);         /* no channel asked for; the ADC left on */
+	(void)mt6360_write(MT6360_ADC_CONFIG + 1, 0);
+	(void)mt6360_update(MT6360_ADC_RPT1, 0xf0, 0xf0);
+	return done;
+}
+
 static void
 rosemary_battery_thread(__unused void *parameter, __unused wait_result_t result)
 {
@@ -596,7 +683,7 @@ rosemary_battery_thread(__unused void *parameter, __unused wait_result_t result)
 	memset(&state, 0, sizeof(state));
 	state.size = (int32_t)sizeof(state);
 	state.present = 1;
-	state.temperature_hundredths = 2500;       /* the NTC curve is not here yet */
+	state.temperature_hundredths = 2500;       /* until the first thermistor reading */
 
 	/* the touch's init has the PMIC's bus for its supply; give it a moment to let go */
 	delay_for_interval(10, NSEC_PER_SEC);
@@ -701,16 +788,15 @@ rosemary_battery_thread(__unused void *parameter, __unused wait_result_t result)
 	}
 
 	for (unsigned tick = 0;; tick++) {
-		uint32_t batadc = 0, isense = 0, vcdt = 0, ntc = 0, chrdet = 0;
+		uint32_t batadc = 0, vcdt = 0, ntc = 0, chrdet = 0;
 		uint8_t stat = 0, stat1 = 0;
 		int chgstat = -1, pwr_rdy = 0, charger, status, soc, ma, ocv;
 		uint32_t vbat, vbus;
 		int64_t car = 0, ua = 0;
 		bool car_ok, by_coulombs = false;
 
-		if (!rosemary_auxadc(0, 0x7fff, &batadc) || !rosemary_auxadc(1, 0x7fff, &isense) ||
-		    !rosemary_auxadc(2, 0x0fff, &vcdt) || !rosemary_auxadc(3, 0x0fff, &ntc) ||
-		    !redwood_pmic_read(MT6359P_CHR_CON0, &chrdet)) {
+		if (!rosemary_auxadc(0, 0x7fff, &batadc) || !rosemary_auxadc(2, 0x0fff, &vcdt) ||
+		    !rosemary_auxadc(3, 0x0fff, &ntc) || !redwood_pmic_read(MT6359P_CHR_CON0, &chrdet)) {
 			failed++;
 			delay_for_interval(5000, NSEC_PER_MSEC);
 			continue;
@@ -722,6 +808,25 @@ rosemary_battery_thread(__unused void *parameter, __unused wait_result_t result)
 		battery_vbus_mv = (int)vbus;
 		battery_vcdt_raw = (int)vcdt;
 		battery_ntc_mv = (int)(ntc * 4500u >> 12);    /* <5 2> over 12 bits */
+
+		/* the charger's own ADC: the port's voltage and current, the battery's at its pin,
+		 * and the two temperatures -- the readings the fast charge will be watched with */
+		int32_t adc_vbus = 0, adc_ibus = 0, adc_ibat = 0, adc_vbat = 0, adc_jc = 0;
+		bool adc_ok = mt6360 && mt6360_adc(MT6360_ADC_VBUSDIV5, &adc_vbus) &&
+		    mt6360_adc(MT6360_ADC_IBUS, &adc_ibus) && mt6360_adc(MT6360_ADC_IBAT, &adc_ibat) &&
+		    mt6360_adc(MT6360_ADC_VBAT, &adc_vbat) && mt6360_adc(MT6360_ADC_TEMP_JC, &adc_jc);
+		int vbus2_mv = adc_ok ? (int)(adc_vbus * 6250u / 1000) : 0;
+		int vbat2_mv = adc_ok ? (int)(adc_vbat * 1250u / 1000) : 0;
+		int ibat2_ma = adc_ok ? (int)(((adc_ibat ^ 0x8000u) - 0x8000) * 5 / 2) : 0;  /* signed counts, 2.5 mA each */
+		int jc_c = adc_ok ? (int)(adc_jc * 105 - 8000) / 100 : 0;
+		int ibus2_ma = 0;
+
+		if (adc_ok) {
+			uint8_t ctrl3 = 0;
+
+			(void)mt6360_read(MT6360_CHG_CTRL3, &ctrl3);
+			ibus2_ma = (int)adc_ibus * (((ctrl3 >> 2) & 0x3f) < 6 ? 19 : 25) / 10;
+		}
 
 		car_ok = rosemary_fg_car(&car);
 		(void)rosemary_fg_iavg(&ua);
@@ -786,6 +891,7 @@ rosemary_battery_thread(__unused void *parameter, __unused wait_result_t result)
 		state.percent_hundredths = soc;
 		state.voltage_uv = (int32_t)(vbat * 1000);
 		state.current_ua = (int32_t)ua;
+		state.temperature_hundredths = (int32_t)rosemary_ntc_c(battery_ntc_mv) * 100;
 		state.present = vbat >= 2500 && vbat <= 5500;
 		state.external = charger;
 		state.status = status;
@@ -795,11 +901,12 @@ rosemary_battery_thread(__unused void *parameter, __unused wait_result_t result)
 		battery_source_dsp = 2;                  /* not the DSP: this driver's own reading */
 
 		if (tick % 12 == 0) {
-			printf("battery: SOC=%d.%02d%% by %s, V=%u mV, I=%d mA, CAR=%lld, port=%u mV (vcdt %u), "
-			    "NTC=%d mV, isense %u, charger=%d (chrdet %u, pwr_rdy %d, chgstat %d), "
-			    "%llu reads, %llu failed\n",
+			printf("battery: SOC=%d.%02d%% by %s, V=%u mV, I=%d mA, CAR=%lld, T=%d C, jc=%d C, "
+			    "port=%d mV (ibus %d mA), MT6360: VBAT %d mV, IBAT %d mA, %s, charger=%d "
+			    "(chrdet %u, pwr_rdy %d, chgstat %d), %llu reads, %llu failed\n",
 			    soc / 100, soc % 100, by_coulombs ? "coulombs" : "voltage", vbat, ma,
-			    (long long)car, vbus, vcdt, battery_ntc_mv, isense, charger,
+			    (long long)car, rosemary_ntc_c(battery_ntc_mv), jc_c, vbus2_mv, ibus2_ma,
+			    vbat2_mv, ibat2_ma, adc_ok ? "adc ok" : "no adc", charger,
 			    chrdet & 1, pwr_rdy, chgstat, reads, failed);
 		}
 		delay_for_interval(5000, NSEC_PER_MSEC);
