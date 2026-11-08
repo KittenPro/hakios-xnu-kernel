@@ -1,0 +1,7 @@
+# Commands run by the launchd job com.redwood.demo (see com.redwood.demo.plist).
+# The phone's own battery (RC_JOBS=rc.jobs.batt23, with the kernel's battery=3): what the
+# kernel's power source and powerd have made of it, every 15 seconds, each line kept for the
+# dump (kern.redwood.say's "!") -- the kernel prints its own AUXADC line every minute besides.
+# While this runs the user plugs a charger in and pulls it out again: the percent, the
+# charger bit and the port's VCDT word move with the cable.
+/redwood/bin/battery_test 16 15

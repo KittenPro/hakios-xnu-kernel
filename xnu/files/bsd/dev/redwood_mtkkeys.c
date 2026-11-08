@@ -17,6 +17,7 @@
  * Boot-arg keylog=1: a line for every change, to check the wiring against.
  */
 #include <kern/clock.h>
+#include <kern/locks.h>
 #include <kern/thread.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
@@ -93,6 +94,36 @@ pmic_write(uint32_t reg, uint32_t value)
 }
 
 /*
+ * The wrapper's channel is one at a time: the buttons' thread asks it every 20 ms and the
+ * battery's (redwood_battery.c, battery=3) whenever it samples, so every PMIC access goes
+ * through this lock. The pair below is what other files borrow.
+ */
+static LCK_GRP_DECLARE(pwrap_group, "redwood-pwrap");
+static LCK_MTX_DECLARE(pwrap_lock, &pwrap_group);
+
+bool
+redwood_pmic_read(uint32_t reg, uint32_t *value)
+{
+	bool ok;
+
+	lck_mtx_lock(&pwrap_lock);
+	ok = pmic_read(reg, value);
+	lck_mtx_unlock(&pwrap_lock);
+	return ok;
+}
+
+bool
+redwood_pmic_write(uint32_t reg, uint32_t value)
+{
+	bool ok;
+
+	lck_mtx_lock(&pwrap_lock);
+	ok = pmic_write(reg, value);
+	lck_mtx_unlock(&pwrap_lock);
+	return ok;
+}
+
+/*
  * The processors' clock (boot-arg mtk_cpufreq=1: what it is, said; mtk_cpufreq=2: raised -- not cpufreq=, which is the POCO's (redwood_cpufreq.c) and writes where this SoC has nothing of the kind). The boot loader
  * leaves both clusters at 1175 MHz and 0.8 V, and nothing under this kernel changes that: iOS ran
  * at some 60 in 100 of what the phone can do (MiniIOMobileFramebuffer's measurement, 24 October).
@@ -140,8 +171,8 @@ cluster_raise(vm_offset_t apmixed, const char *name, uint32_t con1_at, uint32_t 
 {
 	uint32_t con1 = rd(apmixed, con1_at), vproc = 0, vsram = 0, tracking = 0, elr_was = 0;
 
-	if (!pmic_read(dbg, &vproc) || !pmic_read(vsram_dbg, &vsram) || !pmic_read(track, &tracking) ||
-	    !pmic_read(elr, &elr_was)) {
+	if (!redwood_pmic_read(dbg, &vproc) || !redwood_pmic_read(vsram_dbg, &vsram) || !redwood_pmic_read(track, &tracking) ||
+	    !redwood_pmic_read(elr, &elr_was)) {
 		redwood_keep("cpufreq: %s: the PMIC does not answer; left as it is", name);
 		return false;
 	}
@@ -162,17 +193,17 @@ cluster_raise(vm_offset_t apmixed, const char *name, uint32_t con1_at, uint32_t 
 	if (!(tracking & 1)) {
 		uint32_t con = 0;
 
-		if (!pmic_read(vsram_con, &con) || !pmic_write(vsram_con, (con & ~0x7fu) | want_sram)) {
+		if (!redwood_pmic_read(vsram_con, &con) || !redwood_pmic_write(vsram_con, (con & ~0x7fu) | want_sram)) {
 			redwood_keep("cpufreq: %s: VSRAM could not be raised; left as it is", name);
 			return false;
 		}
 	}
-	if (!pmic_write(elr, (elr_was & ~0x7fu) | step)) {
+	if (!redwood_pmic_write(elr, (elr_was & ~0x7fu) | step)) {
 		redwood_keep("cpufreq: %s: Vproc could not be raised; left as it is", name);
 		return false;
 	}
 	delay(1000);    /* 10 mV a microsecond up, and the PMIC's own delay: far more than enough */
-	if (!pmic_read(dbg, &vproc) || (vproc & 0x7f) != step) {
+	if (!redwood_pmic_read(dbg, &vproc) || (vproc & 0x7f) != step) {
 		redwood_keep("cpufreq: %s: Vproc reads step %u, not %u; the clock left as it is", name, vproc & 0x7f, step);
 		return false;
 	}
@@ -184,7 +215,7 @@ cluster_raise(vm_offset_t apmixed, const char *name, uint32_t con1_at, uint32_t 
 	wr(apmixed, con1_at, (rd(apmixed, con1_at) & ~(7u << 24)) | posdiv_sel << 24);
 	delay(1);
 	con1 = rd(apmixed, con1_at);
-	(void)pmic_read(vsram_dbg, &vsram);
+	(void)redwood_pmic_read(vsram_dbg, &vsram);
 	redwood_keep("cpufreq: %s now at %u MHz (CON1 %#x), Vproc step %u, VSRAM step %u", name, pll_mhz(con1), con1,
 	    step, vsram >> 8 & 0x7f);
 	return true;
@@ -218,8 +249,8 @@ gpu_raise(uint32_t mhz)
 	for (unsigned i = 0; i < 600 && !redwood_mali_ready(); i++) {
 		delay(100000);                  /* the GPU brought up first (redwood_mali.c) */
 	}
-	if (!pmic_read(MT6358_VGPU_DBG0, &vgpu) || !pmic_read(MT6358_VSRAM_GPU_DBG0, &vsram) ||
-	    !pmic_read(MT6358_VGPU_ELR0, &elr) || !pmic_read(MT6358_VSRAM_CON3, &con)) {
+	if (!redwood_pmic_read(MT6358_VGPU_DBG0, &vgpu) || !redwood_pmic_read(MT6358_VSRAM_GPU_DBG0, &vsram) ||
+	    !redwood_pmic_read(MT6358_VGPU_ELR0, &elr) || !redwood_pmic_read(MT6358_VSRAM_CON3, &con)) {
 		redwood_keep("gpufreq: the PMIC does not answer; left as it is");
 		return;
 	}
@@ -241,12 +272,12 @@ gpu_raise(uint32_t mhz)
 	if (want_sram < 56) {
 		want_sram = 56;                 /* 0.85 V at least, MediaTek's floor */
 	}
-	if (!pmic_write(MT6358_VSRAM_CON3, (con & ~0x7fu) | want_sram) || !pmic_write(MT6358_VGPU_ELR0, (elr & ~0x7fu) | want)) {
+	if (!redwood_pmic_write(MT6358_VSRAM_CON3, (con & ~0x7fu) | want_sram) || !redwood_pmic_write(MT6358_VGPU_ELR0, (elr & ~0x7fu) | want)) {
 		redwood_keep("gpufreq: the voltages could not be set; left as it is");
 		return;
 	}
 	delay(1000);
-	(void)pmic_read(MT6358_VGPU_DBG0, &vgpu);
+	(void)redwood_pmic_read(MT6358_VGPU_DBG0, &vgpu);
 	if ((vgpu & 0x7f) != want) {
 		redwood_keep("gpufreq: VGPU reads step %u, not %u; the clock left as it is", vgpu & 0x7f, want);
 		return;
@@ -268,7 +299,7 @@ gpu_raise(uint32_t mhz)
 	wr(topckgen, CLK_CFG_1 + 8, 3u);        /* CLR the mux field */
 	wr(topckgen, CLK_CFG_1 + 4, 1u);        /* SET: GPUPLL */
 	wr(topckgen, 0x004, 1u << 4);           /* CLK_CFG_UPDATE: mfg_sel's bit (clk-mt6768.c) */
-	(void)pmic_read(MT6358_VSRAM_GPU_DBG0, &vsram);
+	(void)redwood_pmic_read(MT6358_VSRAM_GPU_DBG0, &vsram);
 	redwood_keep("gpufreq: the GPU at %u MHz (CON1 %#x, mux %u), VGPU step %u, VSRAM_GPU step %u", mhz,
 	    rd(apmixed, GPUPLL_CON1), rd(topckgen, CLK_CFG_1) & 3, want, vsram >> 8 & 0x7f);
 }
@@ -323,7 +354,7 @@ keys_thread(__unused void *parameter, __unused wait_result_t result)
 		uint32_t mem = rd(kpd, KP_MEM1), top = PWRKEY_DEB;
 		bool now[3];
 
-		(void)pmic_read(MT6358_TOPSTATUS, &top);
+		(void)redwood_pmic_read(MT6358_TOPSTATUS, &top);
 		now[0] = !(mem & (1u << 0));
 		now[1] = !(mem & (1u << 1));
 		now[2] = !(top & PWRKEY_DEB);
@@ -397,7 +428,7 @@ rosemary_keys_thread(__unused void *parameter, __unused wait_result_t result)
 		    mem3 = rd(kpd, KP_MEM3) & 0xffffu, top = 0;
 		bool now[3];
 
-		(void)pmic_read(MT6359P_TOPSTATUS, &top);
+		(void)redwood_pmic_read(MT6359P_TOPSTATUS, &top);
 		if (log && (mem1 != was1 || mem2 != was2 || mem3 != was3 || top != wastop)) {
 			printf("mtkkeys: raw mem1 %#x, mem2 %#x, mem3 %#x, PMIC %#x\n", mem1, mem2, mem3, top);
 		}
@@ -433,6 +464,11 @@ redwood_mtkkeys_init(void)
 {
 	uint32_t which = 0;
 	thread_t thread;
+
+	/* The PMIC wrapper is everyone's door to the MT6359P (the battery's AUXADC samples go
+	 * through it too, redwood_battery.c's battery=3), so it is mapped here whether this
+	 * phone's buttons are ours to read or not. */
+	pwrap = ml_io_map(PWRAP_PHYS, 0x1000);
 
 	/* 2 is the Infinix's, 3 is the Redmi Note 10S's; 1 is in redwood_buttons.c. */
 	if (!PE_parse_boot_argn("buttons", &which, sizeof(which)) || (which != 2 && which != 3)) {

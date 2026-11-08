@@ -49,8 +49,11 @@ void redwood_buttons_init(void);        /* boot-arg buttons=1: the phone's power
 void redwood_ufs_init(void);           /* ufs=2 to xnuloader: the phone's storage, read only, through the loader (ufs_shared_pa=) */
 void redwood_ufs_report(const char *when); /* where reading the storage has spent its time so far */
 bool redwood_ufs_dev(dev_t dev);           /* one of the storage's devices */
-void redwood_battery_init(void);        /* boot-arg battery=1: Qualcomm UEFI charger state shared by xnuloader */
+void redwood_battery_init(void);        /* boot-arg battery=1: Qualcomm UEFI charger state; battery=3: the Redmi Note 10S's own */
 int redwood_battery_temperature(void);  /* the battery's temperature in C, -273 while it is not known */
+/* the MT6359P's PMIC wrapper, mapped in redwood_mtkkeys.c whatever reads it; the pair is locked */
+bool redwood_pmic_read(uint32_t reg, uint32_t *value);    /* a 16-bit register by its byte address */
+bool redwood_pmic_write(uint32_t reg, uint32_t value);
 /* one transfer at a time through the PMIC arbiter for this system (bsd/dev/redwood_buttons.c) */
 void redwood_spmi_lock(void);
 void redwood_spmi_unlock(void);

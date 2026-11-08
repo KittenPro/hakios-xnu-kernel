@@ -100,6 +100,18 @@ kernel(const char *name)
 	return value;
 }
 
+/* A line worth keeping: also said to the kernel's kept buffer (kern.redwood.say, the "!" the
+ * demo jobs' lines go with), for the ring throws the middle of a run away -- what was kept
+ * is reprinted at the end instead. */
+static void
+kept_line(const char *line)
+{
+	char kept[640];
+
+	snprintf(kept, sizeof(kept), "!%s", line);
+	sysctlbyname("kern.redwood.say", NULL, NULL, kept, strlen(kept));
+}
+
 static void
 once(void)
 {
@@ -110,12 +122,20 @@ once(void)
 	int percent = -1;
 	bool charging = false, full = false;
 	int got = IOPSGetPercentRemaining(&percent, &charging, &full);
+	char line[640];
 
-	printf("battery_test: the kernel says %d%%, %d mV, %d mA, %d C, battery %d, charger %d, charging %d, from the DSP %d\n",
+	snprintf(line, sizeof(line), "battery_test: the kernel says %d%%, %d mV, %d mA, %d C, battery %d, charger %d, charging %d, from the DSP %d",
 	    kernel("kern.redwood.battery_soc"), kernel("kern.redwood.battery_voltage_mv"), kernel("kern.redwood.battery_current_ma"),
 	    kernel("kern.redwood.battery_temperature_c"), kernel("kern.redwood.battery_present"),
 	    kernel("kern.redwood.battery_charger_present"), kernel("kern.redwood.battery_charging"),
 	    kernel("kern.redwood.battery_from_dsp"));
+	printf("%s\n", line);
+	kept_line(line);
+	snprintf(line, sizeof(line), "battery_test: the port: vbus %d mV (vcdt raw %d), NTC %d mV",
+	    kernel("kern.redwood.battery_vbus_mv"), kernel("kern.redwood.battery_vcdt_raw"),
+	    kernel("kern.redwood.battery_ntc_mv"));
+	printf("%s\n", line);
+	kept_line(line);
 	if (service != 0) {
 		CFMutableDictionaryRef properties = NULL;
 		io_name_t name = "";
@@ -130,8 +150,10 @@ once(void)
 	} else {
 		printf("battery_test: there is no IOPMPowerSource in the kernel\n");
 	}
-	printf("battery_test: IOPSGetPercentRemaining: %d (%#x), %d%%, charging %d, full %d; time remaining %.0f s\n", got, got,
-	    percent, charging, full, IOPSGetTimeRemainingEstimate());
+	snprintf(line, sizeof(line), "battery_test: IOPSGetPercentRemaining: %d (%#x), %d%%, charging %d, full %d; time remaining %.0f s",
+	    got, got, percent, charging, full, IOPSGetTimeRemainingEstimate());
+	printf("%s\n", line);
+	kept_line(line);
 	if (blob != NULL) {
 		show("battery_test: powered by", IOPSGetProvidingPowerSourceType(blob));
 	}
