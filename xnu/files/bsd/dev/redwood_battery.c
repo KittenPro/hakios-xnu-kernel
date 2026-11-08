@@ -305,8 +305,9 @@ battery_thread(__unused void *parameter, __unused wait_result_t result)
 #define TCPC_RX_BYTE_CNT    0x30            /* then the frame type, then the header's two */
 #define TCPC_RX_DATA        0x34            /* the objects, up to twenty-eight bytes */
 #define TCPC_MTK_MODE_CTRL3 0x90            /* the vendor's: the PD bias and the oscillator */
-#define TCPC_MTK_CLK_CTRL1  0x87
-#define TCPC_MTK_CLK_CTRL2  0x88
+#define TCPC_MTK_CLK_CTRL1  0x87            /* the PD clocks: un-gated 0xca (the vendor's own value) */
+#define TCPC_MTK_CLK_CTRL2  0x88            /* un-gated 0x54: the 24M and the protocol clocks */
+#define TCPC_RX_DETECT_ON   0x21            /* SOP messages and hard resets: a listening sink's ear */
 #define TCPC_ALERT_RX_STATUS (1u << 2)      /* a message waits in the FIFO */
 #define TCPC_ALERT_RX_OVERFLOW (1u << 10)   /* the FIFO overflowed; the oldest are lost */
 
@@ -319,8 +320,13 @@ battery_thread(__unused void *parameter, __unused wait_result_t result)
 static int chg_aicr_ma, chg_ichg_ma, chg_cv_mv;
 
 /* pd_probe: read-only eyes on the port's negotiator -- the identification and the status
- * registers once, then every message the brick sends, read and said and nothing more. */
-static int pd_probe;
+ * registers once, then every message the brick sends, read and said and nothing more.
+ * pd_listen, one step further: the receiver's switch on -- the vendor's own set_rx_enable
+ * sequence, the clocks un-gated then RX_DETECT set to SOP|HARD_RESET, its value for a
+ * listening sink. Nothing else changes: no message is ever sent, the hardware's own
+ * GoodCRC answers the brick (the TCPC's protocol layer does that alone), and without a
+ * Request from here the brick keeps VBUS at five volts. */
+static int pd_probe, pd_listen;
 static bool tcpc_ok;
 static unsigned tcpc_rx_seen;
 
@@ -993,8 +999,10 @@ rosemary_battery_thread(__unused void *parameter, __unused wait_result_t result)
 
 	/* the port's own negotiator, read-only eyes when pd_probe asks: who it is, and the
 	 * state the bootloader left it in -- the attachment, the receiver's switch, the PD
-	 * bias. Everything but the alert handshake is left exactly as found. */
-	if (pd_probe) {
+	 * bias. Everything but the alert handshake is left exactly as found. pd_listen goes
+	 * one step on: the receiver's switch turned to the vendor's listening value, so the
+	 * brick's own words land in the log; no word is ever sent back. */
+	if (pd_probe || pd_listen) {
 		uint16_t vid = 0, pid = 0, did = 0;
 
 		tcpc_ok = tcpc_read_word(TCPC_VID, &vid) && tcpc_read_word(TCPC_PID, &pid) &&
@@ -1029,6 +1037,17 @@ rosemary_battery_thread(__unused void *parameter, __unused wait_result_t result)
 			    (pstat >> 2) & 1, rxdet, mode3);
 			if (alert & TCPC_ALERT_RX_STATUS) {
 				tcpc_drain_rx();    /* whatever waited through the boot, said now */
+			}
+			if (pd_listen) {
+				/* the vendor's set_rx_enable: the clocks un-gated, then the ear on */
+				uint8_t rxdet = 0;
+
+				(void)rm_dev_write(TCPC_ADDR, TCPC_MTK_CLK_CTRL1, 0xca);
+				(void)rm_dev_write(TCPC_ADDR, TCPC_MTK_CLK_CTRL2, 0x54);
+				(void)rm_dev_write(TCPC_ADDR, TCPC_RX_DETECT, TCPC_RX_DETECT_ON);
+				(void)rm_dev_read(TCPC_ADDR, TCPC_RX_DETECT, &rxdet);
+				printf("battery: the TCPC's ear on (rx-detect now %#x); listening, never speaking\n", rxdet);
+				redwood_host_keep_add("battery: the TCPC's ear on (rx-detect %#x); listening, never speaking", rxdet);
 			}
 		}
 	}
@@ -1074,9 +1093,9 @@ rosemary_battery_thread(__unused void *parameter, __unused wait_result_t result)
 			ibus2_ma = (int)adc_ibus * (((ctrl3 >> 2) & 0x3f) < 6 ? 19 : 25) / 10;
 		}
 
-		/* the brick's own words, if it sends any while we watch (read-only: said and
-		 * handed back) */
-		if (pd_probe && tcpc_ok) {
+		/* the brick's own words, if it sends any while we watch (read and handed back;
+		 * with pd_listen the ear is on, so its offers land here) */
+		if ((pd_probe || pd_listen) && tcpc_ok) {
 			tcpc_drain_rx();
 		}
 
@@ -1180,6 +1199,7 @@ redwood_battery_init(void)
 		(void)PE_parse_boot_argn("chg_ichg", &chg_ichg_ma, sizeof(chg_ichg_ma));
 		(void)PE_parse_boot_argn("chg_cv", &chg_cv_mv, sizeof(chg_cv_mv));
 		(void)PE_parse_boot_argn("pd_probe", &pd_probe, sizeof(pd_probe));
+	(void)PE_parse_boot_argn("pd_listen", &pd_listen, sizeof(pd_listen));
 		if (kernel_thread_start(rosemary_battery_thread, NULL, &thread) == KERN_SUCCESS) {
 			thread_deallocate(thread);
 			printf("battery: this phone's own, read every 5 seconds\n");
