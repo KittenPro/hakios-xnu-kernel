@@ -30,25 +30,19 @@ jobs:
         run: |
           git clone --recursive https://github.com/theos/theos.git "$HOME/theos"
           mkdir -p "$HOME/theos/toolchain" "$HOME/theos/sdks"
-          # -f so an error body never reaches xz, a five-round loop for the asset CDN's off days
-          # (one morning it served half a file and an error page in two runs of the same step),
-          # xz -t before every tar. The tags are pinned: test-210562a is what releases/latest of
-          # that repo has pointed at all along -- a "test" tag its owner may move any day, and the
-          # newer main-* toolchains are different bytes than everything built here so far.
-          fetch() {
-            for i in 1 2 3 4 5; do
-              curl -fsSL --connect-timeout 30 --max-time 900 -o "$2" "$1" && return 0
-              sleep $((i * 10))
-            done
-            echo "could not fetch $1" >&2
-            return 1
-          }
-          fetch https://github.com/L1ghtmann/llvm-project/releases/download/test-210562a/iOSToolchain-x86_64.tar.xz /tmp/toolchain.tar.xz
-          xz -t /tmp/toolchain.tar.xz
-          tar -xJf /tmp/toolchain.tar.xz -C "$HOME/theos/toolchain/"
-          fetch https://github.com/theos/sdks/releases/download/master-146e41f/iPhoneOS16.5.sdk.tar.xz /tmp/sdk.tar.xz
-          xz -t /tmp/sdk.tar.xz
-          tar -xJf /tmp/sdk.tar.xz -C "$HOME/theos/sdks"
+          # The toolchain and the SDK travel in this fork's own ci-deps branch, git objects on
+          # github.com's own road: release-assets' CDN has been answering 504 to the runner for
+          # the toolchain's asset -- five rounds of curl retry and all -- while every clone of
+          # every run of this workflow has gone through. The tarballs are the pinned ones
+          # (L1ghtmann's test-210562a, what that repo's releases/latest has pointed at all
+          # along; theos/sdks' master-146e41f), checksummed here so the branch can't drift.
+          git clone --depth 1 --branch ci-deps \
+            "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" /tmp/ci-deps
+          (cd /tmp/ci-deps && sha256sum -c SHA256SUMS)
+          xz -t /tmp/ci-deps/iOSToolchain-x86_64.tar.xz
+          tar -xJf /tmp/ci-deps/iOSToolchain-x86_64.tar.xz -C "$HOME/theos/toolchain/"
+          xz -t /tmp/ci-deps/iPhoneOS16.5.sdk.tar.xz
+          tar -xJf /tmp/ci-deps/iPhoneOS16.5.sdk.tar.xz -C "$HOME/theos/sdks"
           test -x "$HOME/theos/toolchain/linux/iphone/bin/ld"
           test -d "$HOME/theos/sdks/iPhoneOS16.5.sdk/usr/include"
 
