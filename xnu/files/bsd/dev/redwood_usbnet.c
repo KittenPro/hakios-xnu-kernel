@@ -56,6 +56,11 @@ extern void delay_for_interval(uint32_t interval, uint32_t scale_factor);
 #define USB_IPPC_PHYS   0x11203E00u
 #define USB_SIF_PHYS    0x11E40000u
 #define INFRA_PHYS      0x10001000u
+#define TOPCLK_PHYS     0x10000000u     /* the top clocks: usb_top_sel, [9:8] of CK_CFG_8 */
+#define APMIXED_PHYS    0x1000C000u     /* the PLLs and the 26 MHz gates: SSUSB26M is bit 4 of +0x20 */
+#define REG_CKCFG8      0x0a0           /* usb_top_sel here: 0 clk26m / 1..3 univpll divisions, all alive */
+#define REG_APMIXED_CG  0x020           /* write-one-to-set, read for status */
+#define APMIXED_SSUSB26M (1u << 4)      /* the device's "ref_ck": 26 MHz for the SSUSB */
 
 /* the two SSUSB clock gates of INFRA2: set-only register, bit set = clock on (clk-mt6785.c) */
 #define INFRA2_CG_SET   0x0a4
@@ -71,6 +76,7 @@ extern void delay_for_interval(uint32_t interval, uint32_t scale_factor);
 #define PHY_DTM1        0x36c            /* RG_UART_EN 16, VBUSVALID 13, SESSEND 12, AVALID 10 */
 
 /* IPPC, the IP block's own power and reset */
+#define IPPC_PW_CTRL0   0x00             /* bit 0 SSUSB_IP_SW_RST: pulse to reset the whole IP */
 #define IPPC_PW_CTRL2   0x08             /* bit 0 DEV_PDN: clear to power on */
 #define IPPC_PW_STS1    0x10             /* bit 0x400: the 125M clock stable */
 #define IPPC_PW_STS2    0x14             /* bit 0x1 */
@@ -240,7 +246,7 @@ static const uint8_t notification_message[8] = { 0xa1, 0x01, 0, 0, 0, 0, 0, 0 };
 
 /* the state of it all */
 static uint32_t usb_step, usb_trace;
-static vm_offset_t usb_mac, usb_ippc, usb_sif, usb_infra;
+static vm_offset_t usb_mac, usb_ippc, usb_sif, usb_infra, usb_top, usb_apmixed;
 static bool usbnet_on;                   /* step 2 got as far as starting the thread */
 static bool usbnet_configured;           /* SET_CONFIG(1) done, the endpoints are the gadget's */
 static uint8_t usbnet_address_set;       /* the last SET_ADDRESS value */
@@ -342,6 +348,30 @@ static inline uint32_t
 sif_read(uint32_t offset)
 {
 	return *(volatile uint32_t *)(usb_sif + offset);
+}
+
+static inline uint32_t
+top_read(uint32_t offset)
+{
+	return *(volatile uint32_t *)(usb_top + offset);
+}
+
+static inline void
+top_write(uint32_t offset, uint32_t value)
+{
+	*(volatile uint32_t *)(usb_top + offset) = value;
+}
+
+static inline uint32_t
+apm_read(uint32_t offset)
+{
+	return *(volatile uint32_t *)(usb_apmixed + offset);
+}
+
+static inline void
+apm_write(uint32_t offset, uint32_t value)
+{
+	*(volatile uint32_t *)(usb_apmixed + offset) = value;
 }
 
 /* everything the DMA engine is to read must leave the cache first (redwood_ufshc.c's dance) */
@@ -1107,7 +1137,8 @@ usbnet_wait(uint32_t offset, uint32_t bit, const char *what)
 		}
 		delay_for_interval(10, NSEC_PER_USEC);
 	}
-	printf("usb: %s never came (IPPC %#x)\n", what, ippc_read(offset));
+	printf("usb: %s never came (STS1 %#x, STS2 %#x)\n", what,
+	    ippc_read(IPPC_PW_STS1), ippc_read(IPPC_PW_STS2));
 	return false;
 }
 
@@ -1133,14 +1164,30 @@ redwood_usbnet_init(void)
 	printf("usb: step %u: the phone's cable as the network link\n", usb_step);
 
 	usb_infra = ml_io_map(INFRA_PHYS, 0x1000);
+	usb_top = ml_io_map(TOPCLK_PHYS, 0x1000);
+	usb_apmixed = ml_io_map(APMIXED_PHYS, 0x1000);
 	usb_sif = ml_io_map(USB_SIF_PHYS, 0x1000);
 	usb_ippc = ml_io_map(USB_IPPC_PHYS, 0x100);
 	usb_mac = ml_io_map(USB_MAC_PHYS, USB_MAC_SIZE);
 
-	/* INFRA2's two gates (set-only registers; a set bit is a clock on) */
+	/* the clock chain as Linux's clock driver builds it (clk-mt6785.c): the INFRA2 gates, the
+	 * APMIXED 26 MHz reference the device's "ref_ck" is, and the usb_top_sel mux the sys clock
+	 * hangs from (read only: its parents, clk26m and univpll divisions, are all alive at boot).
+	 * What the boot loader left behind is said first: run 1's IPPC read zero with the gates
+	 * already open, and these are the three things between the gates and a living block. */
+	printf("usb: as the boot left it: CK_CFG_8 %#x, APMIXED %#x, IPPC %#x/%#x/%#x\n",
+	    top_read(REG_CKCFG8), apm_read(REG_APMIXED_CG),
+	    ippc_read(IPPC_PW_STS1), ippc_read(IPPC_PW_STS2), ippc_read(IPPC_U2_CTRL));
 	*(volatile uint32_t *)(usb_infra + INFRA2_CG_SET) = INFRA_USB | INFRA_SSUSB_XHCI;
+	apm_write(REG_APMIXED_CG, apm_read(REG_APMIXED_CG) | APMIXED_SSUSB26M);
 	delay_for_interval(250, NSEC_PER_USEC);
-	printf("usb: clocks on: INFRA2 says %#x\n", *(volatile uint32_t *)(usb_infra + INFRA2_CG_STA));
+	printf("usb: clocks on: INFRA2 %#x, APMIXED %#x\n",
+	    *(volatile uint32_t *)(usb_infra + INFRA2_CG_STA), apm_read(REG_APMIXED_CG));
+
+	/* the whole IP out of any reset the boot loader left it in (ssusb_ip_sw_reset) */
+	ippc_write(IPPC_PW_CTRL0, ippc_read(IPPC_PW_CTRL0) | 1u);
+	delay_for_interval(1, NSEC_PER_USEC);
+	ippc_write(IPPC_PW_CTRL0, ippc_read(IPPC_PW_CTRL0) & ~1u);
 
 	/* the PHY: its LDO on, then out of the UART mode the boot loader leaves it in */
 	sif_write(PHY_PHYA_REG1, sif_read(PHY_PHYA_REG1) | (1u << 29));
