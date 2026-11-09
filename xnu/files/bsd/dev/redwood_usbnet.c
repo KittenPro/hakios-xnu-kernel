@@ -1259,8 +1259,8 @@ usbnet_log_poll(void)
 		chunk = ahead > 1400 ? 1400 : ahead;
 		memcpy(frame, broadcast, 6);
 		memcpy(frame + 6, usbnet_link.address, 6);
-		frame[12] = 0xb5;                   /* 0x88b5, local experimental 1 */
-		frame[13] = 0x88;
+		frame[12] = 0x88;                   /* 0x88b5, local experimental 1: big-endian on the wire */
+		frame[13] = 0xb5;
 		for (uint32_t i = 0; i < chunk; i++) {
 			frame[14 + i] = mb->msg_bufc[(usbnet_log_cursor + i) % mb->msg_size];
 		}
