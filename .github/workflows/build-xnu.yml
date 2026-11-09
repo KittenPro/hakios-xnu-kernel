@@ -30,9 +30,10 @@ jobs:
         run: |
           git clone --recursive https://github.com/theos/theos.git "$HOME/theos"
           mkdir -p "$HOME/theos/toolchain" "$HOME/theos/sdks"
-          curl -sL https://github.com/L1ghtmann/llvm-project/releases/latest/download/iOSToolchain-x86_64.tar.xz \
+          curl -sL --retry 5 --retry-delay 10 --connect-timeout 30 --max-time 600 \
+            https://github.com/L1ghtmann/llvm-project/releases/latest/download/iOSToolchain-x86_64.tar.xz \
             | tar -xJ -C "$HOME/theos/toolchain/"
-          curl -sL -o /tmp/sdk.tar.xz \
+          curl -sL --retry 5 --retry-delay 10 --connect-timeout 30 --max-time 600 -o /tmp/sdk.tar.xz \
             https://github.com/theos/sdks/releases/download/master-146e41f/iPhoneOS16.5.sdk.tar.xz
           tar -xJf /tmp/sdk.tar.xz -C "$HOME/theos/sdks"
           test -x "$HOME/theos/toolchain/linux/iphone/bin/ld"
