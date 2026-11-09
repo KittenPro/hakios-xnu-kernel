@@ -92,8 +92,15 @@ stage1() {
 	# Apple's iig (the DriverKit interface generator) is closed. host/bin/iig hands out the headers it
 	# would generate, which the macOS SDK of the same XNU release ships ready-made.
 	if [ ! -d MacOSX13.3.sdk/System/Library/Frameworks/Kernel.framework/Headers/DriverKit ]; then
-		log "downloading the macOS 13.3 SDK for its DriverKit headers"
-		curl -L --fail --retry 3 -s -o macos-sdk.tar.xz "$MACOS_SDK_URL" || die "download failed: $MACOS_SDK_URL"
+		# CI hands the tarball in MACOS_SDK_TARBALL (this fork's ci-deps branch): the
+		# release-assets CDN behind the URL has been known to serve 504s for a day straight.
+		if [ -n "$MACOS_SDK_TARBALL" ] && [ -s "$MACOS_SDK_TARBALL" ]; then
+			log "using the macOS SDK tarball from $MACOS_SDK_TARBALL"
+			cp -- "$MACOS_SDK_TARBALL" macos-sdk.tar.xz
+		else
+			log "downloading the macOS 13.3 SDK for its DriverKit headers"
+			curl -L --fail --retry 3 -s -o macos-sdk.tar.xz "$MACOS_SDK_URL" || die "download failed: $MACOS_SDK_URL"
+		fi
 		# bsdtar (macOS) matches patterns without --wildcards, which it does not know
 		if tar --version 2>/dev/null | grep -q GNU; then
 			tar -xJf macos-sdk.tar.xz --wildcards '*MacOSX13.3.sdk/System/Library/Frameworks/Kernel.framework*'

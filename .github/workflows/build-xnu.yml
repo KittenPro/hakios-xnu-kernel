@@ -26,19 +26,24 @@ jobs:
 
       - uses: actions/checkout@v4
 
+      - name: ci-deps (the toolchain and the SDKs, git objects off the release-assets CDN)
+        run: |
+          # release-assets' CDN has been answering 504 to this runner for whole days at a
+          # stretch -- the toolchain's asset died five rounds of curl retry in one run -- while
+          # every clone of every run of this workflow has gone through. So the tarballs the
+          # builds need travel in this fork's own ci-deps branch, pinned and checksummed:
+          # the L1ghtmann toolchain (test-210562a, what that repo's releases/latest has pointed
+          # at all along), the iPhoneOS 16.5 SDK (theos/sdks master-146e41f) and the macOS
+          # 13.3 SDK (joseluisq/macosx-sdks, the DriverKit headers). A shallow clone of it
+          # takes seconds.
+          git clone --depth 1 --branch ci-deps \
+            "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" /tmp/ci-deps
+          (cd /tmp/ci-deps && sha256sum -c SHA256SUMS)
+
       - name: Theos (cctools ld64 for Mach-O) + iPhoneOS 16.5 SDK
         run: |
           git clone --recursive https://github.com/theos/theos.git "$HOME/theos"
           mkdir -p "$HOME/theos/toolchain" "$HOME/theos/sdks"
-          # The toolchain and the SDK travel in this fork's own ci-deps branch, git objects on
-          # github.com's own road: release-assets' CDN has been answering 504 to the runner for
-          # the toolchain's asset -- five rounds of curl retry and all -- while every clone of
-          # every run of this workflow has gone through. The tarballs are the pinned ones
-          # (L1ghtmann's test-210562a, what that repo's releases/latest has pointed at all
-          # along; theos/sdks' master-146e41f), checksummed here so the branch can't drift.
-          git clone --depth 1 --branch ci-deps \
-            "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" /tmp/ci-deps
-          (cd /tmp/ci-deps && sha256sum -c SHA256SUMS)
           xz -t /tmp/ci-deps/iOSToolchain-x86_64.tar.xz
           tar -xJf /tmp/ci-deps/iOSToolchain-x86_64.tar.xz -C "$HOME/theos/toolchain/"
           xz -t /tmp/ci-deps/iPhoneOS16.5.sdk.tar.xz
@@ -55,6 +60,8 @@ jobs:
           xnu-deps/host/zig/zig version
 
       - name: XNU sources + the tree's own dependencies
+        env:
+          MACOS_SDK_TARBALL: /tmp/ci-deps/MacOSX13.3.sdk.tar.xz
         run: |
           ./xnu/apply.sh
           ./xnu-deps/setup.sh
