@@ -118,6 +118,8 @@ extern void delay(int usec);
 static vm_offset_t wf_csr, wf_dma;
 static uint8_t wf_seq;
 static bool wf_tx_ok;
+static unsigned wf_runtime_rxd = 16;   /* the runtime RX descriptor: 16 bytes behind the 1a_1 firmware (WIFI IP set 1),
+                                        * 20 behind the 2a_1 (set 2) -- connac.h: CONNAC_RX_DESC_LENGTH, set by step 13 */
 
 /* the TX rings this driver uses, gen4m's numbering (TX_RING_*_IDX) and the hardware's (connac_bus_info) */
 enum { WF_TX_DATA = 0, WF_TX_CMD = 1, WF_TX_FWDL = 2, WF_TX_COUNT };
@@ -480,13 +482,17 @@ wf_step13(void)
 {
 	const uint32_t began = wf_ms();
 	uint32_t size = 0, entry = 0, at = 0, sync = 0;
-	uint8_t *file = redwood_connsys_file("WIFI_RAM_CODE_soc1_0_2a_1.bin", &size);
+	const char *name = "WIFI_RAM_CODE_soc1_0_2a_1.bin";
+	uint8_t *file = redwood_connsys_file(name, &size);
 	unsigned regions;
 	int status = -1;
 	bool ok = true;
 
+	wf_runtime_rxd = 20;                   /* the 2a_1 is WIFI IP set 2: its runtime descriptor is 4 bytes longer */
 	if (file == NULL) {                     /* the Infinix's own image, whose name the step was written against */
-		file = redwood_connsys_file("WIFI_RAM_CODE_soc1_0_1a_1.bin", &size);
+		name = "WIFI_RAM_CODE_soc1_0_1a_1.bin";
+		file = redwood_connsys_file(name, &size);
+		wf_runtime_rxd = 16;
 	}
 	if (file == NULL || size < 36 + 40) {
 		redwood_host_keep_add("connsys: step 13: no /fw/connsys/WIFI_RAM_CODE (rosemary's soc1_0_2a_1 nor the Infinix's 1a_1)");
@@ -499,8 +505,8 @@ wf_step13(void)
 		kfree_data(file, size);
 		return false;
 	}
-	redwood_host_keep_add("connsys: step 13: %u bytes, %u regions, version %.10s of %.14s", size, regions, file + size - 36 + 7,
-	    file + size - 36 + 17);
+	redwood_host_keep_add("connsys: step 13: %u bytes, %u regions, version %.10s of %.14s, runtime RXD %u bytes (2a_1's IP set 2)",
+	    size, regions, file + size - 36 + 7, file + size - 36 + 17, wf_runtime_rxd);
 	for (unsigned i = 0; i < regions && ok; i++) {
 		const uint8_t *r = file + size - 36 - (regions - i) * 40;
 		uint32_t address, length, mode = 0;
@@ -596,12 +602,13 @@ struct wf_mail {
 	uint8_t eid, seq;
 	uint16_t length;
 	bool full;
+	uint8_t raw[24];               /* the frame's bytes from 16 on: the event header, both descriptor lengths in one */
 	uint8_t body[1024];
 };
 static struct wf_mail wf_mail[WF_MAIL];
 static unsigned wf_mail_next;
 static struct redwood_sta_bss *wf_heard;        /* what the last scan heard, WF_BSS_MOST of it at most */
-static unsigned wf_heard_count, wf_frames, wf_other_events, wf_rx_dropped, wf_rx_ethernets, wf_rx_mailed, wf_rx_short;
+static unsigned wf_heard_count, wf_frames, wf_other_events, wf_rx_dropped, wf_rx_rejected, wf_rx_ethernets, wf_rx_mailed, wf_rx_short;
 /* what the joined network carried, said every 10 s while it is joined (wf_link_poll) */
 static struct {
 	unsigned tx, tx_failed, arp, udp, tcp, other, unicast, broadcast, clear, wtbl, error, said, dropped_said;
@@ -723,13 +730,22 @@ wf_rx_frame(const uint8_t *f, uint32_t got)
 {
 	const uint16_t count = got >= 16 ? (uint16_t)(f[0] | f[1] << 8) : 0, type = got >= 16 ? (uint16_t)(f[2] | f[3] << 8) : 0;
 	const unsigned groups = (type >> 9) & 0xf;
-	uint32_t at = 16, rx_vector = 0, length;
+	uint32_t at = wf_runtime_rxd, rx_vector = 0, length;
 	const uint8_t *frame;
 	int rssi = -100;
 
 	wf_frames++;
 	/* (all of it inside what was received: the descriptor's count is the firmware's word, not a bound) */
 	if (got < 16 || count > got || (((type >> 13) & 7) != RX_PKT_TYPE_RX_DATA && (type & 0xe00f) != 0xe001)) {
+		/* (a sanity the scan may not meet if the firmware's descriptor grows beyond what we parse -- show the frame) */
+		wf_rx_dropped++;
+		if (wf_rx_rejected < 2 && got >= 24) {
+			redwood_host_keep_add("connsys: a frame rejected on RX 0, type %#x, count %u, %u bytes: %02x%02x %02x%02x "
+			    "%02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x",
+			    type, count, got, f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8], f[9], f[10], f[11], f[12], f[13],
+			    f[14], f[15], f[16], f[17], f[18], f[19], f[20], f[21], f[22], f[23]);
+		}
+		wf_rx_rejected++;
 		return;
 	}
 	at += (groups & 8) ? 16 : 0;
@@ -819,8 +835,8 @@ wf_pump(uint8_t eid, uint8_t seq, uint8_t *body, uint32_t room)
 		wf_rx_frame(wf_frame_buf, (uint32_t)got);
 	}
 	while (found < 0 && (got = wf_rx(WF_RX_EVENT, wf_frame_buf, sizeof(wf_frame_buf), 0)) >= 0) {
-		const uint8_t *e = wf_frame_buf + INIT_RXD_SIZE;
-		const uint32_t length = (uint32_t)got > INIT_RXD_SIZE + WIFI_EVENT_SIZE ? (uint32_t)got - INIT_RXD_SIZE -
+		const uint8_t *e = wf_frame_buf + wf_runtime_rxd;
+		const uint32_t length = (uint32_t)got > wf_runtime_rxd + WIFI_EVENT_SIZE ? (uint32_t)got - wf_runtime_rxd -
 		    WIFI_EVENT_SIZE : 0;
 		const uint16_t type = (uint16_t)(wf_frame_buf[2] | wf_frame_buf[3] << 8);
 
@@ -835,10 +851,10 @@ wf_pump(uint8_t eid, uint8_t seq, uint8_t *body, uint32_t room)
 				    b[22], b[23]);
 			}
 			wf_rx_frame(wf_frame_buf, (uint32_t)got);
-		} else if (got >= INIT_RXD_SIZE + WIFI_EVENT_SIZE && e[4] == eid && (seq == 0 || e[5] == seq)) {
+		} else if (got >= wf_runtime_rxd + WIFI_EVENT_SIZE && e[4] == eid && (seq == 0 || e[5] == seq)) {
 			found = (int)(length < room ? length : room);
 			memcpy(body, e + WIFI_EVENT_SIZE, (uint32_t)found);
-		} else if (got >= INIT_RXD_SIZE + WIFI_EVENT_SIZE) {
+		} else if (got >= wf_runtime_rxd + WIFI_EVENT_SIZE) {
 			/* kept for whoever waits for it next (the interface's poll may be the one that finds it) */
 			struct wf_mail *m = &wf_mail[wf_mail_next++ % WF_MAIL];
 
@@ -850,18 +866,19 @@ wf_pump(uint8_t eid, uint8_t seq, uint8_t *body, uint32_t room)
 			m->seq = e[5];
 			m->length = (uint16_t)(length < sizeof(m->body) ? length : sizeof(m->body));
 			memcpy(m->body, e + WIFI_EVENT_SIZE, m->length);
+			memcpy(m->raw, wf_frame_buf + 16, sizeof(m->raw));
 			m->full = true;
 			wf_rx_mailed++;
 		} else {
 			/* shorter than an event even -- the answer, whatever its shape, may be one of these */
 			wf_rx_short++;
-			if (wf_rx_short <= 3 && got >= 22) {
+			if (wf_rx_short <= 3 && got >= wf_runtime_rxd + 6) {
 				const uint8_t *b = wf_frame_buf;
 
 				redwood_host_keep_add("connsys: a short event on RX 1, type %#x, %d bytes (event %#x seq %u): %02x%02x %02x%02x "
 				    "%02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x", type, got, e[4], e[5],
 				    b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15], b[16], b[17],
-				    b[18], b[19], b[20], b[21]);
+				    b[18], b[19], b[20], b[21], b[22], b[23]);
 			}
 		}
 	}
@@ -926,11 +943,14 @@ wf_step14(void)
 			const struct wf_mail *m = &wf_mail[i];
 
 			if (m->full) {
-				redwood_host_keep_add("connsys: step 14: the mailbox's slot %u: event %#x seq %u, %u bytes: %02x%02x %02x%02x "
-				    "%02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x", i, m->eid,
-				    m->seq, m->length, m->body[0], m->body[1], m->body[2], m->body[3], m->body[4], m->body[5], m->body[6], m->body[7],
-				    m->body[8], m->body[9], m->body[10], m->body[11], m->body[12], m->body[13], m->body[14], m->body[15], m->body[16],
-				    m->body[17], m->body[18], m->body[19], m->body[20], m->body[21], m->body[22], m->body[23]);
+				redwood_host_keep_add("connsys: step 14: the mailbox's slot %u: event %#x seq %u, %u bytes, raw: %02x%02x %02x%02x "
+				    "%02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x | "
+				    "body: %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x", i, m->eid, m->seq, m->length,
+				    m->raw[0], m->raw[1], m->raw[2], m->raw[3], m->raw[4], m->raw[5], m->raw[6], m->raw[7], m->raw[8], m->raw[9],
+				    m->raw[10], m->raw[11], m->raw[12], m->raw[13], m->raw[14], m->raw[15], m->raw[16], m->raw[17], m->raw[18],
+				    m->raw[19], m->raw[20], m->raw[21], m->raw[22], m->raw[23], m->body[0], m->body[1], m->body[2], m->body[3],
+				    m->body[4], m->body[5], m->body[6], m->body[7], m->body[8], m->body[9], m->body[10], m->body[11], m->body[12],
+				    m->body[13], m->body[14], m->body[15]);
 			}
 		}
 		return false;
