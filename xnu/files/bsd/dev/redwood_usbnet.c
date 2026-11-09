@@ -291,6 +291,7 @@ static uint32_t ep0_out_want, ep0_out_got;
 static bool usbnet_carrier;
 static bool usbnet_log_armed;
 static unsigned usbnet_log_cursor;
+static unsigned usbnet_log_sent, usbnet_log_stalled;
 
 /* the encapsulated response waiting for the host to read */
 static uint8_t rndis_response[64];
@@ -313,6 +314,7 @@ static uint32_t usbnet_fifo_limit;       /* in 512-byte units: TX's half of the 
 static void usbnet_start(void);
 static void usbnet_stop(void);
 static void usbnet_log_poll(void);
+static void usbnet_log_probe(void);
 
 static inline uint32_t
 mac_read(uint32_t offset)
@@ -1180,6 +1182,11 @@ usbnet_thread(__unused void *parameter, __unused wait_result_t result)
 		if (usb_trace && (ms % 50) == 0) {
 			usbnet_log_poll();
 		}
+		/* and once every five seconds, the stream's own story: the counters and the queue's
+		 * state, printed -- and carried by the stream itself when the stream is healthy */
+		if (usb_trace && usbnet_configured && (ms % 5000) == 0) {
+			usbnet_log_probe();
+		}
 		ms++;
 		/* the pulse (usb_trace): run 3's whole wire story was invisible -- the pullup never
 		 * reached the host and the MAC never saw one byte, and nothing said which. Now any
@@ -1258,11 +1265,37 @@ usbnet_log_poll(void)
 			frame[14 + i] = mb->msg_bufc[(usbnet_log_cursor + i) % mb->msg_size];
 		}
 		if (!usbnet_send_raw(frame, 14 + chunk)) {
+			usbnet_log_stalled++;
 			return;                         /* the ring is full: the bytes wait for the next tick */
 		}
 		usbnet_log_cursor = (usbnet_log_cursor + chunk) % mb->msg_size;
 		sent++;
+		usbnet_log_sent++;
 	}
+}
+
+/*
+ * usb_trace's story of the stream, once every five seconds while the cable is configured:
+ * the frames out, the waits, and the bulk-in queue's own word about itself -- TXQCSR1 read
+ * back, the ring's enq, head and free. Printed into the message buffer, so when the stream
+ * is healthy the line rides the stream itself, and when it is not the pstore keeps it: run 7
+ * (logs/usb2g) sat three hundred seconds with a hundred kilobytes pending behind one frame,
+ * and its log could not say what the queue was doing while it sat. This line can.
+ */
+static void
+usbnet_log_probe(void)
+{
+	uint32_t qcsr;
+	unsigned enq, head, free_count;
+
+	lck_mtx_lock(&usbnet_lock);
+	qcsr = mac_read(REG_TXQCSR1);
+	enq = tx_enq;
+	head = tx_head;
+	free_count = tx_free_count;
+	lck_mtx_unlock(&usbnet_lock);
+	printf("usb: stream: %u frames out, %u waiting; tx queue %#x, enq %u head %u free %u\n",
+	    usbnet_log_sent, usbnet_log_stalled, qcsr, enq, head, free_count);
 }
 
 static bool
