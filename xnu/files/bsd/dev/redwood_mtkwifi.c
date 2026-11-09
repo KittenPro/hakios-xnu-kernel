@@ -609,6 +609,7 @@ static struct wf_mail wf_mail[WF_MAIL];
 static unsigned wf_mail_next;
 static struct redwood_sta_bss *wf_heard;        /* what the last scan heard, WF_BSS_MOST of it at most */
 static unsigned wf_heard_count, wf_frames, wf_other_events, wf_rx_dropped, wf_rx_rejected, wf_rx_ethernets, wf_rx_mailed, wf_rx_short;
+static unsigned wf_join_beacons;        /* the network being joined: its beacons while the join runs (on its channel?) */
 /* what the joined network carried, said every 10 s while it is joined (wf_link_poll) */
 static struct {
 	unsigned tx, tx_failed, arp, udp, tcp, other, unicast, broadcast, clear, wtbl, error, said, dropped_said;
@@ -683,6 +684,9 @@ wf_rx_beacon(const uint8_t *frame, uint32_t length, int rssi, unsigned channel)
 
 	if (length < 36 || wf_heard == NULL) {
 		return;
+	}
+	if (memcmp(frame + 16, wf_net.bssid, 6) == 0) {
+		wf_join_beacons++;                   /* (the network being joined: its beacons say the channel is the right one) */
 	}
 	for (unsigned i = 0; i < wf_heard_count; i++) {
 		if (memcmp(wf_heard[i].bssid, frame + 16, 6) == 0) {
@@ -903,6 +907,32 @@ wf_mail_take(uint8_t eid, uint8_t seq, uint8_t *body, uint32_t room)
 	return -1;
 }
 
+/* the mailbox's slots on the record: what the firmware said while nobody waited for it (a TX done's status tells
+ * whether the air took the frame at all) */
+static void
+wf_mail_dump(const char *what)
+{
+	for (unsigned i = 0; i < WF_MAIL; i++) {
+		const struct wf_mail *m = &wf_mail[i];
+
+		if (!m->full) {
+			continue;
+		}
+		redwood_host_keep_add("connsys: %s: the mailbox's slot %u: event %#x seq %u, %u bytes, raw: %02x%02x %02x%02x "
+		    "%02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x | "
+		    "body: %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x", what, i, m->eid, m->seq, m->length,
+		    m->raw[0], m->raw[1], m->raw[2], m->raw[3], m->raw[4], m->raw[5], m->raw[6], m->raw[7], m->raw[8], m->raw[9],
+		    m->raw[10], m->raw[11], m->raw[12], m->raw[13], m->raw[14], m->raw[15], m->raw[16], m->raw[17], m->raw[18],
+		    m->raw[19], m->raw[20], m->raw[21], m->raw[22], m->raw[23], m->body[0], m->body[1], m->body[2], m->body[3],
+		    m->body[4], m->body[5], m->body[6], m->body[7], m->body[8], m->body[9], m->body[10], m->body[11], m->body[12],
+		    m->body[13], m->body[14], m->body[15]);
+		if (m->eid == 0x0f && m->length >= 9) {  /* EVENT_ID_TX_DONE: seq, status, SN, wlan, tries, rate, flag */
+			redwood_host_keep_add("connsys: %s: that one a TX done: status %u, %u tries, rate %#x, flag %#x, SN %u, wlan %u",
+			    what, m->body[1], m->body[5], m->body[6] | m->body[7] << 8, m->body[8], m->body[2] | m->body[3] << 8, m->body[4]);
+		}
+	}
+}
+
 /* (wf_lock held: the rings are one thread's at a time) */
 static int
 wf_wait(uint8_t eid, uint8_t seq, uint8_t *body, uint32_t room, unsigned wait_ms)
@@ -939,20 +969,7 @@ wf_step14(void)
 		    "%u events mailed, %u short)", wf_ms(), wf_tx_ok ? "NOT ANSWERED" : "NOT TAKEN BY THE DMA", wf_rd(WPDMA_TX_RING + 0xf8),
 		    wf_rd(WPDMA_TX_RING + 0xfc), wf_rd(WPDMA_RX_RING + 0x18), wf_rd(WPDMA_RX_RING + 0x1c), wf_frames, wf_rx_mailed,
 		    wf_rx_short);
-		for (unsigned i = 0; i < WF_MAIL; i++) {   /* the answer, under whatever event ID it came, sits here unsaid */
-			const struct wf_mail *m = &wf_mail[i];
-
-			if (m->full) {
-				redwood_host_keep_add("connsys: step 14: the mailbox's slot %u: event %#x seq %u, %u bytes, raw: %02x%02x %02x%02x "
-				    "%02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x | "
-				    "body: %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x", i, m->eid, m->seq, m->length,
-				    m->raw[0], m->raw[1], m->raw[2], m->raw[3], m->raw[4], m->raw[5], m->raw[6], m->raw[7], m->raw[8], m->raw[9],
-				    m->raw[10], m->raw[11], m->raw[12], m->raw[13], m->raw[14], m->raw[15], m->raw[16], m->raw[17], m->raw[18],
-				    m->raw[19], m->raw[20], m->raw[21], m->raw[22], m->raw[23], m->body[0], m->body[1], m->body[2], m->body[3],
-				    m->body[4], m->body[5], m->body[6], m->body[7], m->body[8], m->body[9], m->body[10], m->body[11], m->body[12],
-				    m->body[13], m->body[14], m->body[15]);
-			}
-		}
+		wf_mail_dump("step 14");   /* the answer, under whatever event ID it came, sits here unsaid */
 		return false;
 	}
 	/* EVENT_NIC_CAPABILITY_V2: the elements' count, then each a tag, a length and its body */
@@ -1604,6 +1621,7 @@ wf_join(const struct redwood_sta_join *what)
 
 	/* Authentication, open system: algorithm 0, sequence 1, status 0 -- answered with sequence 2 */
 	wf_mgmt_heard = 0;
+	wf_join_beacons = 0;
 	unsigned sent = 0;
 	for (unsigned try = 0; try < 3 && status != 0; try++) {
 		const uint8_t auth[6] = { 0, 0, 1, 0, 0, 0 };
@@ -1614,9 +1632,10 @@ wf_join(const struct redwood_sta_join *what)
 		}
 	}
 	redwood_host_keep_add("connsys: step 17 [%u ms]: authentication %s (status %u; %u of the frames taken by the DMA, %u "
-	    "addressed to us from it, %u frames in all)", wf_ms(), status == 0 ? "accepted" : got == 0 ? "NOT ANSWERED" : "REFUSED",
-	    status, sent, wf_mgmt_heard, wf_frames);
+	    "addressed to us from it, %u frames in all, %u of its beacons)", wf_ms(), status == 0 ? "accepted" : got == 0 ?
+	    "NOT ANSWERED" : "REFUSED", status, sent, wf_mgmt_heard, wf_frames, wf_join_beacons);
 	if (status != 0) {
+		wf_mail_dump("step 17");      /* the TX dones: their status says whether the air took the Authentication at all */
 		goto failed;
 	}
 
@@ -1654,6 +1673,7 @@ wf_join(const struct redwood_sta_join *what)
 	redwood_host_keep_add("connsys: step 17 [%u ms]: association %s (status %u, AID %u)", wf_ms(), status == 0 ? "accepted" :
 	    got == 0 ? "NOT ANSWERED" : "REFUSED", status, wf_net.aid);
 	if (status != 0) {
+		wf_mail_dump("step 17");
 		goto failed;
 	}
 
@@ -1689,6 +1709,7 @@ wf_join(const struct redwood_sta_join *what)
 		if (!wf_net.keyed) {
 			redwood_host_keep_add("connsys: step 17 [%u ms]: WPA2's handshake did NOT come through (%u messages; %u Ethernet "
 			    "frames, %u dropped, %u frames in all)", wf_ms(), wf_net.eapol_said, wf_rx_ethernets, wf_rx_dropped, wf_frames);
+			wf_mail_dump("step 17");
 			wf_net.joined = false;
 			goto failed;
 		}
