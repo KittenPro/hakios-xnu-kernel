@@ -30,11 +30,19 @@ jobs:
         run: |
           git clone --recursive https://github.com/theos/theos.git "$HOME/theos"
           mkdir -p "$HOME/theos/toolchain" "$HOME/theos/sdks"
-          curl -sL --retry 5 --retry-delay 10 --connect-timeout 30 --max-time 600 \
-            https://github.com/L1ghtmann/llvm-project/releases/latest/download/iOSToolchain-x86_64.tar.xz \
-            | tar -xJ -C "$HOME/theos/toolchain/"
-          curl -sL --retry 5 --retry-delay 10 --connect-timeout 30 --max-time 600 -o /tmp/sdk.tar.xz \
-            https://github.com/theos/sdks/releases/download/master-146e41f/iPhoneOS16.5.sdk.tar.xz
+          fetch() {  # $1 url, $2 file: -f refuses error bodies, the loop rides out the asset CDN's moods
+            for i in 1 2 3 4 5; do
+              curl -fsSL --connect-timeout 30 --max-time 900 -o "$2" "$1" && return 0
+              sleep $((i * 10))
+            done
+            echo "could not fetch $1" >&2
+            return 1
+          }
+          fetch https://github.com/L1ghtmann/llvm-project/releases/latest/download/iOSToolchain-x86_64.tar.xz /tmp/toolchain.tar.xz
+          xz -t /tmp/toolchain.tar.xz
+          tar -xJf /tmp/toolchain.tar.xz -C "$HOME/theos/toolchain/"
+          fetch https://github.com/theos/sdks/releases/download/master-146e41f/iPhoneOS16.5.sdk.tar.xz /tmp/sdk.tar.xz
+          xz -t /tmp/sdk.tar.xz
           tar -xJf /tmp/sdk.tar.xz -C "$HOME/theos/sdks"
           test -x "$HOME/theos/toolchain/linux/iphone/bin/ld"
           test -d "$HOME/theos/sdks/iPhoneOS16.5.sdk/usr/include"
