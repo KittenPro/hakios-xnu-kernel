@@ -135,6 +135,13 @@ extern void delay_for_interval(uint32_t interval, uint32_t scale_factor);
 #define Q_RESUME        (1u << 1)
 #define Q_STOP          (1u << 2)
 #define Q_ACTIVE        (1u << 15)
+#define REG_TXQCPR1     0x0518           /* the queue's current GPD: where the hardware sits */
+#define REG_QISAR0      0x0700           /* done statuses, W1C: bit n TX ep n, 16+n RX ep n */
+#define REG_QISAR1      0x0710           /* live (read update): 0 empty, 1 TX CS err, 2 TX len err, 16..20 RX */
+#define REG_TQERRIR0    0x0780           /* which TX endpoint erred, W1C: bit n checksum, 16+n length */
+#define REG_RQERRIR0    0x07c0           /* the receive side's pair of it, W1C */
+#define QISAR1_TX_ERRS  ((1u << 1) | (1u << 2))
+#define QISAR1_RX_ERRS  ((1u << 17) | (1u << 18) | (1u << 20))
 
 #define REG_DEVICE_CONF 0x0800
 #define DEV_ADDR_MSK    0x7f000000u      /* GENMASK(30,24), the address <<24 */
@@ -293,6 +300,10 @@ static bool usbnet_log_armed;
 static unsigned usbnet_log_cursor;
 static unsigned usbnet_log_sent, usbnet_log_stalled;
 
+/* the QMU's event bookkeeping (usbnet_qmu_poll): done statuses acknowledged, exceptions seen */
+static unsigned usbnet_qmu_done, usbnet_qmu_exc_events;
+static uint32_t usbnet_qmu_exc;
+
 /* the encapsulated response waiting for the host to read */
 static uint8_t rndis_response[64];
 static uint32_t rndis_response_len;
@@ -315,6 +326,7 @@ static void usbnet_start(void);
 static void usbnet_stop(void);
 static void usbnet_log_poll(void);
 static void usbnet_log_probe(void);
+static void usbnet_qmu_poll(void);
 
 static inline uint32_t
 mac_read(uint32_t offset)
@@ -492,6 +504,48 @@ queue_resume(uint32_t qcsr)              /* nudge the QMU to look at the GPD jus
 	if (!(mac_read(qcsr) & Q_ACTIVE)) {
 		mac_write(qcsr, Q_RESUME);
 	}
+}
+
+/*
+ * The QMU's own events, serviced the way mtu3's interrupt handler services them -- by poll
+ * instead of ISR (mtu3_qmu_isr). The done statuses are acknowledged write-one-clear: run 8's
+ * stream sent 1024 frames and then the done machinery went silent -- the host had every
+ * frame, but no GPD was marked complete again, the ring filled with armed GPDs the queue
+ * would not look at, and the stream sat stalled half a cycle (logs/usb2h: "1024 frames out,
+ * 2382 waiting"). mtu3 acknowledges these statuses on every interrupt; we had never
+ * acknowledged one. The exception statuses behind QISAR1 are live, not latched: the error
+ * registers they point at are cleared when they say something, and everything the probe's
+ * next line needs is kept.
+ */
+static void
+usbnet_qmu_poll(void)
+{
+	uint32_t done, exc;
+
+	if (!usbnet_on) {
+		return;
+	}
+	lck_mtx_lock(&usbnet_lock);
+	done = mac_read(REG_QISAR0);
+	if (done) {
+		mac_write(REG_QISAR0, done);     /* W1C: the events are acknowledged */
+		usbnet_qmu_done += (unsigned)__builtin_popcount(done);
+	}
+	exc = mac_read(REG_QISAR1) & (QISAR1_TX_ERRS | QISAR1_RX_ERRS);
+	if (exc) {
+		uint32_t terr = mac_read(REG_TQERRIR0);
+		uint32_t rerr = mac_read(REG_RQERRIR0);
+
+		if (terr) {
+			mac_write(REG_TQERRIR0, terr);   /* W1C */
+		}
+		if (rerr) {
+			mac_write(REG_RQERRIR0, rerr);   /* W1C */
+		}
+		usbnet_qmu_exc |= exc;
+		usbnet_qmu_exc_events++;
+	}
+	lck_mtx_unlock(&usbnet_lock);
 }
 
 /* the 8-byte RESPONSE_AVAILABLE on the interrupt endpoint; the host polls EP0 anyway */
@@ -1176,6 +1230,7 @@ usbnet_thread(__unused void *parameter, __unused wait_result_t result)
 		usbnet_bus_poll();
 		usbnet_ep0_poll();
 		usbnet_rx_poll();
+		usbnet_qmu_poll();
 		/* the console over the cable: every 50 ms whatever the kernel has printed since
 		 * the last look, out through the bulk-in ring. The first frames this gadget has
 		 * ever sent are its own log. */
@@ -1285,17 +1340,28 @@ usbnet_log_poll(void)
 static void
 usbnet_log_probe(void)
 {
-	uint32_t qcsr;
-	unsigned enq, head, free_count;
+	uint32_t qcsr, cpr, exc, ring0;
+	unsigned enq, head, free_count, done, exc_events, cpr_index = 99;
 
 	lck_mtx_lock(&usbnet_lock);
 	qcsr = mac_read(REG_TXQCSR1);
+	cpr = mac_read(REG_TXQCPR1);
+	ring0 = ring_pa(0);
 	enq = tx_enq;
 	head = tx_head;
 	free_count = tx_free_count;
+	done = usbnet_qmu_done;
+	exc = usbnet_qmu_exc;
+	exc_events = usbnet_qmu_exc_events;
+	usbnet_qmu_exc = 0;               /* reported; the next five seconds start clean */
 	lck_mtx_unlock(&usbnet_lock);
-	printf("usb: stream: %u frames out, %u waiting; tx queue %#x, enq %u head %u free %u\n",
-	    usbnet_log_sent, usbnet_log_stalled, qcsr, enq, head, free_count);
+	if (cpr >= ring0 && cpr < ring0 + RING_DEPTH * sizeof(struct usbnet_gpd)) {
+		cpr_index = (unsigned)((cpr - ring0) / sizeof(struct usbnet_gpd));
+	}
+	printf("usb: stream: %u frames out, %u waiting; tx queue %#x, enq %u head %u free %u; "
+	    "qmu done %u, exc %#x (%u), cpr %u\n",
+	    usbnet_log_sent, usbnet_log_stalled, qcsr, enq, head, free_count,
+	    done, exc, exc_events, cpr_index);
 }
 
 static bool
