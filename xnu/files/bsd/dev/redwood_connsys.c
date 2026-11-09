@@ -1476,9 +1476,13 @@ connsys_firmware_thread(__unused void *parameter, __unused wait_result_t result)
 		uint32_t size = 0, address, offset;
 		uint8_t *file;
 
-		/* from step 9 the MCU's patch goes over BTIF (connsys_pda_patch), not into EMI: Android puts only the RAM
-		 * images there ("[Rom Patch]" ram_bt, ram_wifi, ram_mcu in its log) */
-		if (connsys_step >= 9 && strcmp(files[i], "soc1_0_patch_mcu_2a_1_hdr.bin") == 0) {
+		/* The MCU's patch does not go into EMI at all: at the MT6785 it travels over BTIF after the reset
+		 * is let go (mtk_wcn_soc_pda_patch_dwn of core/wmt_ic_soc.c -- .pda_dl_patch_flag of mt6785.c's
+		 * emi_addr_info; step 9 here). mtk_wcn_soc_rom_patch_dwn puts only the RAM images there, "[Rom
+		 * Patch] ram_bt, ram_wifi, ram_mcu" in Android's log. Run 1 of step 5 put it in EMI too and the
+		 * ROM never wrote 0x1D1E into MCU+0x600 (0x5 instead, pc 0x956378c); the canonical order is what
+		 * this tries next. */
+		if (strcmp(files[i], "soc1_0_patch_mcu_2a_1_hdr.bin") == 0) {
 			continue;
 		}
 		file = connsys_file(files[i], &size);
@@ -1583,11 +1587,19 @@ connsys_firmware_thread(__unused void *parameter, __unused wait_result_t result)
 		}
 	}
 	uint32_t ms_rel = connsys_ms();
+	/* what Android reads while it waits for 0x1D1E (consys_hw_reset_bit_set, mt6785.c): the ROM's own
+	 * version registers -- +0x00 hardware, +0x04 firmware (ROM), polled in polling_consys_chipid too --
+	 * and +0x16c, its dump line "0x1800216c". Run 1 of step 5: 0x600 stuck at 0x5; these say whether
+	 * the ROM is speaking at all. */
+	redwood_host_keep_add("connsys: step 5 [%u ms]: before the reset goes: MCU+0x600 %#x, HW %#x, ROM FW %#x, "
+	    "+0x16c %#x", connsys_ms(), rd(mcu, 0x600), rd(mcu, 0x0), rd(mcu, 0x4), rd(mcu, 0x16c));
 	*(volatile uint32_t *)(rgu + 0x18) = (rd(rgu, 0x18) & ~(1u << 12)) | (0x88u << 24);     /* the CPU let go */
 	for (unsigned n = 0; n < 50 && version != 0x1D1E; n++) {
 		delay_for_interval(20, NSEC_PER_MSEC);
 		version = rd(mcu, 0x600);
 	}
+	redwood_host_keep_add("connsys: step 5 [%u ms]: after: MCU+0x600 %#x, HW %#x, ROM FW %#x, +0x16c %#x",
+	    connsys_ms(), version, rd(mcu, 0x0), rd(mcu, 0x4), rd(mcu, 0x16c));
 	snprintf(connsys_said, sizeof(connsys_said), "step 5 [%u ms, rel at %u ms]: %u files in; remap %#x/%#x; MCU+0x600 %#x (%s), CPUPCR %#x then %#x",
 	    connsys_ms(), ms_rel, copied, rd(infra, 0x380), rd(infra, 0x388), version, version == 0x1D1E ? "CONNSYS'S ROM TOOK IT" : "not 0x1D1E",
 	    rd(hif, 0x104), (delay_for_interval(10, NSEC_PER_MSEC), rd(hif, 0x104)));
