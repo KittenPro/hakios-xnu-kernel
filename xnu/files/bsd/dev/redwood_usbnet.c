@@ -278,7 +278,7 @@ static unsigned rx_head, rx_enq;
 static unsigned notify_pos;              /* the two slots alternate */
 
 /* EP0's state machine (the thread's own; nothing else touches it) */
-enum { EP0_SETUP, EP0_TX, EP0_RX };
+enum { EP0_SETUP, EP0_TX, EP0_RX, EP0_TX_END };
 static uint8_t ep0_state;
 static uint8_t ep0_in[256];
 static uint32_t ep0_in_len, ep0_in_pos;
@@ -763,29 +763,30 @@ ep0_dispatch(const uint8_t *setup)
 }
 
 static void
-ep0_send_more(void)                 /* EP0_TX: load the FIFO as it drains */
+ep0_send_more(void)                 /* EP0_TX: one packet per call, as mtu3 sends them */
 {
 	uint32_t csr = mac_read(REG_EP0CSR);
+	uint32_t chunk = ep0_in_len - ep0_in_pos;
 
-	while (!(csr & EP0_FIFOFULL)) {
-		uint32_t chunk = ep0_in_len - ep0_in_pos;
-
-		if (chunk > 64) {
-			chunk = 64;
-		}
-		if (chunk > 0) {
-			ep0_fifo_write(ep0_in + ep0_in_pos, chunk);
-			ep0_in_pos += chunk;
-		}
-		csr = (mac_read(REG_EP0CSR) & EP0_W1C_BITS) | EP0_TXPKTRDY;
-		if (ep0_in_pos == ep0_in_len) {
-			mac_write(REG_EP0CSR, csr | EP0_DATAEND);
-			ep0_state = EP0_SETUP;
-			return;
-		}
-		mac_write(REG_EP0CSR, csr);
-		csr = mac_read(REG_EP0CSR);
+	if (csr & (EP0_TXPKTRDY | EP0_FIFOFULL)) {
+		return;              /* the previous packet has not left the FIFO yet */
 	}
+	if (chunk > 64) {
+		chunk = 64;
+	}
+	if (chunk > 0) {
+		ep0_fifo_write(ep0_in + ep0_in_pos, chunk);
+		ep0_in_pos += chunk;
+	}
+	if (chunk < 64 || ep0_in_pos == ep0_in_len) {
+		ep0_state = EP0_TX_END;  /* DATAEND only once this packet has flown */
+	}
+	/* mtu3's ep0_tx_state(): the write is TXPKTRDY alone. TXPKTRDY|DATAEND together
+	 * is a thing this MAC will not honor -- run 5 wrote them as one and the answer
+	 * was EP0CSR 0x880440: TXPKTRDY gone, the bytes parked in the FIFO, FIFOFULL
+	 * latched for all three hundred seconds. mtu3 sends DATAEND afterwards, as its
+	 * own state, on the "txpktrdy cleared" event -- ours is the poll below. */
+	mac_write(REG_EP0CSR, (mac_read(REG_EP0CSR) & EP0_W1C_BITS) | EP0_TXPKTRDY);
 }
 
 static void
@@ -848,6 +849,17 @@ usbnet_ep0_poll(void)
 	}
 	if (ep0_state == EP0_TX) {
 		ep0_send_more();
+	} else if (ep0_state == EP0_TX_END) {
+		/* mtu3 answers the "txpktrdy cleared" event by writing DATAEND alone
+		 * (ep0's TX_END state). Polled, the same news reads as TXPKTRDY and
+		 * FIFOFULL both back on the floor: the packet has left the FIFO for
+		 * the wire, the status stage may begin. */
+		uint32_t csr2 = mac_read(REG_EP0CSR);
+
+		if (!(csr2 & (EP0_TXPKTRDY | EP0_FIFOFULL))) {
+			mac_write(REG_EP0CSR, (csr2 & EP0_W1C_BITS) | EP0_DATAEND);
+			ep0_state = EP0_SETUP;
+		}
 	} else if (ep0_state == EP0_RX && (mac_read(REG_EP0CSR) & EP0_RXPKTRDY)) {
 		ep0_receive();
 	}
