@@ -601,7 +601,7 @@ struct wf_mail {
 static struct wf_mail wf_mail[WF_MAIL];
 static unsigned wf_mail_next;
 static struct redwood_sta_bss *wf_heard;        /* what the last scan heard, WF_BSS_MOST of it at most */
-static unsigned wf_heard_count, wf_frames, wf_other_events, wf_rx_dropped, wf_rx_ethernets;
+static unsigned wf_heard_count, wf_frames, wf_other_events, wf_rx_dropped, wf_rx_ethernets, wf_rx_mailed, wf_rx_short;
 /* what the joined network carried, said every 10 s while it is joined (wf_link_poll) */
 static struct {
 	unsigned tx, tx_failed, arp, udp, tcp, other, unicast, broadcast, clear, wtbl, error, said, dropped_said;
@@ -851,6 +851,18 @@ wf_pump(uint8_t eid, uint8_t seq, uint8_t *body, uint32_t room)
 			m->length = (uint16_t)(length < sizeof(m->body) ? length : sizeof(m->body));
 			memcpy(m->body, e + WIFI_EVENT_SIZE, m->length);
 			m->full = true;
+			wf_rx_mailed++;
+		} else {
+			/* shorter than an event even -- the answer, whatever its shape, may be one of these */
+			wf_rx_short++;
+			if (wf_rx_short <= 3 && got >= 22) {
+				const uint8_t *b = wf_frame_buf;
+
+				redwood_host_keep_add("connsys: a short event on RX 1, type %#x, %d bytes (event %#x seq %u): %02x%02x %02x%02x "
+				    "%02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x", type, got, e[4], e[5],
+				    b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15], b[16], b[17],
+				    b[18], b[19], b[20], b[21]);
+			}
 		}
 	}
 	return found;
@@ -902,10 +914,25 @@ wf_step14(void)
 	wf_wr(WPDMA_GLO_CFG, wf_rd(WPDMA_GLO_CFG) & ~GLO_BYPASS_DMASHDL_TX3);   /* HAL_ENABLE_FWDL(FALSE) */
 	seq = wf_cmd(CMD_ID_GET_NIC_CAPABILITY_V2, false, NULL, 0);
 	got = wf_tx_ok ? wf_wait(EVENT_ID_NIC_CAPABILITY_V2, seq, answer, sizeof(answer), 1000) : -1;
+	if (got < 4 && wf_tx_ok) {      /* a straggler may still sit in the ring: one more window before the verdict */
+		got = wf_wait(EVENT_ID_NIC_CAPABILITY_V2, seq, answer, sizeof(answer), 500);
+	}
 	if (got < 4) {
-		redwood_host_keep_add("connsys: step 14 [%u ms]: NIC_CAPABILITY_V2 %s (TX15 cidx/didx %u/%u, RX1 %u/%u, %u frames)",
-		    wf_ms(), wf_tx_ok ? "NOT ANSWERED" : "NOT TAKEN BY THE DMA", wf_rd(WPDMA_TX_RING + 0xf8), wf_rd(WPDMA_TX_RING + 0xfc),
-		    wf_rd(WPDMA_RX_RING + 0x18), wf_rd(WPDMA_RX_RING + 0x1c), wf_frames);
+		redwood_host_keep_add("connsys: step 14 [%u ms]: NIC_CAPABILITY_V2 %s (TX15 cidx/didx %u/%u, RX1 %u/%u, %u frames; "
+		    "%u events mailed, %u short)", wf_ms(), wf_tx_ok ? "NOT ANSWERED" : "NOT TAKEN BY THE DMA", wf_rd(WPDMA_TX_RING + 0xf8),
+		    wf_rd(WPDMA_TX_RING + 0xfc), wf_rd(WPDMA_RX_RING + 0x18), wf_rd(WPDMA_RX_RING + 0x1c), wf_frames, wf_rx_mailed,
+		    wf_rx_short);
+		for (unsigned i = 0; i < WF_MAIL; i++) {   /* the answer, under whatever event ID it came, sits here unsaid */
+			const struct wf_mail *m = &wf_mail[i];
+
+			if (m->full) {
+				redwood_host_keep_add("connsys: step 14: the mailbox's slot %u: event %#x seq %u, %u bytes: %02x%02x %02x%02x "
+				    "%02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x", i, m->eid,
+				    m->seq, m->length, m->body[0], m->body[1], m->body[2], m->body[3], m->body[4], m->body[5], m->body[6], m->body[7],
+				    m->body[8], m->body[9], m->body[10], m->body[11], m->body[12], m->body[13], m->body[14], m->body[15], m->body[16],
+				    m->body[17], m->body[18], m->body[19], m->body[20], m->body[21], m->body[22], m->body[23]);
+			}
+		}
 		return false;
 	}
 	/* EVENT_NIC_CAPABILITY_V2: the elements' count, then each a tag, a length and its body */
