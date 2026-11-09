@@ -480,10 +480,15 @@ buffer_pa(const uint8_t *buffers, unsigned index)
 static void
 queue_resume(uint32_t qcsr)              /* nudge the QMU to look at the GPD just armed */
 {
-	if (mac_read(qcsr) & Q_ACTIVE) {
+	/* mtu3_qmu_resume(), word for word: RESUME, and if the queue did not go ACTIVE on it,
+	 * RESUME again. Never Q_START -- the queues were started once at SET_CONFIGURATION, and
+	 * a start written into an idle started queue is not a wake-up word at all: run 7's
+	 * console stream sent its first frame and then not one more, three hundred seconds of
+	 * GPDs armed and never fetched, while the receive queue -- never allowed to idle -- ran
+	 * the same helper happy the whole time. */
+	mac_write(qcsr, Q_RESUME);
+	if (!(mac_read(qcsr) & Q_ACTIVE)) {
 		mac_write(qcsr, Q_RESUME);
-	} else {
-		mac_write(qcsr, Q_START);
 	}
 }
 
