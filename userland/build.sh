@@ -458,6 +458,15 @@ for module in ../fw-camera/com.qti.sensormodule.redwood_*.bin; do
 	mkdir -p root/fw
 	../tools/camsensor.py "$module" "root/fw/camera-$sensor.tab" >/dev/null
 done
+# ... and the CONNSYS firmware (Wi-Fi, Bluetooth; bsd/dev/redwood_connsys.c, connsys_step=5): the
+# phone's own /vendor/firmware, taken off it into ../xnu-deps/build/connsys-fw (never in the
+# repository). 1.5 MB, small enough to travel with the kernel: connsys_file() reads fw/connsys of
+# this image when the root's /fw/connsys has none, and a run does not wait for the 2.5 GB system
+# image to be rewritten for a firmware that changed.
+if [ -d ../xnu-deps/build/connsys-fw/firmware ]; then
+	mkdir -p root/fw/connsys
+	install -m 0644 ../xnu-deps/build/connsys-fw/firmware/* root/fw/connsys/
+fi
 # ... and with ADSP=1 the image of the audio DSP, from the same place into ../fw-audio (bsd/dev/redwood_adsp.c):
 # adsp.mdt and adsp.b02 to adsp.b36, 20 MB. Only when asked for: beside GL=1 the payload would be more than the 64 MB
 # the loader takes.
@@ -612,9 +621,10 @@ if [ -f $IOS/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 		mkdir -p sysroot/fw
 		cp ../fw-audio/aw882xx_acf.bin sysroot/fw/
 	fi
-	# the Infinix's CONNSYS firmware (Wi-Fi, Bluetooth), the phone's own /vendor/firmware taken off it through root
-	# into ../xnu-deps/build/connsys-fw (never in the repository): /fw/connsys, where bsd/dev/redwood_connsys.c reads
-	# it once the root is mounted (connsys_step=5)
+	# the CONNSYS firmware (Wi-Fi, Bluetooth), the phone's own /vendor/firmware taken off it through root
+	# into ../xnu-deps/build/connsys-fw (never in the repository): /fw/connsys of the system image, where
+	# bsd/dev/redwood_connsys.c reads it once the root is mounted (connsys_step=5; the small image's
+	# fw/connsys, built above, answers only when this image has none)
 	if [ -d ../xnu-deps/build/connsys-fw/firmware ]; then
 		mkdir -p sysroot/fw/connsys
 		cp ../xnu-deps/build/connsys-fw/firmware/* sysroot/fw/connsys/

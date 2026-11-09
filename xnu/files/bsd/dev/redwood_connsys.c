@@ -327,7 +327,10 @@ connsys_power_on(vm_offset_t spm)
 /*
  * Step 5 (connsys_step=5): the firmware into CONNSYS's memory, as mtk_wcn_soc_rom_patch_dwn
  * (core/wmt_ic_soc.c) does it, and its CPU let go. Each of the phone's soc1_0_*_hdr.bin files
- * (/vendor/firmware, in the system image as /fw/connsys: userland/build.sh) is a 48-byte struct
+ * (/vendor/firmware, put by userland/build.sh into the system image as /fw/connsys and into the
+ * small RAM image as fw/connsys -- connsys_file() tries the root first and the RAM image second,
+ * so a run does not wait for the 2.5 GB system to be rewritten for a firmware that changed) is a
+ * 48-byte struct
  * wmt_rom_patch (core/include/wmt_core.h) -- whose u4PatchAddr is where CONNSYS sees it, 0xf0000000 being
  * the start of its memory (CONSYS_EMI_FW_PHY_BASE against CONSYS_EMI_AP_PHY_BASE, include/mt6785.h) --
  * and then its body, copied there: the MCU's RAM code at 0, its ROM patch at 0x1c000, Bluetooth's at
@@ -347,6 +350,33 @@ SYSCTL_STRING(_kern_redwood, OID_AUTO, connsys, CTLFLAG_RD | CTLFLAG_LOCKED, con
 #define CONNSYS_EMI_PHYS        REDWOOD_CONNSYS_EMI_PHYS
 #define CONNSYS_EMI_SIZE        REDWOOD_CONNSYS_EMI_SIZE
 
+/*
+ * The root's /fw/connsys (the system image of the flash) is not the only place the firmware can
+ * be: fw/connsys of the small RAM image that travels with the kernel has it too (userland/build.sh
+ * puts the same files there), read out of the RAM disk's own memory by redwood_image.c -- the way
+ * redwood_adreno.c and redwood_adsp.c read theirs. That image keeps what it reads, so the caller
+ * gets a copy of its own to free, as it does the root's.
+ */
+extern const uint8_t *redwood_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
+static uint8_t *
+connsys_image_file(const char *name, uint32_t *size)
+{
+	uint64_t length = 0;
+	const uint8_t *found = redwood_image_file("fw/connsys", name, &length, NULL);
+	uint8_t *data;
+
+	if (found == NULL || length < 48 || length > CONNSYS_EMI_SIZE) {
+		return NULL;
+	}
+	data = kalloc_data((vm_size_t)length, Z_WAITOK);
+	if (data == NULL) {
+		return NULL;
+	}
+	memcpy(data, found, (size_t)length);
+	*size = (uint32_t)length;
+	return data;
+}
+
 static uint8_t *
 connsys_file(const char *name, uint32_t *size)
 {
@@ -359,7 +389,7 @@ connsys_file(const char *name, uint32_t *size)
 
 	snprintf(path, sizeof(path), "/fw/connsys/%s", name);
 	if (vnode_lookup(path, 0, &vnode, context) != 0) {
-		return NULL;
+		return connsys_image_file(name, size);
 	}
 	VATTR_INIT(&attributes);
 	VATTR_WANTED(&attributes, va_data_size);
@@ -1070,7 +1100,7 @@ connsys_pda_patch(void)
 		free_file = true;
 	}
 	if (file == NULL || size <= 28 + 2) {
-		redwood_host_keep_add("connsys: step 9 [%u ms]: /fw/connsys/soc1_0_patch_mcu_2a_1_hdr.bin: not read", connsys_ms());
+		redwood_host_keep_add("connsys: step 9 [%u ms]: soc1_0_patch_mcu_2a_1_hdr.bin: not read (neither /fw/connsys of the root nor fw/connsys of the small image)", connsys_ms());
 		if (file != NULL && free_file) {
 			kfree_data(file, size);
 		}
@@ -1454,7 +1484,7 @@ connsys_firmware_thread(__unused void *parameter, __unused wait_result_t result)
 		file = connsys_file(files[i], &size);
 
 		if (file == NULL) {
-			redwood_host_keep_add("connsys: step 5 [%u ms]: /fw/connsys/%s: not read", connsys_ms(), files[i]);
+			redwood_host_keep_add("connsys: step 5 [%u ms]: %s: not read (neither /fw/connsys of the root nor fw/connsys of the small image)", connsys_ms(), files[i]);
 			thread_terminate(current_thread());
 			return;
 		}
