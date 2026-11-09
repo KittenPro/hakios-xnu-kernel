@@ -75,7 +75,8 @@ extern void delay_for_interval(uint32_t interval, uint32_t scale_factor);
 #define PHY_ACR6        0x318            /* OTG_VBUSCMP_EN, bit 20 */
 #define PHY_ACR4        0x320            /* RG_USB20_* bits 18..16, 9, 8 */
 #define PHY_DTM0        0x368            /* RG_UART_MODE 30, FORCE_UART_EN 26, FORCE_SUSPENDM 18 */
-#define PHY_DTM1        0x36c            /* RG_UART_EN 16, VBUSVALID 13, SESSEND 12, AVALID 10 */
+#define PHY_DTM1        0x36c            /* UART_EN 16; FORCE bits 13/12/10 enable the RG overrides:
+                                         * RG_VBUSVALID 5, RG_SESSEND 4, RG_AVALID 2 are the values */
 
 /* IPPC, the IP block's own power and reset */
 #define IPPC_PW_CTRL0   0x00             /* bit 0 SSUSB_IP_SW_RST: pulse to reset the whole IP */
@@ -1113,10 +1114,30 @@ usbnet_rx_poll(void)
 static void
 usbnet_thread(__unused void *parameter, __unused wait_result_t result)
 {
+	uint32_t last_csr = 0, last_intr = 0, last_link = 0, last_power = 0, last_conf = 0;
+	unsigned tick = 0, beats = 0;
+
 	for (;;) {
 		usbnet_bus_poll();
 		usbnet_ep0_poll();
 		usbnet_rx_poll();
+		/* the pulse (usb_trace): run 3's whole wire story was invisible -- the pullup never
+		 * reached the host and the MAC never saw one byte, and nothing said which. Now any
+		 * change of the EP0 status, the bus interrupts, the link, the pullup or the speed
+		 * is a line, and one line every five seconds says the thread is alive. */
+		if (usb_trace && !usbnet_configured) {
+			uint32_t csr = mac_read(REG_EP0CSR), intr = mac_read(REG_USB_INTR);
+			uint32_t link = mac_read(REG_DEV_LINK_INTR), power = mac_read(REG_POWER_MGMT);
+			uint32_t conf = mac_read(REG_DEVICE_CONF);
+			tick++;
+			if (csr != last_csr || intr != last_intr || link != last_link ||
+			    power != last_power || conf != last_conf || (tick % 5000) == 0) {
+				printf("usb: beat %u: EP0CSR %#x, INTR %#x, LINK %#x, POWER %#x, CONF %#x\n",
+				    ++beats, csr, intr, link, power, conf);
+				last_csr = csr; last_intr = intr; last_link = link;
+				last_power = power; last_conf = conf;
+			}
+		}
 		delay_for_interval(1, NSEC_PER_MSEC);
 	}
 }
@@ -1202,7 +1223,20 @@ redwood_usbnet_init(void)
 	sif_write(PHY_ACR6, sif_read(PHY_ACR6) & ~(1u << 20));
 	sif_write(PHY_DTM0, sif_read(PHY_DTM0) & ~(1u << 18));
 	delay_for_interval(800, NSEC_PER_USEC);
-	sif_write(PHY_DTM1, sif_read(PHY_DTM1) | (1u << 13) | (1u << 12) | (1u << 10));
+	/* VBUS said by hand: a peripheral may not connect until it sees VBUS, and this board's
+	 * sense line goes nowhere the driver can read. The FORCE bits only *enable* the overrides
+	 * (phy-mtk-ssusb-reg.h: FORCE at 13/12/10, the values RG_VBUSVALID/RG_SESSEND/RG_AVALID at
+	 * 5/4/2) -- run 3 set the enables and left the values at whatever the boot loader kept, a
+	 * "no VBUS" the SOFT_CONN pullup then politely obeyed: the host never saw a thing. */
+	{
+		uint32_t dtm1 = sif_read(PHY_DTM1);
+		dtm1 |= (1u << 13) | (1u << 5);   /* VBUS valid: forced, and said */
+		dtm1 |= (1u << 10) | (1u << 2);   /* A valid: forced, and said */
+		dtm1 |= (1u << 12);               /* session end: forced... */
+		dtm1 &= ~(1u << 4);               /* ...to "no session end" */
+		sif_write(PHY_DTM1, dtm1);
+		printf("usb: DTM1 now %#x\n", sif_read(PHY_DTM1));
+	}
 
 	/* the IP block's own power: on, the U2 port a device, a reset pulse once it is alive */
 	ippc_write(IPPC_PW_CTRL2, ippc_read(IPPC_PW_CTRL2) & ~1u);
