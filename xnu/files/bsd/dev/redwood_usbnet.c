@@ -62,8 +62,10 @@ extern void delay_for_interval(uint32_t interval, uint32_t scale_factor);
 #define REG_APMIXED_CG  0x020           /* write-one-to-set, read for status */
 #define APMIXED_SSUSB26M (1u << 4)      /* the device's "ref_ck": 26 MHz for the SSUSB */
 
-/* the two SSUSB clock gates of INFRA2: set-only register, bit set = clock on (clk-mt6785.c) */
-#define INFRA2_CG_SET   0x0a4
+/* the two SSUSB clock gates of INFRA2: a power-down bank (clk-mt6785.c's INFRA_PDN_SET2/CLR2/STA2,
+ * +0xa4/+0xa8/+0xac) -- a bit SET is the clock OFF; mtk_clk_gate_ops_setclr's enable writes the
+ * bit to the CLR bank. The connsys driver ungates CCIF4 the same way (INFRA3_CLR, +0xc4). */
+#define INFRA2_CG_CLR   0x0a8
 #define INFRA2_CG_STA   0x0ac
 #define INFRA_USB       (1u << 1)
 #define INFRA_SSUSB_XHCI (1u << 31)
@@ -1137,8 +1139,8 @@ usbnet_wait(uint32_t offset, uint32_t bit, const char *what)
 		}
 		delay_for_interval(10, NSEC_PER_USEC);
 	}
-	printf("usb: %s never came (STS1 %#x, STS2 %#x)\n", what,
-	    ippc_read(IPPC_PW_STS1), ippc_read(IPPC_PW_STS2));
+	printf("usb: %s never came (STS1 %#x, STS2 %#x, U2 %#x)\n", what,
+	    ippc_read(IPPC_PW_STS1), ippc_read(IPPC_PW_STS2), ippc_read(IPPC_U2_CTRL));
 	return false;
 }
 
@@ -1174,14 +1176,17 @@ redwood_usbnet_init(void)
 	 * APMIXED 26 MHz reference the device's "ref_ck" is, and the usb_top_sel mux the sys clock
 	 * hangs from (read only: its parents, clk26m and univpll divisions, are all alive at boot).
 	 * What the boot loader left behind is said first: run 1's IPPC read zero with the gates
-	 * already open, and these are the three things between the gates and a living block. */
-	printf("usb: as the boot left it: CK_CFG_8 %#x, APMIXED %#x, IPPC %#x/%#x/%#x\n",
+	 * "open" (0x80000002 -- read as on, meaning off: the bank is a power-down bank), and these
+	 * are the things between the gates and a living block. */
+	printf("usb: as the boot left it: CK_CFG_8 %#x, APMIXED %#x, INFRA2 %#x, IPPC %#x/%#x/%#x\n",
 	    top_read(REG_CKCFG8), apm_read(REG_APMIXED_CG),
+	    *(volatile uint32_t *)(usb_infra + INFRA2_CG_STA),
 	    ippc_read(IPPC_PW_STS1), ippc_read(IPPC_PW_STS2), ippc_read(IPPC_U2_CTRL));
-	*(volatile uint32_t *)(usb_infra + INFRA2_CG_SET) = INFRA_USB | INFRA_SSUSB_XHCI;
+	/* the gates: a power-down bank, so the bit goes to the CLEAR bank to open the clock */
+	*(volatile uint32_t *)(usb_infra + INFRA2_CG_CLR) = INFRA_USB | INFRA_SSUSB_XHCI;
 	apm_write(REG_APMIXED_CG, apm_read(REG_APMIXED_CG) | APMIXED_SSUSB26M);
 	delay_for_interval(250, NSEC_PER_USEC);
-	printf("usb: clocks on: INFRA2 %#x, APMIXED %#x\n",
+	printf("usb: clocks on: INFRA2 %#x (the two bits clear), APMIXED %#x\n",
 	    *(volatile uint32_t *)(usb_infra + INFRA2_CG_STA), apm_read(REG_APMIXED_CG));
 
 	/* the whole IP out of any reset the boot loader left it in (ssusb_ip_sw_reset) */
