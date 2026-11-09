@@ -15,7 +15,7 @@
  *   12  driver own (CONN_HIF_ON_LPCTL), the rings set up as halWpdmaInitRing does -- TX 3 for the download, RX 1
  *       for the ROM's events -- and the ROM asked for the hardware's and firmware's versions (INIT_CMD_ID_ACCESS_REG
  *       of TOP_HVR and TOP_FVR, wlanSetChipEcoInfo: "HW[0x00008a00] SW[0x00008a00]" on Android)
- *   13  WIFI_RAM_CODE_soc1_0_1a_1.bin in, region by region (its tailer: five): three through the DMA (a
+ *   13  WIFI_RAM_CODE in (rosemary's soc1_0_2a_1.bin, or the Infinix's 1a_1), region by region (its tailer: five): three through the DMA (a
  *       DOWNLOAD_CONFIG, answered, then 2 KB at a time) and two copied into CONNSYS's memory, then WIFI_START,
  *       answered, and the firmware's ready bits (sw_sync0)
  *   14  the running firmware's commands (TX 15, a 64-byte WIFI_CMD header; its events on RX 1 behind a 16-byte RX
@@ -480,13 +480,16 @@ wf_step13(void)
 {
 	const uint32_t began = wf_ms();
 	uint32_t size = 0, entry = 0, at = 0, sync = 0;
-	uint8_t *file = redwood_connsys_file("WIFI_RAM_CODE_soc1_0_1a_1.bin", &size);
+	uint8_t *file = redwood_connsys_file("WIFI_RAM_CODE_soc1_0_2a_1.bin", &size);
 	unsigned regions;
 	int status = -1;
 	bool ok = true;
 
+	if (file == NULL) {                     /* the Infinix's own image, whose name the step was written against */
+		file = redwood_connsys_file("WIFI_RAM_CODE_soc1_0_1a_1.bin", &size);
+	}
 	if (file == NULL || size < 36 + 40) {
-		redwood_host_keep_add("connsys: step 13: no /fw/connsys/WIFI_RAM_CODE_soc1_0_1a_1.bin");
+		redwood_host_keep_add("connsys: step 13: no /fw/connsys/WIFI_RAM_CODE (rosemary's soc1_0_2a_1 nor the Infinix's 1a_1)");
 		return false;
 	}
 	/* the tailer (wlanGetConnacTailerInfo): 36 bytes at the end, the regions' 40 each before it */
