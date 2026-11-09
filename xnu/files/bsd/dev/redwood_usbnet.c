@@ -72,9 +72,16 @@ extern void delay_for_interval(uint32_t interval, uint32_t scale_factor);
 
 /* the PHY, SIF-relative */
 #define PHY_PHYA_REG1   0xb04            /* VUSB10 on, bit 29 */
-#define PHY_ACR6        0x318            /* OTG_VBUSCMP_EN, bit 20 */
-#define PHY_ACR4        0x320            /* RG_USB20_* bits 18..16, 9, 8 */
-#define PHY_DTM0        0x368            /* RG_UART_MODE 30, FORCE_UART_EN 26, FORCE_SUSPENDM 18 */
+#define PHY_FMCR0       0x100            /* FREQDET_EN 24, CYCLECNT 23..0 (the frequency meter, sif +0x100) */
+#define PHY_FMMONR0     0x10c            /* FM_OUT, the measurement */
+#define PHY_FMMONR1     0x110            /* FRCK_EN 8, the free run clock */
+#define PHY_ACR5        0x314            /* SRCAL_EN 15, SRCTRL 14..12 */
+#define PHY_ACR6        0x318            /* BC11_SW_EN 23, OTG_VBUSCMP_EN 20, DISCTH 7..4 */
+#define PHY_ACR4        0x320            /* DP_100K_MODE 18, DM/DP_100K_EN 17/16, GPIO_CTL 9, GPIO_MODE 8 */
+#define PHY_DTM0        0x368            /* RG_UART_MODE 31..30, FORCE_UART_EN 26, FORCE_DATAIN 23,
+                                         * FORCE_DM/DP_PULLDOWN 21/20, FORCE_XCVRSEL 19, FORCE_SUSPENDM 18,
+                                         * FORCE_TERMSEL 17, RG_DATAIN 13..10, RG_DMPULLDOWN 7, RG_DPPULLDOWN 6,
+                                         * RG_XCVRSEL 5..4, RG_TERMSEL 2 */
 #define PHY_DTM1        0x36c            /* UART_EN 16; FORCE bits 13/12/10 enable the RG overrides:
                                          * RG_VBUSVALID 5, RG_SESSEND 4, RG_AVALID 2 are the values */
 
@@ -1215,13 +1222,32 @@ redwood_usbnet_init(void)
 	delay_for_interval(1, NSEC_PER_USEC);
 	ippc_write(IPPC_PW_CTRL0, ippc_read(IPPC_PW_CTRL0) & ~1u);
 
-	/* the PHY: its LDO on, then out of the UART mode the boot loader leaves it in */
+	/* the PHY, the way phy-mtk's phy_recover() brings it out of whatever the boot left.
+	 * A savecurrent'ed PHY sits with both pull-downs, the FS termination and an SE0 drive
+	 * forced on -- DTM0's RG_DPPULLDOWN/RG_DMPULLDOWN, RG_XCVRSEL, RG_TERMSEL, RG_DATAIN
+	 * and every FORCE behind them (bits 23..16 and 7..2): a zombie that still owns its
+	 * pullup but cannot hear a word. The host saw exactly that in runs 3 and 4 -- a
+	 * full-speed attach (TERMSEL forced to the FS termination) whose every descriptor
+	 * read died -EPROTO -- and the phone's MAC saw nothing at all. What the boot left
+	 * is said first: the proof or the alibi. */
+	printf("usb: the PHY as the boot left it: DTM0 %#x, DTM1 %#x, ACR4 %#x, ACR6 %#x\n",
+	    sif_read(PHY_DTM0), sif_read(PHY_DTM1), sif_read(PHY_ACR4), sif_read(PHY_ACR6));
+	/* the LDO, out of UART mode, and every transceiver force and pull on the floor */
 	sif_write(PHY_PHYA_REG1, sif_read(PHY_PHYA_REG1) | (1u << 29));
-	sif_write(PHY_DTM0, sif_read(PHY_DTM0) & ~((1u << 26) | (1u << 30)));
-	sif_write(PHY_DTM1, sif_read(PHY_DTM1) & ~(1u << 16));
-	sif_write(PHY_ACR4, sif_read(PHY_ACR4) & ~((1u << 18) | (1u << 17) | (1u << 16) | (1u << 9) | (1u << 8)));
-	sif_write(PHY_ACR6, sif_read(PHY_ACR6) & ~(1u << 20));
-	sif_write(PHY_DTM0, sif_read(PHY_DTM0) & ~(1u << 18));
+	sif_write(PHY_DTM0, sif_read(PHY_DTM0) & ~(0xc0000000u |  /* RG_UART_MODE */
+	    (1u << 26) |                                          /* FORCE_UART_EN */
+	    (1u << 18) |                                          /* FORCE_SUSPENDM */
+	    (1u << 23) |                                          /* FORCE_DATAIN */
+	    (1u << 21) | (1u << 20) |                             /* FORCE_DM/DP_PULLDOWN */
+	    (1u << 19) | (1u << 17) |                             /* FORCE_XCVRSEL, FORCE_TERMSEL */
+	    (1u << 7) | (1u << 6) |                               /* RG_DMPULLDOWN, RG_DPPULLDOWN */
+	    (1u << 5) | (1u << 4) |                               /* RG_XCVRSEL */
+	    (1u << 2) | 0x3c00u));                                /* RG_TERMSEL, RG_DATAIN */
+	sif_write(PHY_DTM1, sif_read(PHY_DTM1) & ~(1u << 16));   /* RG_UART_EN */
+	/* the 100K and GPIO choices of phy_init_soc: the DP mode bit on, the rest off */
+	sif_write(PHY_ACR4, (sif_read(PHY_ACR4) & ~((1u << 17) | (1u << 16) | (1u << 9) | (1u << 8))) | (1u << 18));
+	/* BC1.2 and the VBUS comparator off, the disconnect threshold where Linux puts it (0x7) */
+	sif_write(PHY_ACR6, (sif_read(PHY_ACR6) & ~((1u << 23) | (1u << 20))) | (7u << 4));
 	delay_for_interval(800, NSEC_PER_USEC);
 	/* VBUS said by hand: a peripheral may not connect until it sees VBUS, and this board's
 	 * sense line goes nowhere the driver can read. The FORCE bits only *enable* the overrides
@@ -1236,6 +1262,37 @@ redwood_usbnet_init(void)
 		dtm1 &= ~(1u << 4);               /* ...to "no session end" */
 		sif_write(PHY_DTM1, dtm1);
 		printf("usb: DTM1 now %#x\n", sif_read(PHY_DTM1));
+	}
+	/* the TX slew rate: Linux measures the PHY's ring oscillator against the 26 MHz
+	 * reference and writes the quotient into ACR5 (phy_slew_rate_calibration, the
+	 * frequency meter at the SIF's own +0x100, cycle count 0x400). An uncalibrated
+	 * transmitter is mush the host reads as babble; FM_OUT of zero takes Linux's own
+	 * fallback, SRCTRL 4. */
+	{
+		uint32_t fm_out = 0, srctrl;
+
+		sif_write(PHY_ACR5, sif_read(PHY_ACR5) | (1u << 15));       /* the ring oscillator on */
+		delay_for_interval(1, NSEC_PER_USEC);
+		sif_write(PHY_FMMONR1, sif_read(PHY_FMMONR1) | (1u << 8));  /* the free run clock */
+		sif_write(PHY_FMCR0, (sif_read(PHY_FMCR0) & ~0xffffffu) | 0x400u);
+		sif_write(PHY_FMCR0, sif_read(PHY_FMCR0) | (1u << 24));     /* measure */
+		for (unsigned i = 0; i < 10; i++) {
+			delay_for_interval(1, NSEC_PER_MSEC);
+			fm_out = sif_read(PHY_FMMONR0);
+			if (fm_out != 0) {
+				break;
+			}
+		}
+		sif_write(PHY_FMCR0, sif_read(PHY_FMCR0) & ~(1u << 24));
+		sif_write(PHY_FMMONR1, sif_read(PHY_FMMONR1) & ~(1u << 8));
+		srctrl = fm_out ? (1024u * 26u * 28u) / (fm_out * 1000u) : 4u;
+		if (srctrl > 7u) {
+			srctrl = 7u;
+		}
+		sif_write(PHY_ACR5, (sif_read(PHY_ACR5) & ~(7u << 12)) | (srctrl << 12));
+		sif_write(PHY_ACR5, sif_read(PHY_ACR5) & ~(1u << 15));      /* the ring oscillator off */
+		printf("usb: the PHY calibrated: FM_OUT %u -> SRCTRL %u; now ACR5 %#x, DTM0 %#x, DTM1 %#x\n",
+		    fm_out, srctrl, sif_read(PHY_ACR5), sif_read(PHY_DTM0), sif_read(PHY_DTM1));
 	}
 
 	/* the IP block's own power: on, the U2 port a device, a reset pulse once it is alive */
