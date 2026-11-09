@@ -37,6 +37,7 @@
 #include <mach/vm_param.h>
 #include <pexpert/pexpert.h>
 #include <sys/kpi_mbuf.h>
+#include <sys/msgbuf.h>
 #include <sys/redwood_net.h>
 #include <sys/systm.h>
 #include <vm/vm_kern.h>
@@ -285,6 +286,12 @@ static uint32_t ep0_in_len, ep0_in_pos;
 static uint8_t ep0_out[512];
 static uint32_t ep0_out_want, ep0_out_got;
 
+/* the console over the cable: what the host's packet filter has let pass, and where the
+ * kernel's message buffer was the last time the thread looked */
+static bool usbnet_carrier;
+static bool usbnet_log_armed;
+static unsigned usbnet_log_cursor;
+
 /* the encapsulated response waiting for the host to read */
 static uint8_t rndis_response[64];
 static uint32_t rndis_response_len;
@@ -305,6 +312,7 @@ static uint32_t usbnet_fifo_limit;       /* in 512-byte units: TX's half of the 
 
 static void usbnet_start(void);
 static void usbnet_stop(void);
+static void usbnet_log_poll(void);
 
 static inline uint32_t
 mac_read(uint32_t offset)
@@ -603,6 +611,10 @@ rndis_process(uint8_t *message, uint32_t length)
 
 				printf("usb: the host set the packet filter 0x%x: the cable %s a carrier\n",
 				    filter, filter ? "is" : "is no longer");
+				usbnet_carrier = filter != 0;
+				if (!usbnet_carrier) {
+					usbnet_log_armed = false;    /* a fresh carrier streams from its own moment */
+				}
 				redwood_net_link_state(filter != 0);
 			}
 		}
@@ -628,6 +640,8 @@ rndis_process(uint8_t *message, uint32_t length)
 		break;
 	case RNDIS_MSG_HALT:
 		rndis_response_len = 0;
+		usbnet_carrier = false;
+		usbnet_log_armed = false;
 		redwood_net_link_state(false);
 		return;                     /* no reply to HALT */
 	default:
@@ -1007,23 +1021,24 @@ usbnet_stop(void)
 	rndis_response_len = 0;
 	lck_mtx_unlock(&usbnet_lock);
 	if (was) {
+		usbnet_carrier = false;
+		usbnet_log_armed = false;
 		redwood_net_link_state(false);
 	}
 }
 
 /*
- * The link's transmit: one frame, wrapped in its RNDIS header, onto the bulk-in ring. Called
- * by the interface's output path (one thread at a time, net.c's net_tx_lock held there), so
- * the lock is all that keeps it from the thread's configure/teardown. False = dropped, and
- * the interface counts it.
+ * One frame, wrapped in its RNDIS header, onto the bulk-in ring. Two callers now -- the
+ * interface's output path and the thread's own console stream below -- and the lock is all
+ * that keeps them from each other. False = dropped, and the caller counts it.
  */
 static bool
-usbnet_transmit(mbuf_t packet, size_t length)
+usbnet_send_raw(const uint8_t *frame, uint32_t length)
 {
 	struct usbnet_gpd *gpd;
 	uint8_t *buffer;
-	unsigned total, bidx;
-	bool sent = false;
+	uint32_t total;
+	unsigned bidx;
 
 	if (!usbnet_on) {
 		return false;
@@ -1048,14 +1063,11 @@ usbnet_transmit(mbuf_t packet, size_t length)
 	bidx = tx_free[--tx_free_count];
 	buffer = tx_buffers + (size_t)bidx * BUFFER_SIZE;
 	put32(buffer, RNDIS_MSG_PACKET);
-	put32(buffer + 4, RNDIS_HEADER_SIZE + (uint32_t)length);
+	put32(buffer + 4, RNDIS_HEADER_SIZE + length);
 	put32(buffer + 8, 36);          /* the frame, from request_id + 36 = byte 44 */
-	put32(buffer + 12, (uint32_t)length);
-	if (mbuf_copydata(packet, 0, length, buffer + RNDIS_HEADER_SIZE) != 0) {
-		tx_free[tx_free_count++] = bidx;
-		goto out;
-	}
-	total = RNDIS_HEADER_SIZE + (uint32_t)length;
+	put32(buffer + 12, length);
+	memcpy(buffer + RNDIS_HEADER_SIZE, frame, length);
+	total = RNDIS_HEADER_SIZE + length;
 	dma_flush((vm_offset_t)buffer, total);
 	/* a transfer that fills its packets exactly needs a zero-length packet after it */
 	gpd = &tx_ring[tx_enq];
@@ -1064,10 +1076,27 @@ usbnet_transmit(mbuf_t packet, size_t length)
 	tx_gpd_buf[tx_enq] = bidx;
 	tx_enq = (tx_enq + 1) % RING_DEPTH;
 	queue_resume(REG_TXQCSR1);
-	sent = true;
+	lck_mtx_unlock(&usbnet_lock);
+	return true;
 out:
 	lck_mtx_unlock(&usbnet_lock);
-	return sent;
+	return false;
+}
+
+/*
+ * The link's transmit: called by the interface's output path (one thread at a time, net.c's
+ * net_tx_lock held there). The packet is copied; false = dropped, and the interface counts it.
+ */
+static bool
+usbnet_transmit(mbuf_t packet, size_t length)
+{
+	uint8_t frame[REDWOOD_NET_FRAME_MAX];
+
+	if (length == 0 || length > sizeof(frame) ||
+	    mbuf_copydata(packet, 0, length, frame) != 0) {
+		return false;
+	}
+	return usbnet_send_raw(frame, (uint32_t)length);
 }
 
 /*
@@ -1134,12 +1163,19 @@ static void
 usbnet_thread(__unused void *parameter, __unused wait_result_t result)
 {
 	uint32_t last_csr = 0, last_intr = 0, last_link = 0, last_power = 0, last_conf = 0;
-	unsigned tick = 0, beats = 0;
+	unsigned tick = 0, beats = 0, ms = 0;
 
 	for (;;) {
 		usbnet_bus_poll();
 		usbnet_ep0_poll();
 		usbnet_rx_poll();
+		/* the console over the cable: every 50 ms whatever the kernel has printed since
+		 * the last look, out through the bulk-in ring. The first frames this gadget has
+		 * ever sent are its own log. */
+		if (usb_trace && (ms % 50) == 0) {
+			usbnet_log_poll();
+		}
+		ms++;
 		/* the pulse (usb_trace): run 3's whole wire story was invisible -- the pullup never
 		 * reached the host and the MAC never saw one byte, and nothing said which. Now any
 		 * change of the EP0 status, the bus interrupts, the link, the pullup or the speed
@@ -1169,6 +1205,60 @@ static const struct redwood_net_link usbnet_link = {
 	.transmit = usbnet_transmit,
 	.poll = NULL,
 };
+
+/*
+ * The console over the cable (usb_trace): the kernel message buffer's new bytes, out as
+ * broadcast frames of ethertype 0x88b5 (local experimental 1), roughly 1400 bytes each, the
+ * first look catching up from the moment the carrier came up. The host reads them with
+ * tools/usblog-sniff.py on usb0 and watches the phone's log live -- the bring-up's log
+ * without the five-minute pstore cycle, and the first frames this gadget has ever sent.
+ * Best effort the way a console is: a full ring waits for the next tick, a message buffer
+ * the console has lapped is read from wherever the lapping left the newest end.
+ */
+static void
+usbnet_log_poll(void)
+{
+	static const uint8_t broadcast[6] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
+	uint8_t frame[14 + 1400];
+	struct msgbuf *mb;
+	uint32_t at, ahead, chunk, sent = 0;
+
+	if (!usbnet_carrier || !usbnet_configured || !usbnet_on) {
+		return;
+	}
+	mb = msgbufp;
+	if (mb == NULL || mb->msg_bufc == NULL || mb->msg_size < 128) {
+		return;
+	}
+	if (!usbnet_log_armed) {
+		usbnet_log_cursor = mb->msg_bufx;   /* stream from this moment on */
+		usbnet_log_armed = true;
+	}
+	for (;;) {
+		at = mb->msg_bufx;                  /* one writer; one look per frame */
+		ahead = (at - usbnet_log_cursor) % mb->msg_size;
+		if (ahead == 0 || sent >= 3) {
+			return;
+		}
+		if (ahead > mb->msg_size - 64) {    /* lapped: the newest kilobyte, then keep going */
+			usbnet_log_cursor = (at + mb->msg_size - 1024) % mb->msg_size;
+			continue;
+		}
+		chunk = ahead > 1400 ? 1400 : ahead;
+		memcpy(frame, broadcast, 6);
+		memcpy(frame + 6, usbnet_link.address, 6);
+		frame[12] = 0xb5;                   /* 0x88b5, local experimental 1 */
+		frame[13] = 0x88;
+		for (uint32_t i = 0; i < chunk; i++) {
+			frame[14 + i] = mb->msg_bufc[(usbnet_log_cursor + i) % mb->msg_size];
+		}
+		if (!usbnet_send_raw(frame, 14 + chunk)) {
+			return;                         /* the ring is full: the bytes wait for the next tick */
+		}
+		usbnet_log_cursor = (usbnet_log_cursor + chunk) % mb->msg_size;
+		sent++;
+	}
+}
 
 static bool
 usbnet_wait(uint32_t offset, uint32_t bit, const char *what)
