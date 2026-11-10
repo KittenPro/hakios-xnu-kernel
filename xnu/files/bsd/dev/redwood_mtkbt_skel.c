@@ -233,6 +233,48 @@ redwood_connsys_bt_send(const uint8_t *bytes, unsigned length)
  */
 static uint8_t skel_vsc_sub;            /* the first parameter of the last 0xfce2 command sent: its kind */
 
+/*
+ * ---- what this controller will not take from the host as it is ----
+ * The legacy LE scan commands are the pair the stack sends; rosemary's firmware answers Command Disallowed to both (skel_quirks says the
+ * answers done, which kept the stack alive in bt2e but the radio idle: not one unsolicited event in 300 s, and bt_test saw 0 devices).
+ * The Bluetooth 5 way is the extended pair; the stack's commands are rewritten to them on the way out and their answers back to the legacy
+ * opcodes on the way in, the status whatever it was said in the log -- the probe of whether this firmware scans the extended way at all --
+ * and then done (a refused scan must not fault the stack again, bt2d). The extended advertising report is LE meta subevent 0x0d, so the
+ * LE event mask the stack sets gains its bit; the reports themselves pass through as they are this round (the stack that asked the legacy
+ * way will not read them; the wire is what they are for).
+ */
+static unsigned
+skel_out_quirks(uint8_t *packet, unsigned length)
+{
+	if (length == 12 && packet[0] == 0x01 && packet[1] == 0x01 && packet[2] == 0x20 && packet[3] == 0x08) {
+		packet[5] |= 0x20;                   /* LE_Set_Event_Mask: bit 13, subevent 0x0d, the extended advertising report */
+	} else if (length == 11 && packet[0] == 0x01 && packet[1] == 0x0b && packet[2] == 0x20) {
+		/* LE_Set_Scan_Parameters -> LE_Set_Extended_Scan_Parameters: Scanning_PHYs (the 1M PHY) before the same seven bytes */
+		packet[11] = packet[10];
+		packet[10] = packet[9];
+		packet[9] = packet[8];
+		packet[8] = packet[7];
+		packet[7] = packet[6];
+		packet[6] = packet[5];
+		packet[5] = packet[4];
+		packet[4] = 0x01;
+		packet[3] = 0x08;
+		packet[1] = 0x41;
+		return 12;
+	} else if (length == 6 && packet[0] == 0x01 && packet[1] == 0x0c && packet[2] == 0x20) {
+		/* LE_Set_Scan_Enable -> LE_Set_Extended_Scan_Enable: the same two bytes, then duration and period, 0: no limit */
+		packet[6] = 0x00;
+		packet[7] = 0x00;
+		packet[8] = 0x00;
+		packet[9] = 0x00;
+		packet[3] = 0x06;
+		packet[1] = 0x42;
+		return 10;
+	}
+	return length;
+}
+
+
 static unsigned
 skel_quirks(uint8_t *packet, unsigned length)
 {
@@ -264,6 +306,24 @@ skel_quirks(uint8_t *packet, unsigned length)
 		packet[5] = 0x0c;
 		packet[6] = 0x00;
 		return 7;
+	}
+	if (length == 7 && packet[0] == 0x04 && packet[1] == 0x0e && packet[2] == 0x04 && packet[3] == 0x01 && packet[5] == 0x20 &&
+	    (packet[4] == 0x41 || packet[4] == 0x42)) {
+		/* the extended scan pair's Command Complete, back to the legacy opcode the stack asked with (skel_out_quirks sent it);
+		 * the status as the controller gave it is said -- the probe of the round -- and then done, whatever it was */
+		say("extended scan 0x20%02x answered %02x, said done", packet[4], packet[6]);
+		packet[4] = packet[4] == 0x41 ? 0x0b : 0x0c;
+		packet[6] = 0x00;
+	}
+	if (length == 7 && packet[0] == 0x04 && packet[1] == 0x0f && packet[2] == 0x04 && packet[3] == 0x01 && packet[6] == 0x20 &&
+	    (packet[5] == 0x41 || packet[5] == 0x42)) {
+		/* the same as a Command Status (an answer the firmware gives as "Unknown" to what it does not know), to the same legacy
+		 * Command Complete, status done, the native one said */
+		say("extended scan 0x20%02x answered %02x (Command Status), said done", packet[5], packet[4]);
+		packet[1] = 0x0e;
+		packet[4] = packet[5] == 0x41 ? 0x0b : 0x0c;
+		packet[5] = 0x20;
+		packet[6] = 0x00;
 	}
 	if (length == 7 && packet[0] == 0x04 && packet[1] == 0x0e && packet[2] == 0x04 && packet[3] == 0x01 && packet[5] == 0x20 &&
 	    packet[6] == 0x0c && (packet[4] == 0x0b || packet[4] == 0x0c)) {
@@ -590,6 +650,7 @@ skel_bridge(void)
 			if (n >= 5 && skel_packet[0] == 1 && skel_packet[1] == 0xe2 && skel_packet[2] == 0xfc) {
 				skel_vsc_sub = skel_packet[4];
 			}
+			n = skel_out_quirks(skel_packet, n);
 			skel_dump("out", skel_packet, n, &skel_said_out);
 			if (p->wake != NULL) {
 				p->wake();
