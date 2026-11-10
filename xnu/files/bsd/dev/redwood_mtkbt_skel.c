@@ -224,6 +224,10 @@ redwood_connsys_bt_send(const uint8_t *bytes, unsigned length)
  *    reads after the status -- a byte for 0xfd48, 16 for 0xfce2 with sub-command 0x15 or 0x36, 64 (the first 0x51) for 0xfd1b, none for the rest
  *    (data on 0xfce9 left the next command unsent).
  *  - Write_Default_Erroneous_Data_Reporting (0x0c5b), also "Unknown HCI Command", is answered as done.
+ *  - rosemary's firmware answers Command Disallowed (0x0c) to LE_Set_Scan_Parameters (0x200b) after the vendor sequence has run
+ *    (bt2d: every death is 21 ms after that answer; the sibling's firmware answered 0 and its scans ran). Apple's stack faults its
+ *    scan session on the error, so the status is said done. LE_Set_Scan_Enable (0x200c) never reached the wire in bt2d (the death
+ *    came first) and is taken the same way; each rewrite says so in the log.
  *  - Read_Local_Supported_Commands: the controller leaves the LE commands of octets 25-28 and LE Host Support of octet 24 clear although it
  *    answers them; bluetoothd looks in the mask before it sends one and gives up ("HCI initialization failed"). The bits are OR-ed in.
  */
@@ -260,6 +264,11 @@ skel_quirks(uint8_t *packet, unsigned length)
 		packet[5] = 0x0c;
 		packet[6] = 0x00;
 		return 7;
+	}
+	if (length == 7 && packet[0] == 0x04 && packet[1] == 0x0e && packet[2] == 0x04 && packet[3] == 0x01 && packet[5] == 0x20 &&
+	    packet[6] == 0x0c && (packet[4] == 0x0b || packet[4] == 0x0c)) {
+		say("0x20%02x answered Command Disallowed, said done", packet[4]);
+		packet[6] = 0x00;
 	}
 	if (length >= 7 + 64 && packet[0] == 0x04 && packet[1] == 0x0e && packet[2] == 0x44 && packet[4] == 0x02 && packet[5] == 0x10 && packet[6] == 0x00) {
 		for (unsigned i = 0; i < 4; i++) {
