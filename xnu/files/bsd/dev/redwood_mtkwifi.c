@@ -610,6 +610,8 @@ static unsigned wf_mail_next;
 static struct redwood_sta_bss *wf_heard;        /* what the last scan heard, WF_BSS_MOST of it at most */
 static unsigned wf_heard_count, wf_frames, wf_other_events, wf_rx_dropped, wf_rx_rejected, wf_rx_ethernets, wf_rx_mailed, wf_rx_short;
 static unsigned wf_join_beacons;        /* the network being joined: its beacons while the join runs (on its channel?) */
+static bool wf_join_active;             /* the join's window: what the access point answers, and to whom, goes on the record */
+static unsigned wf_mgmt_seen;
 /* what the joined network carried, said every 10 s while it is joined (wf_link_poll) */
 static struct {
 	unsigned tx, tx_failed, arp, udp, tcp, other, unicast, broadcast, clear, wtbl, error, said, dropped_said;
@@ -1305,6 +1307,13 @@ wf_rx_mgmt(const uint8_t *frame, uint32_t length)
 	const uint8_t subtype = frame[0] >> 4;
 
 	if (memcmp(frame + 10, wf_net.bssid, 6) != 0 || memcmp(frame + 4, wf_address, 6) != 0) {
+		/* the answer may not name us as we think we are -- while the join runs, every mismatched management
+		 * frame goes on the record: who sent it, to whom, what it is */
+		if (wf_join_active && wf_mgmt_seen++ < 8) {
+			redwood_host_keep_add("connsys: a management frame while joining: subtype %u, from %02x:%02x:%02x:%02x:%02x:%02x "
+			    "to %02x:%02x:%02x:%02x:%02x:%02x, %u bytes", subtype, frame[10], frame[11], frame[12], frame[13], frame[14],
+			    frame[15], frame[4], frame[5], frame[6], frame[7], frame[8], frame[9], length);
+		}
 		return;
 	}
 	wf_mgmt_heard++;
@@ -1605,6 +1614,8 @@ wf_join(const struct redwood_sta_join *what)
 		wf_net.wpa.rsn = wf_net.rsn;
 		wf_net.wpa.rsn_length = wf_net.rsn_length;
 	}
+	wf_join_active = true;
+	wf_mgmt_seen = 0;
 	redwood_host_keep_add("connsys: step 17 [%u ms]: joining %02x:%02x:%02x:..:%02x on channel %u (%d dBm, %s, rates %#x basic %#x)",
 	    wf_ms(), wf_net.bssid[0], wf_net.bssid[1], wf_net.bssid[2], wf_net.bssid[5], wf_net.channel, best->rssi, wf_net.secure ?
 	    "WPA2" : "open", wf_net.operational, wf_net.basic);
@@ -1718,9 +1729,11 @@ wf_join(const struct redwood_sta_join *what)
 	redwood_net_link_state(true);
 	redwood_host_keep_add("connsys: step 17 [%u ms]: THE NETWORK IS JOINED%s, %u ms in all", wf_ms(), wf_net.secure ?
 	    " AND ITS KEYS ARE IN" : "", wf_ms() - began);
+	wf_join_active = false;
 	return 0;
 
 failed:
+	wf_join_active = false;
 	(void)wf_channel(false);
 	{
 		const uint8_t remove[4] = { 0, 0, 0, 0 };     /* STA_REC_CMD_ACTION_STA, record 0, BSS 0 */
