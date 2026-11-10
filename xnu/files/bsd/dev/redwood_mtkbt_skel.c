@@ -266,6 +266,12 @@ skel_quirks(uint8_t *packet, unsigned length)
 			packet[7 + 25 + i] |= le_commands[i];
 		}
 		packet[7 + 24] |= 0x60;
+		packet[7 + 18] |= 0x08;
+		/* Write_Default_Erroneous_Data_Reporting's bit is octet 18 bit 3 of this answer (its read twin 0x0c5a is bit 2 next to it, and
+		 * bluetoothd's test reads the octet and bit its command descriptor names: "status=628" is that test failing). The sibling's firmware
+		 * set the bit and only its "Unknown HCI Command" answer needed rewriting (the rule above); rosemary's firmware leaves it clear, so
+		 * the stack never wrote the command at all and died of "HCI initialization failed" instead (bt2c: no 0x0c5b on the wire, the last
+		 * command of every cycle 0x0c31). */
 	}
 	return length;
 }
