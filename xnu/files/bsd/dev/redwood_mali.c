@@ -143,12 +143,46 @@ SYSCTL_PROC(_kern_redwood, OID_AUTO, say, CTLTYPE_STRING | CTLFLAG_WR | CTLFLAG_
  * run built (run 352) were in neither. A line written here goes into this buffer only (the writer says
  * in the log what it wants said there), and mtkloader puts the buffer into ramoops' pmsg zone when the
  * kernel comes back, by whatever way it does (its end, a panic, the watchdog), where Android shows it
- * as /sys/fs/pstore/pmsg-ramoops-0 and tools/xnu-cycle.sh appends it to the log. Lines that do not fit
- * are counted, not kept.
+ * as /sys/fs/pstore/pmsg-ramoops-0 and tools/xnu-cycle.sh appends it to the log. The buffer keeps the tail: a line that does
+ * not fit drops whole lines from the front (counted), so what a run's late moments said -- the watcher's reasons for its late
+ * deaths, which the console zone's own tail window does not reach either (bt2d lost every "restarting" after the first 64 KB) --
+ * is what survives.
  */
 #define HOST_KEEP_SIZE 0xff00          /* the pmsg zone is 64 KB, less its header and mtkloader's first line */
 char redwood_host_keep[HOST_KEEP_SIZE];
 uint32_t redwood_host_keep_len, redwood_host_keep_dropped;
+
+static void
+host_keep_append(const char *line, size_t length)
+{
+	if (length > sizeof(redwood_host_keep)) {
+		redwood_host_keep_dropped++;
+		return;
+	}
+	if (redwood_host_keep_len + length > sizeof(redwood_host_keep)) {
+		uint32_t from = 0;
+
+		while (redwood_host_keep_len - from + length > sizeof(redwood_host_keep)) {
+			uint32_t nl = from;
+
+			while (nl < redwood_host_keep_len && redwood_host_keep[nl] != '\n') {
+				nl++;
+			}
+			redwood_host_keep_dropped++;
+			if (nl >= redwood_host_keep_len) {
+				from = redwood_host_keep_len;   /* no newline: the front is a fragment, drop it all */
+				break;
+			}
+			from = nl + 1;
+		}
+		if (from != 0) {
+			memmove(redwood_host_keep, redwood_host_keep + from, redwood_host_keep_len - from);
+			redwood_host_keep_len -= from;
+		}
+	}
+	memcpy(redwood_host_keep + redwood_host_keep_len, line, length);
+	redwood_host_keep_len += (uint32_t)length;
+}
 
 static int
 host_keep_line(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
@@ -170,12 +204,7 @@ host_keep_line(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused i
 	}
 	line[length] = 0;
 	lck_mtx_lock(&kept_lock);
-	if (redwood_host_keep_len + length <= sizeof(redwood_host_keep)) {
-		memcpy(redwood_host_keep + redwood_host_keep_len, line, length);
-		redwood_host_keep_len += length;
-	} else {
-		redwood_host_keep_dropped++;
-	}
+	host_keep_append(line, length);
 	lck_mtx_unlock(&kept_lock);
 	return 0;
 }
@@ -199,12 +228,7 @@ redwood_host_keep_add(const char *format, ...)
 	length = strlen(line);
 	line[length++] = '\n';
 	lck_mtx_lock(&kept_lock);
-	if (redwood_host_keep_len + length <= sizeof(redwood_host_keep)) {
-		memcpy(redwood_host_keep + redwood_host_keep_len, line, length);
-		redwood_host_keep_len += (uint32_t)length;
-	} else {
-		redwood_host_keep_dropped++;
-	}
+	host_keep_append(line, length);
 	lck_mtx_unlock(&kept_lock);
 }
 SYSCTL_UINT(_kern_redwood, OID_AUTO, host_keep_len, CTLFLAG_RD | CTLFLAG_LOCKED, &redwood_host_keep_len, 0, "");
