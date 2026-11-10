@@ -65,7 +65,7 @@ diff --git a/bsd/conf/files b/bsd/conf/files
 index 44274016a4cf..5bcb397ff5ca 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -109,6 +109,48 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
+@@ -109,6 +109,50 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
  bsd/dev/unix_startup.c			standard
  
  bsd/dev/monotonic.c optional monotonic
@@ -77,6 +77,8 @@ index 44274016a4cf..5bcb397ff5ca 100644
 +bsd/dev/redwood_mtkkeys.c	standard
 +bsd/dev/redwood_mali.c	standard
 +bsd/dev/redwood_connsys.c	standard
++bsd/dev/redwood_btsk.c	standard
++bsd/dev/redwood_mtkbt_skel.c	standard
 +bsd/dev/redwood_mtkwifi.c	standard
 +bsd/dev/redwood_wpa.c	standard
 +bsd/dev/redwood_emmc.c	standard
@@ -1888,7 +1890,7 @@ diff --git a/iokit/conf/files b/iokit/conf/files
 index 5fb0a52062e0..468ffc7d0414 100644
 --- a/iokit/conf/files
 +++ b/iokit/conf/files
-@@ -79,6 +79,16 @@ iokit/Kernel/IOSubMemoryDescriptor.cpp			optional iokitcpp
+@@ -79,6 +79,17 @@ iokit/Kernel/IOSubMemoryDescriptor.cpp			optional iokitcpp
  iokit/Kernel/IOGuardPageMemoryDescriptor.cpp		optional iokitcpp
  
  iokit/Kernel/IOPlatformExpert.cpp			optional iokitcpp
@@ -1898,6 +1900,7 @@ index 5fb0a52062e0..468ffc7d0414 100644
 +iokit/Kernel/RedwoodGPU.cpp				optional iokitcpp
 +iokit/Kernel/RedwoodMali.cpp				optional iokitcpp
 +iokit/Kernel/RedwoodWLAN.cpp			optional iokitcpp
++iokit/Kernel/RedwoodBluetooth.cpp		optional iokitcpp
 +iokit/Kernel/RedwoodBattery.cpp			optional iokitcpp
 +iokit/Kernel/MiniAppleKeyStore.cpp			optional iokitcpp
 +iokit/Kernel/MiniIONetworkStack.cpp			optional iokitcpp

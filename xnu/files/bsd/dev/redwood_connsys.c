@@ -35,6 +35,7 @@
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <pexpert/pexpert.h>
+#include <sys/errno.h>
 #include <sys/redwood_input.h>
 #include <sys/systm.h>
 #include <sys/sysctl.h>
@@ -707,7 +708,7 @@ connsys_btif_write(const uint8_t *bytes, unsigned length)
 	}
 }
 
-static void
+void
 connsys_btif_wake(void)
 {
 	*(volatile uint32_t *)(connsys_btif + 0x64) &= ~1u;
@@ -732,6 +733,8 @@ connsys_btif_wake(void)
  */
 static bool connsys_stp_full;
 static uint8_t connsys_stp_seq, connsys_stp_ack, connsys_stp_expect;
+static unsigned connsys_stp_task = 4;     /* STP's channel a frame goes on and an answer is waited on: 4 WMT, 0 Bluetooth (BT_TASK_INDX) */
+static bool connsys_bt_ready;             /* the firmware thread done with BTIF for good: Bluetooth's from here (redwood_mtkbt_skel.c) */
 static vm_offset_t connsys_hif;         /* CONN_HIF_ON (0x18007000): CPUPCR at +0x104, the MCU's program counter */
 static vm_offset_t connsys_mcu;         /* MCU (0x18002000): mapped once for register dumps */
 static vm_offset_t connsys_rgu;         /* RGU (0x10007000): software reset at +0x18 */
@@ -813,12 +816,16 @@ connsys_btif_byte(unsigned wait_ms)
 static void
 connsys_stp_send(const uint8_t *payload, unsigned length)
 {
-	uint8_t frame[4 + 64 + 2];
+	uint8_t frame[4 + 1100 + 2];
 	uint16_t crc = connsys_stp_full ? connsys_crc16(payload, length) : 0;
+
+	if (length > 1100) {
+		return;
+	}
 
 	/* In mandatory mode, MediaTek STP header byte 0 is fixed 0x80 (no seq increment). */
 	frame[0] = (uint8_t)(0x80 | (connsys_stp_full ? ((connsys_stp_seq << 3) | connsys_stp_ack) : 0));
-	frame[1] = (uint8_t)((4 << 4) | ((length >> 8) & 0xf));
+	frame[1] = (uint8_t)((connsys_stp_task << 4) | ((length >> 8) & 0xf));
 	frame[2] = (uint8_t)length;
 	frame[3] = connsys_stp_full ? (uint8_t)(frame[0] + frame[1] + frame[2]) : 0;
 	memcpy(frame + 4, payload, length);
@@ -885,7 +892,7 @@ connsys_stp_receive(uint8_t *payload, unsigned room, char *heard, size_t heard_r
 			}
 		}
 		/* another of STP's channels (Bluetooth 0, GPS 2, its own 5...) is not WMT's answer: taken, acked and said */
-		if (((b1 >> 4) & 7) != 4) {
+		if (((b1 >> 4) & 7) != connsys_stp_task) {
 			used += (size_t)snprintf(heard + used, heard_room - used, " [type %u, %u bytes]", (b1 >> 4) & 7, length);
 			continue;
 		}
@@ -926,6 +933,7 @@ connsys_btif_dump_state(const char *tag)
 	    iir, ier, dma_en, sleep_en, tri_lvl, wak, handshake, fakelcr, cpupcr, mcu600, mcu16c);
 }
 
+static bool connsys_skip_foreign;       /* WMT answers: an event of another opcode than the command's is not its answer (firmware's own, e.g. 02 16 ..) */
 static unsigned connsys_answer_ms;      /* when not 0, how long the next answer may take in full mode (else 1 s) */
 
 static bool
@@ -976,6 +984,12 @@ connsys_wmt(const char *what, const uint8_t *command, unsigned length, const uin
 		    !((unsigned)got >= expected_length && memcmp(answer, expected, expected_length) == 0); more++) {
 			used = strlen(line);
 			snprintf(line + used, sizeof(line) - used, " [event %02x]", answer[5]);
+			got = connsys_stp_receive(answer, sizeof(answer), line, sizeof(line), wait_ms);
+		}
+		for (unsigned more = 0; more < 8 && connsys_skip_foreign && connsys_stp_task == 4 && got >= 5 && answer[0] == 0x02 &&
+		    expected_length >= 2 && answer[1] != expected[1]; more++) {
+			used = strlen(line);
+			snprintf(line + used, sizeof(line) - used, " [event %02x, %d bytes]", answer[1], got);
 			got = connsys_stp_receive(answer, sizeof(answer), line, sizeof(line), wait_ms);
 		}
 		if (got >= 0) {
@@ -1299,6 +1313,84 @@ connsys_sw_init(void)
 	if (connsys_step >= 12) {
 		redwood_mtkwifi_start(connsys_step);
 	}
+	/* The firmware thread's last word on STP: WMT is up and Wi-Fi runs on gen4m's own rings, not BTIF.
+	 * Whoever comes for Bluetooth (redwood_mtkbt_skel.c's thread) can own BTIF from here. */
+	connsys_bt_ready = true;
+}
+
+/*
+ * ---- Bluetooth for the skeleton (redwood_mtkbt_skel.c): this phone's platform ----
+ * What docs/bluetooth-mtk-porting.md asks of a port, on what the steps above have already done: the same
+ * MT6631 the Infinix's working driver talked to, its firmware up (steps 1 to 11) and STP in its full mode
+ * on BTIF. All of these run on the skeleton's one thread, and only after connsys_bt_ready.
+ */
+int
+connsys_bt_power_on(void)
+{
+	for (unsigned waited = 0; !connsys_bt_ready && waited < 600; waited++) {
+		delay_for_interval(100, NSEC_PER_MSEC);
+	}
+	if (!connsys_bt_ready) {
+		redwood_host_keep_add("connsys: bt: WMT never came up in 60 s: no Bluetooth");
+		return ENODEV;
+	}
+	return 0;
+}
+
+int
+connsys_bt_function_on(void)
+{
+	static const uint8_t on[] = { 0x01, 0x06, 0x02, 0x00, 0x00, 0x01 };
+	static const uint8_t on_done[] = { 0x02, 0x06, 0x01, 0x00, 0x00 };
+	bool ok;
+
+	/* WMT_FUNC_CTRL (wmt_core_func_ctrl_cmd, as wmt_func_bt_on sends it): type 0 is Bluetooth, 1 is on. The
+	 * firmware sends events of its own before the answer (an MT6631's were opcode 0x16): skip_foreign
+	 * takes them. Bluetooth's HCI is STP's channel 0 from here on. */
+	connsys_doing = 20;
+	connsys_stp_task = 4;
+	connsys_skip_foreign = true;
+	ok = connsys_wmt("BT on (WMT_FUNC_CTRL)", on, sizeof(on), on_done, sizeof(on_done));
+	connsys_skip_foreign = false;
+	delay_for_interval(50, NSEC_PER_MSEC);
+	connsys_stp_task = 0;
+	return ok ? 0 : EIO;
+}
+
+void
+connsys_bt_function_off(void)
+{
+	static const uint8_t off[] = { 0x01, 0x06, 0x02, 0x00, 0x00, 0x00 };
+
+	/* (wmt_func_bt_off's command with 0; the Infinix never sent it either, whose Bluetooth stays on) */
+	connsys_doing = 20;
+	connsys_stp_task = 4;
+	connsys_stp_send(off, sizeof(off));
+	delay_for_interval(50, NSEC_PER_MSEC);
+	connsys_stp_task = 0;
+}
+
+int
+connsys_bt_send(const uint8_t *h4, unsigned length)
+{
+	/* one whole H4 packet, its type byte first, as one STP frame's payload on channel 0 */
+	connsys_stp_task = 0;
+	connsys_stp_send(h4, length);
+	return 0;
+}
+
+int
+connsys_bt_receive(uint8_t *h4, unsigned room, unsigned wait_ms)
+{
+	char heard[220];
+	int got;
+
+	/* (what is not channel 0's is taken and acked by connsys_stp_receive itself; a timeout is "none came",
+	 * not an error -- the skeleton's probe reads less than zero as one) */
+	connsys_stp_task = 0;
+	heard[0] = 0;
+	got = connsys_stp_receive(h4, room, heard, sizeof(heard), wait_ms);
+	return got > 0 ? got : 0;
 }
 
 static void

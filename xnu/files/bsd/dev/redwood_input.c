@@ -236,6 +236,7 @@ redwood_input_init(void)
 	redwood_adreno_init();
 	redwood_mali_init();
 	redwood_connsys_init();
+	redwood_mtkbt_skel_init();
 	redwood_scp_init();
 	redwood_wifi_init();
 	redwood_adsp_init();
