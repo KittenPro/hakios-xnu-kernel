@@ -54,7 +54,7 @@ void redwood_mtkbt_skel_init(void);
 
 #define SKEL_TXQ                8192u           /* what bluetoothd has written and the controller has not been given yet */
 #define SKEL_FRAME              4096u           /* one packet from the controller */
-#define SKEL_SAID_PACKETS       96u             /* of each direction, said in the log: the host buffer is 64 KB and bluetoothd's own lines want it */
+#define SKEL_SAID_PACKETS       4096u           /* of each direction, said in the log: bt2's run stopped at 96 with bluetoothd's restart cycles unexplained (a Write_Default_Erroneous_Data_Reporting that its log says timed out, reason 108 "HCI initialization failed"), and the packets past the limit were the ones that would have said why */
 #define SKEL_ANSWER_MS          2000u           /* a command of the probe is given this long */
 
 /*
