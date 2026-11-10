@@ -1,0 +1,11 @@
+# Bluetooth's runs (BT=1): what is up once the daemons have had their start, and bt_test -- the state
+# CoreBluetooth reports and a scan, which is also what wakes bluetoothd through launchd (it is on-demand
+# here). Settings -> Bluetooth is the switch and the device list; the psgrep lines say whether
+# bluetoothd, BlueTool and the keybag daemons are running without touching the screen.
+sleep 60
+/redwood/bin/tolog /redwood/bin/psgrep bluetoothd BlueTool keybagd wifid securityd
+/redwood/bin/tolog /redwood/bin/bt_test 30
+sleep 30
+/redwood/bin/tolog /redwood/bin/psgrep bluetoothd BlueTool keybagd
+/redwood/bin/tolog /redwood/bin/bt_test 30
+

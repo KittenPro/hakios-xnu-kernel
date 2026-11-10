@@ -178,6 +178,10 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		$DYN -o obj/nullxpc src/nullxpc.c
 		$DYN -framework CoreFoundation -framework AudioToolbox -framework AVFoundation -lobjc -o obj/sound_test src/sound_test.c
 		$DYN -framework CoreFoundation -lMobileGestalt -o obj/mg_test src/mg_test.c
+		$DYN -fobjc-arc -framework Foundation -framework CoreBluetooth -sectcreate __TEXT __info_plist src/bt_test.plist \
+			-o obj/bt_test src/bt_test.m &&
+			{ ${LDID:-ldid} -Ssrc/bt_test.entitlements obj/bt_test 2>/dev/null ||
+			  echo "build.sh: no ldid: bt_test is unsigned, and TCC may not let it use Bluetooth"; }
 		$DYN -framework CoreFoundation -framework AVFoundation -lobjc -o obj/torch_test src/torch_test.c
 		$DYN -O2 -o obj/camera_test src/camera_test.c src/camera_isp.c
 		$DYN -fobjc-arc -framework Foundation -framework AVFoundation -o obj/camera_avtest src/camera_avtest.m
@@ -232,6 +236,12 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		$DYN -framework CoreFoundation -framework Security -o obj/wifipw_test src/wifipw_test.c &&
 			{ ${LDID:-ldid} -Ssrc/wifipw_test.entitlements obj/wifipw_test 2>/dev/null ||
 			  echo "build.sh: no ldid: wifipw_test is unsigned, and the keychain will refuse it (-34018)"; }
+		# (what a restore leaves for the key store, done once -- Bluetooth's runs (BT=1), where
+		# bluetoothd keeps its identity root in the keychain: signed with com.apple.keystore.device,
+		# for the kernel answers its bag selectors to no one else)
+		$DYN -framework CoreFoundation -framework IOKit -o obj/aks_restore src/aks_restore.c &&
+			{ ${LDID:-ldid} -Ssrc/aks_restore.entitlements obj/aks_restore 2>/dev/null ||
+			  echo "build.sh: no ldid: aks_restore is unsigned, and the kernel will refuse its bag selectors"; }
 		# our library for inside stock iOS programs (the jobs in INJECT are started with it)
 		$DYN -dynamiclib -install_name /redwood/lib/libredwood.dylib -framework CoreFoundation -framework IOKit -lobjc \
 			-o obj/libredwood.dylib src/inject.c
@@ -283,6 +293,8 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		# (a prebuilt/ from before a program has none of it either)
 		[ -f obj/$f ] && cp obj/$f root/bin/
 	done
+	[ -n "$BT" ] && [ -f obj/bt_test ] && cp obj/bt_test root/bin/     # (src/bt_test.m: CoreBluetooth's scan, for Bluetooth runs)
+	[ -n "$BT" ] && [ -f obj/aks_restore ] && cp obj/aks_restore root/bin/   # (src/aks_restore.c: the system bag, made before launchd)
 	[ -f obj/cpu_test ] && cp obj/cpu_test root/bin/        # (a prebuilt/ from before this program has none)
 	[ -f obj/cow_test ] && cp obj/cow_test root/bin/
 	[ -f obj/cg_test ] && cp obj/cg_test root/bin/
