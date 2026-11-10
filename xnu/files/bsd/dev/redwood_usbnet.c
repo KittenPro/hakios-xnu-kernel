@@ -1582,8 +1582,18 @@ redwood_usbnet_init(void)
 		    (uint32_t)kvtophys(dma_rings), (unsigned long long)kvtophys(dma_buffers));
 
 		usbnet_on = true;
-		if (!redwood_net_attach(&usbnet_link)) {
-			printf("usb: en0 was taken already: the link will idle\n");
+		{
+			uint32_t radio = 0;
+
+			/* One en0, and when the radio's station is coming for it (connsys_step 16 and on) the station
+			 * is first in line: iOS's Wi-Fi side asks en0 for a radio behind it, once, and gives up when
+			 * the answer is no -- so the cable's link stays off the interface and carries the console
+			 * alone. Nothing below (the thread, the log stream) needs anything of redwood_net.c. */
+			if (PE_parse_boot_argn("connsys_step", &radio, sizeof(radio)) && radio >= 16) {
+				printf("usb: en0 is the coming radio's (connsys_step %u): the cable carries the console only\n", radio);
+			} else if (!redwood_net_attach(&usbnet_link)) {
+				printf("usb: en0 was taken already: the link will idle\n");
+			}
 		}
 		if (kernel_thread_start(usbnet_thread, NULL, &thread) == KERN_SUCCESS) {
 			thread_set_thread_name(thread, "the cable's traffic");
