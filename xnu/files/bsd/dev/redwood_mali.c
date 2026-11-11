@@ -1232,9 +1232,13 @@ redwood_mali_wait(uint64_t seq, uint64_t timeout_ns)
  * mali_dump=N has the window client (RedwoodMali.cpp: a fragment submission whose buffers include
  * a display surface -- the pass that composites a frame) call this for its first N: the chain's job
  * headers, then the buffer it lives in as words at the addresses the GPU knows them by, blocks of
- * zeros left out and every value that points into another of the last buffers noted -- the
- * descriptors' own buffers, with the shaders in them, to fetch next. It all goes to the host's
- * keep (the pmsg zone): a run's console would lose the middle of it.
+ * zeros left out (the host's keep is 64 KB: at most 256 lines of it); then every value that points
+ * into another buffer gets its first 64 bytes said (mdp lines -- the render state and the texture
+ * descriptors), and the pointers in those, half a kilobyte each (mds lines -- the shader's code,
+ * which no descriptor of ours names smaller). The whole run's own sayings share the same 64 KB, so
+ * nothing else may be kept there the same run (run gpu4b: bluetoothd's os_log and the connsys
+ * packets between them dropped every md line, 668 of them, while the markers survived in the
+ * console's kept lines).
  */
 uint32_t mali_dump;
 
@@ -1288,6 +1292,8 @@ redwood_mali_dump(uint64_t chain)
 {
 	uint64_t window = 0;
 	uint64_t whole = 0;
+	uint64_t targets[32], deep[8];
+	uint32_t ntargets = 0, ndeep = 0;
 	uint32_t size = 0;
 	int own = -1;
 
@@ -1310,7 +1316,7 @@ redwood_mali_dump(uint64_t chain)
 		lck_mtx_unlock(&mali_lock);
 		return;
 	}
-	size = whole > 0x8000 ? 0x8000 : (uint32_t) whole;        /* (the jobs and their descriptors sit at the front) */
+	size = whole > 0x10000 ? 0x10000 : (uint32_t) whole;
 	/* said as a kept line as well: the console keeps a run's head and tail only, and this is said
 	 * in the middle of one (the md lines below are for the pmsg zone alone) */
 	redwood_keep("mali dump: chain %#llx, the buffer of %#llx bytes at %#llx: %u bytes of it kept for the host",
@@ -1324,52 +1330,112 @@ redwood_mali_dump(uint64_t chain)
 		if (job < window || job >= window + whole || !gpu_read(job, header, sizeof(header))) {
 			break;
 		}
-		dump_line("md job %llu at %#llx: next %#llx %016llx %016llx %016llx %016llx %016llx %016llx", n, job,
+		dump_line("md job %llu at %#llx: next %#llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx", n, job,
 		    header[0], header[1], header[2], header[3], header[4], header[5], header[6], header[7]);
 		job = header[0];
 	}
 
-	/* the buffer's words, blocks of four that are not all zero */
-	uint32_t blocks = 0;
+	/* the buffer's words, eight to a line, blocks of zeros left out. The host's keep is 64 KB and
+	 * the rest of it is wanted below, so no more than 256 lines of this: the count in the end
+	 * line says whether any of the buffer was left out (a wider dump the next run, then). */
+	uint32_t blocks = 0, shown = 0;
 
-	for (uint32_t at = 0; at + 32 <= size; at += 32) {
-		uint64_t words[4];
+	for (uint32_t at = 0; at + 64 <= size; at += 64) {
+		uint64_t words[8];
 
 		if (!gpu_read(window + at, words, sizeof(words))) {
 			break;
 		}
-		if ((words[0] | words[1] | words[2] | words[3]) == 0) {
+		if ((words[0] | words[1] | words[2] | words[3] | words[4] | words[5] | words[6] | words[7]) == 0) {
 			continue;
 		}
 		blocks++;
-		dump_line("md %#llx: %016llx %016llx %016llx %016llx", window + at, words[0], words[1], words[2], words[3]);
+		if (shown < 256) {
+			dump_line("md %#llx: %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx", window + at,
+			    words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
+			shown++;
+		}
 	}
 
-	/* which of the words point into another buffer: those hold the shaders, and the surfaces */
-	uint32_t noted = 0;
-
-	for (uint32_t at = 0; at + 8 <= size && noted < 96; at += 8) {
+	/* the words that point into another buffer: the render state and the textures, in buffers of
+	 * their own. Each gets its first 64 bytes read and said (one line each, mdp), which is where
+	 * the next lot of pointers is -- to the shader's own words, above all. */
+	for (uint32_t at = 0; at + 8 <= size && ntargets < 32; at += 8) {
 		uint64_t value;
 
 		if (!gpu_read(window + at, &value, sizeof(value))) {
 			break;
 		}
-		if (value < window || value >= window + whole) {      /* (its own buffer it points to is seen above) */
+		if (value < 0x100000 || (value >= window && value < window + whole)) {
+			continue;
+		}
+		for (int i = 0; i < MALI_RECENT; i++) {
+			if (mali_recent[i].size != 0 && value >= mali_recent[i].address &&
+			    value < mali_recent[i].address + mali_recent[i].size) {
+				bool again = false;
+
+				for (uint32_t k = 0; k < ntargets; k++) {
+					if (targets[k] == value) {
+						again = true;
+					}
+				}
+				if (!again) {
+					targets[ntargets++] = value;
+				}
+				break;
+			}
+		}
+	}
+	for (uint32_t k = 0; k < ntargets; k++) {
+		uint64_t words[8];
+
+		if (!gpu_read(targets[k], words, sizeof(words))) {
+			dump_line("mdp %#llx: unmapped", targets[k]);
+			continue;
+		}
+		dump_line("mdp %#llx: %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx", targets[k],
+		    words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
+
+		/* the pointers in those words: the shader's code among them, half a kilobyte of it */
+		for (uint32_t w = 0; w < 8 && ndeep < 8; w++) {
+			uint64_t value = words[w];
+
+			if (value < 0x100000) {
+				continue;
+			}
 			for (int i = 0; i < MALI_RECENT; i++) {
 				if (mali_recent[i].size != 0 && value >= mali_recent[i].address &&
 				    value < mali_recent[i].address + mali_recent[i].size) {
-					if (mali_recent[i].address == window) {
-						continue;
+					bool again = false;
+
+					for (uint32_t j = 0; j < ndeep; j++) {
+						if (deep[j] == value) {
+							again = true;
+						}
 					}
-					dump_line("md %#llx: -> the buffer at %#llx (%#llx bytes)%s", window + at,
-					    mali_recent[i].address, mali_recent[i].size, mali_recent[i].freed ? ", FREED" : "");
-					noted++;
+					if (!again) {
+						deep[ndeep++] = value;
+					}
 					break;
 				}
 			}
 		}
 	}
-	dump_line("md chain %#llx end: %u blocks, %u pointers noted", chain, blocks, noted);
+	for (uint32_t k = 0; k < ndeep; k++) {
+		for (uint32_t at = 0; at < 512; at += 64) {
+			uint64_t words[8];
+
+			if (!gpu_read(deep[k] + at, words, sizeof(words))) {
+				break;
+			}
+			if ((words[0] | words[1] | words[2] | words[3] | words[4] | words[5] | words[6] | words[7]) == 0) {
+				continue;
+			}
+			dump_line("mds %#llx: %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx", deep[k] + at,
+			    words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
+		}
+	}
+	dump_line("md chain %#llx end: %u blocks (%u said), %u targets, %u deep", chain, blocks, shown, ntargets, ndeep);
 	lck_mtx_unlock(&mali_lock);
 }
 
