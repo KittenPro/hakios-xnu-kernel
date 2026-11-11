@@ -1463,7 +1463,8 @@ redwood_mali_dump(uint64_t chain)
  *
  *   the framebuffer descriptor is the panel's: width, height, bounds, and the render target
  *   (the panel's memory, which gets GPU addresses of its own; the boot framebuffer is
- *   ordinary memory the display engine reads)
+ *   ordinary memory the display engine reads). Its reload mode is turned from Intersect to
+ *   Always, for the tiles Intersect would pick are the polygon list's, and no tiler runs here
  *
  *   the quad stays 0,0 to 1125,2436 -- the panel clips it -- while the varying buffer (the
  *   same four corners, as the shader's texture coordinate) is stretched to 1125^2/1080 and
@@ -1644,9 +1645,15 @@ fb_build(uint64_t panel_phys, uint32_t panel_w, uint32_t panel_h, uint32_t panel
 	}
 	redwood_mali_mapped();
 
-	/* the framebuffer descriptor: the panel's geometry and target, nobody's tiler */
+	/* the framebuffer descriptor: the panel's geometry and target, nobody's tiler. The reload's
+	 * mode is turned from Intersect to Always: Intersect picks the tiles by the polygon list of
+	 * the pass the chain came with, and no such list is replayed -- Always runs the draw on
+	 * every tile in the bounds, which a whole-screen blit wants anyway. The writeback stays as
+	 * taken (Linear: the canvas is plain rows too, its 4608 a row being 1125 pixels' 4500 with
+	 * the window server's padding). */
 	fbd = (uint64_t *)(fb.kmem + FB_FBD);
 	memcpy(fbd, fb.fbd, 0x100);
+	fbd[0] = (fbd[0] & ~7ull) | 1;                                       /* Pre Frame 0: Always */
 	fbd[2] = fb.gpu + FB_SAMPLEPOS;
 	fbd[3] = fb.gpu + FB_DCD;
 	fbd[4] = ((uint64_t)(panel_h - 1) << 16) | (panel_w - 1);            /* size, bounds min 0,0 */
@@ -1706,7 +1713,8 @@ fb_build(uint64_t panel_phys, uint32_t panel_w, uint32_t panel_h, uint32_t panel
 	}
 	FlushPoC_DcacheRegion(fb.kmem, PAGE_SIZE);
 	redwood_keep("mali: the panel's blit built: canvas %ux%u onto %ux%u (physical %#llx), "
-	    "the UV ends %.3f and %.3f", fb.canvas_w, fb.canvas_h, panel_w, panel_h, panel_phys, u_end, v_end);
+	    "the UV ends %u.%03u and %u.%03u", fb.canvas_w, fb.canvas_h, panel_w, panel_h, panel_phys,
+	    (uint32_t)u_end, (uint32_t)(u_end * 1000.0f) % 1000, (uint32_t)v_end, (uint32_t)(v_end * 1000.0f) % 1000);
 	return true;
 }
 
@@ -1743,7 +1751,10 @@ redwood_mali_fb_frame(uint64_t buffer, uint32_t canvas_stride, uint64_t panel_ph
 	job = (uint64_t *)(fb.kmem + FB_JOB);
 	bzero(job, 64);
 	job[2] = 0x10013;                            /* a fragment job, 64-bit, no dependencies */
-	job[4] = ((((panel_h + 15) / 16 - 1) << 16) | (panel_w + 15) / 16 - 1);      /* bounds, in 16x16 tiles */
+	job[4] = (uint64_t)((((panel_h + 15) / 16 - 1) << 16) | (panel_w + 15) / 16 - 1) << 32;
+	/* the bound maximum, in 16 x 16 tiles, in the payload's second word; the minimum, in the
+	 * first, stays nought -- the maximum alone in the first word was the replay's fall: a
+	 * backwards box the hardware refused with the data-invalid fault, not an address in sight */
 	job[5] = (fb.gpu + FB_FBD) | 0x01;           /* the framebuffer: one render target */
 	FlushPoC_DcacheRegion((vm_offset_t)sws, 16);
 	FlushPoC_DcacheRegion((vm_offset_t)job, 64);
