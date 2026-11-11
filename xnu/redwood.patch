@@ -65,7 +65,7 @@ diff --git a/bsd/conf/files b/bsd/conf/files
 index 44274016a4cf..4ab7ca03b301 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -109,6 +109,50 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
+@@ -109,6 +109,52 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
  bsd/dev/unix_startup.c			standard
  
  bsd/dev/monotonic.c optional monotonic
@@ -1902,7 +1902,6 @@ index 5fb0a52062e0..274ed3282878 100644
 +iokit/Kernel/RedwoodGPU.cpp				optional iokitcpp
 +iokit/Kernel/RedwoodMali.cpp				optional iokitcpp
 +iokit/Kernel/RedwoodWLAN.cpp			optional iokitcpp
-+iokit/Kernel/RedwoodBluetooth.cpp		optional iokitcpp
 +iokit/Kernel/RedwoodBattery.cpp			optional iokitcpp
 +iokit/Kernel/RedwoodBluetooth.cpp		optional iokitcpp
 +iokit/Kernel/MiniAppleKeyStore.cpp			optional iokitcpp
@@ -3488,7 +3487,7 @@ diff --git a/tools/lldbmacros/core/syntax_checker.py b/tools/lldbmacros/core/syn
 index 3ebc295117a3..de101eafc83b 100755
 --- a/tools/lldbmacros/core/syntax_checker.py
 +++ b/tools/lldbmacros/core/syntax_checker.py
-@@ -12,10 +12,13 @@ Usage:
+@@ -12,11 +12,14 @@ Usage:
  """
  import sys
  import os
