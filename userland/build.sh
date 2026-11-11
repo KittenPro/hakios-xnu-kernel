@@ -61,6 +61,16 @@
 set -e
 cd "$(dirname "$(readlink -f "$0")")"
 source ../xnu-env.sh
+# Three things GNU coreutils has and macOS has not: a tree of hard links (cp -al; Sonoma's cp fails on every
+# file of one, "Bad file descriptor"), sha256sum, and stat -c
+linktree() { # linktree DIR NEW: NEW (which is not there yet) becomes DIR's tree, every file a hard link
+	if [ "$(uname -s)" = Darwin ]; then
+		mkdir -p "$2" && (dst=$(cd "$2" && pwd) && cd "$1" && pax -rwl -p e . "$dst")
+	else
+		cp -al "$1" "$2"
+	fi
+}
+sha256() { if command -v sha256sum >/dev/null; then sha256sum "$@"; else shasum -a 256 "$@"; fi; }
 
 CC="xnu-clang -arch arm64 -Os -static -nostdlib -ffreestanding -fno-stack-protector -fno-builtin -Wall -Wextra"
 LD="-Wl,-e,_start -Wl,-pagezero_size,0x100000000"
@@ -186,6 +196,10 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		$DYN -dynamiclib -install_name /redwood/lib/libprobe.dylib -o obj/libprobe.dylib src/probe.c
 		$DYN -framework CoreFoundation -framework AVFoundation -lobjc -o obj/torch_test src/torch_test.c
 		$DYN -O2 -o obj/camera_test src/camera_test.c src/camera_isp.c
+		$DYN -fobjc-arc -framework Foundation -framework CoreBluetooth -sectcreate __TEXT __info_plist src/bt_test.plist \
+			-o obj/bt_test src/bt_test.m &&
+			{ ${LDID:-ldid} -Ssrc/bt_test.entitlements obj/bt_test 2>/dev/null ||
+			  echo "build.sh: no ldid: bt_test is unsigned, and TCC may not let it use Bluetooth"; }
 		$DYN -fobjc-arc -framework Foundation -framework AVFoundation -o obj/camera_avtest src/camera_avtest.m
 		# (the microphone as an application records: allowed to, by an entitlement, if ldid is there)
 		$DYN -framework CoreFoundation -framework AVFoundation -lobjc -o obj/record_test src/record_test.c &&
@@ -226,6 +240,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		$DYN -framework CoreFoundation -framework CoreGraphics -framework ImageIO -o obj/snap_test src/snap_test.c
 		$DYN -framework CoreFoundation -framework CoreGraphics -framework CoreText -o obj/font_test src/font_test.c
 		$DYN -fobjc-arc -framework Foundation -framework SystemConfiguration -o obj/net_test src/net_test.m
+		$DYN -fobjc-arc -framework Foundation -framework CoreGraphics -framework ImageIO -o obj/fbgrab src/fbgrab.m
 		# (with an entitlement for "battery_test open URL", if ldid is there: src/battery_test.c)
 		$DYN -framework CoreFoundation -framework IOKit -lsqlite3 -o obj/battery_test src/battery_test.c &&
 			{ ${LDID:-ldid} -Ssrc/battery_test.entitlements obj/battery_test 2>/dev/null ||
@@ -275,7 +290,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 			# the OpenGL ES library, and the table of functions that hands CoreAnimation's calls to it
 			# (Mesa says beside the library what it was built from: one from other patches is built again)
 			M=../xnu-deps/build/mesa/out
-			[ "$(cat $M/built-from 2>/dev/null)" = "$(cat ../tools/mesa/*.patch ../tools/mesa/redwood-drm/* | sha256sum)" ] ||
+			[ "$(cat $M/built-from 2>/dev/null)" = "$(cat ../tools/mesa/*.patch ../tools/mesa/redwood-drm/* | sha256)" ] ||
 				../tools/mk-mesa.sh
 			./mkeagl.py src/eagl_slots.txt $M/gl.xml $M/exported-gl.txt src/eagl.c > obj/eagl_gen.h
 			$DYN -dynamiclib -install_name /redwood/lib/libredwood-gl.dylib -Iobj -framework CoreFoundation \
@@ -307,6 +322,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	[ -f obj/font_test ] && cp obj/font_test root/bin/
 	[ -f obj/metal_test ] && cp obj/metal_test root/bin/
 	[ -f obj/net_test ] && cp obj/net_test root/bin/
+	[ -f obj/fbgrab ] && cp obj/fbgrab root/bin/
 	[ -f obj/battery_test ] && cp obj/battery_test root/bin/
 	[ -f obj/keychain_test ] && cp obj/keychain_test root/bin/
 	[ -f obj/wifipw_test ] && cp obj/wifipw_test root/bin/
@@ -544,7 +560,7 @@ if [ -n "$FLASHBOOT" ] && [ -f $CACHE/dyld_shared_cache_arm64 ]; then
 	# with CRYPTEXES=flash the cryptexes are read from the phone's flash and this tree is
 	# built and thrown away unused
 	if [ "$CRYPTEXES" != flash ]; then
-	if [ -d $IOS/cryptex ]; then cp -al $IOS/cryptex flashboot.os; else mkdir -p flashboot.os; fi
+	if [ -d $IOS/cryptex ]; then linktree $IOS/cryptex flashboot.os; else mkdir -p flashboot.os; fi
 	# the audio DSP's firmware and the speaker amplifiers' configuration, as in the system image's /fw: the kernel
 	# reads the firmware as soon as there is a root (this image, adsp=1), the configuration maybe later -- by then
 	# from the iOS volume's /fw, which src/init.c (flash_root) binds to this
@@ -593,7 +609,7 @@ if [ -n "$FLASHBOOT" ] && [ -f $CACHE/dyld_shared_cache_arm64 ]; then
 		rm -f flashboot.os.apfs
 	fi
 	rm -rf flashboot flashboot.os flashboot.boot.apfs
-	echo "flashboot.apfs: $(( $(stat -c %s flashboot.apfs) / 1048576 )) MB"
+	echo "flashboot.apfs: $(( $(wc -c < flashboot.apfs) / 1048576 )) MB"
 fi
 
 # --- the system image -----------------------------------------------------------------------------
@@ -608,7 +624,7 @@ if [ -f $IOS/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 		exit 1
 	fi
 	rm -rf sysroot
-	cp -al $IOS/rootfs sysroot                      # hard links: no copies of the 0.5 GB
+	linktree $IOS/rootfs sysroot                      # hard links: no copies of the 0.5 GB
 	# launchd must load our choice of jobs, not all 500 that iOS has
 	rm -rf sysroot/System/Library/LaunchDaemons sysroot/System/Library/NanoLaunchDaemons \
 		sysroot/System/Library/LaunchAngels sysroot/System/Library/xpc/launchd.plist
@@ -678,16 +694,23 @@ if [ -f $IOS/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 		fi
 		echo "  the package manager's prefix: $(du -sh sysroot/jb | cut -f1) as /jb (init puts it at /var/jb)"
 	fi
+	# libOSMesa (11 MB, the Mali's compiler and GL inside it) in the system image as well, /usr/lib/redwood/libOSMesa.8.dylib: the boot
+	# partition (32 MB) is full, and with OSMESA_EXT=1 runkit/mk.sh makes /redwood/lib/libOSMesa.8.dylib a link to this copy. It does no
+	# harm to an image that keeps its own.
+	if [ -f obj/libOSMesa.8.dylib ]; then
+		mkdir -p sysroot/usr/lib/redwood
+		cp obj/libOSMesa.8.dylib sysroot/usr/lib/redwood/
+	fi
 	# our audio device, where the audio server looks for such plug-ins (and for no others: Apple's are left out)
 	mkdir -p sysroot/System/Library/Audio/Plug-Ins/HAL
 	ln -s /redwood/lib/RedwoodAudio.driver sysroot/System/Library/Audio/Plug-Ins/HAL/RedwoodAudio.driver
 	# the OS cryptex: on a device a separate volume grafted at /System/Cryptexes/OS. It holds the dyld
 	# shared cache (dyld looks there first) and a few libraries and resources outside the cache.
 	mkdir -p sysroot/System/Cryptexes
-	if [ -d $IOS/cryptex ]; then cp -al $IOS/cryptex sysroot/System/Cryptexes/OS; fi
+	if [ -d $IOS/cryptex ]; then linktree $IOS/cryptex sysroot/System/Cryptexes/OS; fi
 	# the App cryptex, the same way: Safari's daemons (eight launchd jobs run them from there), its settings and
 	# the bundles around it, which the root's links reach (System/Library/PreferenceBundles/MobileSafariSettings.bundle...)
-	if [ -d $IOS/cryptex-app ]; then cp -al $IOS/cryptex-app sysroot/System/Cryptexes/App; fi
+	if [ -d $IOS/cryptex-app ]; then linktree $IOS/cryptex-app sysroot/System/Cryptexes/App; fi
 	D=sysroot/System/Cryptexes/OS/System/Library/Caches/com.apple.dyld
 	mkdir -p $D
 	for f in $CACHE/dyld_shared_cache_arm64*; do

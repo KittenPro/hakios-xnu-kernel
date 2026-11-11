@@ -34,7 +34,7 @@
 /* Where the system image is put, clear of the kernel, as xnuloader does it (RESIDENT_RD_OFFSET). */
 #define SYSTEM_PA           (XNU_PHYS_BASE + 0x08000000ULL)
 #define SYSTEM_PART         "xnusys"
-/* 0: all of it. Smaller is for trying the path out: packfs will not mount a half image. */
+/* 0: all of it. Smaller is for trying the path out: a half image will not mount. */
 #ifndef SYSTEM_MAX_MB
 #define SYSTEM_MAX_MB       0
 #endif
@@ -89,6 +89,10 @@ static const uint8_t core_order[8] = { 0, 7, 6, 1, 2, 3, 4, 5 };
 /* 1: wake the GPU and ask it what it is, if Android asked for it (tools/gpu-probe.sh); then Android. */
 #ifndef GPU_PROBE
 #define GPU_PROBE           0
+#endif
+/* 1: read the camera's pins, rails and I2C controller and report, if Android asked for it (tools/cam-probe.sh); then Android. */
+#ifndef CAM_PROBE
+#define CAM_PROBE           0
 #endif
 /* 1: read the eMMC and report, then go back to Android (no XNU). */
 #ifndef MSDC_TEST
@@ -537,9 +541,9 @@ static uint64_t kva_to_pa(uint64_t va)
 /* ---- the system image, on the flash ---- */
 
 /*
- * userland/system.packfs is the root XNU mounts (md0), 2.8 GB of it: too large for a boot image,
+ * userland/system.apfs is the root XNU mounts (md0), 2.6 GB of it: too large for a boot image,
  * so it lives in its own partition (tools/gpt-carve.py made "xnusys" out of the end of userdata)
- * and is read into DRAM here. The payload's small root.packfs stays the second disk (md1).
+ * and is read into DRAM here. The payload's small root.apfs stays the second disk (md1).
  */
 static uint8_t gpt_entries[128 * 128] __attribute__((aligned(16)));
 static uint8_t sector_buf[512] __attribute__((aligned(16)));
@@ -567,7 +571,7 @@ static int gpt_find(const char *name, uint64_t *lba, uint64_t *blocks)
 		const uint8_t *e = gpt_entries + i * size;
 		int same = 1;
 
-		for (int k = 0; same && name[k - (k ? 0 : 0)] != 0; k++) {
+		for (int k = 0; same && name[k] != 0; k++) {
 			same = e[56 + 2 * k] == (uint8_t)name[k] && e[57 + 2 * k] == 0;
 		}
 		if (same && e[56 + 2 * (int)strlen(name)] == 0) {
@@ -2307,8 +2311,8 @@ static void __attribute__((noreturn)) run_xnu(void)
 
 	out("md0 ");
 	out_hex(sys_size ? sys_pa : rd_pa);
-	out(sys_size ? " (the system image), md1 " : XNU_ROOT_EMMC ? " is none: md1 (root.packfs), the system image on the eMMC" :
-	    " (root.packfs only)");
+	out(sys_size ? " (the system image), md1 " : XNU_ROOT_EMMC ? " is none: md1 (root.apfs), the system image on the eMMC" :
+	    " (root.apfs only)");
 	if (sys_size) {
 		out_hex(rd_pa);
 	}
@@ -3365,6 +3369,12 @@ rails_off:
 }
 #endif /* GPU_PROBE */
 
+#if CAM_PROBE
+#include "mtkcam.h"
+
+static const char cam_probe_flag[] = "DARWIN-REDWOOD:CAM-PROBE";
+#endif /* CAM_PROBE */
+
 void mtkloader_main(uint64_t dtb)
 {
 	uint32_t mark = marker_get();
@@ -3401,6 +3411,17 @@ void mtkloader_main(uint64_t dtb)
 		fbc.y = fbc.top = 0;
 		out("== mtkloader: GPU probe ==\n");
 		gpu_probe();
+		dbg_delay_ms(4000);
+	}
+	chain_android();
+#endif
+#if CAM_PROBE
+	if (pmsg_take(cam_probe_flag, sizeof(cam_probe_flag) - 1)) {
+		fb_rect(0, 0, PANEL_W, PANEL_H, 0xff000000u);
+		fbc.x = 0;
+		fbc.y = fbc.top = 0;
+		out("== mtkloader: CAM probe ==\n");
+		cam_probe();
 		dbg_delay_ms(4000);
 	}
 	chain_android();

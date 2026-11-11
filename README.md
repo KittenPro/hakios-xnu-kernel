@@ -11,7 +11,7 @@ The phone loses nothing. `mtkloader` installs into `boot_a` ahead of the Android
 and after the session the phone returns to Android by itself. The iOS system image lives in its own `xnusys` partition and is read from
 eMMC on demand. A research bench, not a ROM.
 
-**Documentation:** [docs/](docs/).
+**Documentation:** [docs/](docs/README.md); porting to another MediaTek phone: [docs/mtk-porting.md](docs/mtk-porting.md).
 
 ## What works
 
@@ -21,14 +21,18 @@ eMMC on demand. A research bench, not a ROM.
 - **Graphics** — an in-kernel Mali driver (`bsd/dev/redwood_mali.c`), Mesa with **panfrost**, and a **Metal** driver
   (`userland/src/redwoodmetal.m`, an AIR→NIR compiler): CoreAnimation draws through Metal on the Mali-G52. Lock screen, swipe to
   unlock, the full home screen, system gestures and Control Center.
-- **Input** — touchscreen (Goodix), multitouch, wake on touch; the phone's real power and volume buttons.
+- **Input** — touchscreen (an OmniVision TD4160 on SPI2, `bsd/dev/redwood_tcm.c`), multitouch, wake on touch; the phone's real power and volume buttons.
 - **Sensors** — the accelerometer through the SCP sensor hub (`bsd/dev/redwood_scp.c`); screen rotation in backboardd.
 - **Wi-Fi** — CONNSYS brought up from the phone's own firmware; the phone joins a network from Settings and Safari loads pages over it
   (`docs/wifi-x6826b.md`).
+- **Bluetooth** — the MT6631's controller behind iOS's own `bluetoothd`: apps see real BLE devices in a scan, and Settings shows the
+  phone as discoverable. A confirmed pairing, the profiles and audio are not done (`docs/bluetooth-x6826b.md`).
+- **Battery** — the real percentage in the status bar (`mtkbatt=1`, `bsd/dev/redwood_mtkbatt.c`): Android's last number, carried on
+  by the MT6358 fuel gauge. The charger chip (RT9471) is not driven yet.
 - **Apps & shell** — Settings, Clock, Calendar, Photos, Notes and more; Safari; Sileo with the Procursus prefix (dpkg/apt) in
   `/var/jb`; SSH to the phone by key.
 
-**Not yet, or not a goal:** cellular, Bluetooth, the phone's speakers and microphones, camera capture, vibration, and writing to the
+**Not yet, or not a goal:** cellular, the phone's speakers and microphones, camera capture, vibration, and writing to the
 system volume (data iOS writes to `/private/var` is instead archived to the `darwin` partition and survives a reboot). Apple's online
 services — activation, Apple ID, iCloud, the App Store — are **not supported and not a goal**: this hardware has no Secure Enclave, and
 nothing Apple's servers verify is forged.
@@ -52,8 +56,9 @@ file, no phone firmware and no iOS screenshot is checked in.
 ## Building
 
 The kernel is built from an external XNU source tree plus `xnu/redwood.patch` (`xnu-build.sh`); the user-space libraries and tools are
-built with `userland/build.sh`; the boot image is packed and flashed, and a session is run, by the scripts under `runkit/`. The system
-image is assembled from your own IPSW (`ios165/fetch.sh`). See [docs/](docs/).
+built with `userland/build.sh`; the boot image is packed and flashed, and a session is run, by `tools/xnu-cycle.sh`. The system
+image is assembled from your own IPSW (`ios165/fetch.sh`). Every command in order, with what it needs:
+[docs/from-a-clone.md](docs/from-a-clone.md). For another phone: [docs/mtk-porting.md](docs/mtk-porting.md).
 
 ## License and legal
 

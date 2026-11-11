@@ -54,7 +54,7 @@ void redwood_mtkbt_skel_init(void);
 
 #define SKEL_TXQ                8192u           /* what bluetoothd has written and the controller has not been given yet */
 #define SKEL_FRAME              4096u           /* one packet from the controller */
-#define SKEL_SAID_PACKETS       4096u           /* of each direction, said in the log: bt2's run stopped at 96 with bluetoothd's restart cycles unexplained (a Write_Default_Erroneous_Data_Reporting that its log says timed out, reason 108 "HCI initialization failed"), and the packets past the limit were the ones that would have said why */
+#define SKEL_SAID_PACKETS       96u             /* of each direction, said in the log: the host buffer is 64 KB and bluetoothd's own lines want it */
 #define SKEL_ANSWER_MS          2000u           /* a command of the probe is given this long */
 
 /*
@@ -97,27 +97,12 @@ struct mtkbt_platform {
 };
 
 /*
- * ---- THE PORT: rosemary (Redmi Note 10S, MT6785 / MT6631 in CONNSYS) ----
- * Each of these is a part of redwood_connsys.c: the firmware thread's steps 1 to 11 and the flag they end on
- * (power_on), WMT_FUNC_CTRL (function_on), connsys_stp_send and connsys_stp_receive on STP's channel 0 (send,
- * receive), connsys_btif_wake (wake). The Wi-Fi address needs no function here: redwood_net.c calls
- * RedwoodBluetoothAddress() with the radio's own when it attaches en0.
+ * ---- THE PORT: fill this in ----
+ * Nothing is assumed. For the Infinix Hot 20 each of these is a part of redwood_connsys.c: connsys_sw_init and the steps before it (power_on),
+ * connsys_bt_start's WMT_FUNC_CTRL (function_on), connsys_stp_send and connsys_stp_receive on channel 0 (send, receive), connsys_btif_wake (wake).
  */
-extern int connsys_bt_power_on(void);
-extern int connsys_bt_function_on(void);
-extern void connsys_bt_function_off(void);
-extern int connsys_bt_send(const uint8_t *h4, unsigned length);
-extern int connsys_bt_receive(uint8_t *h4, unsigned room, unsigned wait_ms);
-extern void connsys_btif_wake(void);
-
 static const struct mtkbt_platform mtkbt_platform = {
-	.name = "mt6785 / rosemary / mt6631",
-	.power_on = connsys_bt_power_on,
-	.function_on = connsys_bt_function_on,
-	.function_off = connsys_bt_function_off,
-	.send = connsys_bt_send,
-	.receive = connsys_bt_receive,
-	.wake = connsys_btif_wake,
+	.name = NULL,
 };
 
 /* ---- the platform check ---- */
@@ -221,110 +206,22 @@ redwood_connsys_bt_send(const uint8_t *bytes, unsigned length)
  * own log (BTLOG, src/inject.c's watcher) says which command it stopped at.
  *  - Apple's vendor commands (OGF 0x3f) are Broadcom's; the MediaTek controller says "Unknown HCI Command" (Command Status, status 1) to each
  *    and bluetoothd restarts ("VSC stall detected", reason 3602). Each is answered as done: Command Complete, status 0, and the data its parser
- *    reads after the status -- a byte for 0xfd48, 16 for 0xfce2 with sub-command 0x15, 0x36 or 0x1e, 64 (the first 0x51) for 0xfd1b, none for the
- *    rest (data on 0xfce9 left the next command unsent).
+ *    reads after the status -- a byte for 0xfd48, 16 for 0xfce2 with sub-command 0x15 or 0x36, 64 (the first 0x51) for 0xfd1b, none for the rest
+ *    (data on 0xfce9 left the next command unsent).
  *  - Write_Default_Erroneous_Data_Reporting (0x0c5b), also "Unknown HCI Command", is answered as done.
- *  - rosemary's firmware answers Command Disallowed (0x0c) to LE_Set_Scan_Parameters (0x200b) after the vendor sequence has run
- *    (bt2d: every death is 21 ms after that answer; the sibling's firmware answered 0 and its scans ran). Apple's stack faults its
- *    scan session on the error, so the status is said done. LE_Set_Scan_Enable (0x200c) never reached the wire in bt2d (the death
- *    came first) and is taken the same way; each rewrite says so in the log.
  *  - Read_Local_Supported_Commands: the controller leaves the LE commands of octets 25-28 and LE Host Support of octet 24 clear although it
  *    answers them; bluetoothd looks in the mask before it sends one and gives up ("HCI initialization failed"). The bits are OR-ed in.
  */
 static uint8_t skel_vsc_sub;            /* the first parameter of the last 0xfce2 command sent: its kind */
-
-/*
- * ---- what this controller will not take from the host as it is ----
- * The legacy LE scan commands are the pair the stack sends; rosemary's firmware answers Command Disallowed to both (skel_quirks says the
- * answers done, which kept the stack alive in bt2e but the radio idle: not one unsolicited event in 300 s, and bt_test saw 0 devices).
- * The Bluetooth 5 way is the extended pair; the stack's commands are rewritten to them on the way out and their answers back to the legacy
- * opcodes on the way in, the status whatever it was said in the log -- the probe of whether this firmware scans the extended way at all --
- * and then done (a refused scan must not fault the stack again, bt2d). The extended advertising report is LE meta subevent 0x0d, so the
- * LE event mask the stack sets gains its bit; the reports themselves pass through as they are this round (the stack that asked the legacy
- * way will not read them; the wire is what they are for).
- */
-static unsigned
-skel_out_quirks(uint8_t *packet, unsigned length)
-{
-	if (length == 12 && packet[0] == 0x01 && packet[1] == 0x01 && packet[2] == 0x20 && packet[3] == 0x08) {
-		packet[5] |= 0x20;                   /* LE_Set_Event_Mask: bit 13, subevent 0x0d, the extended advertising report */
-	} else if (length == 11 && packet[0] == 0x01 && packet[1] == 0x0b && packet[2] == 0x20) {
-		/*
-		 * LE_Set_Scan_Parameters -> LE_Set_Extended_Scan_Parameters: a reorder, not an insertion. The legacy order is
-		 * type, interval, window, own address type, filter policy; the extended order is own address type, filter policy,
-		 * Scanning_PHYs, then per PHY type, interval, window -- the stock's own snoop, its taken 0x2041 is 01 00 01 01
-		 * a0 00 a0 00. bt2g inserted Scanning_PHYs as the first parameter, so the firmware read the stack's interval
-		 * low byte 0x40 -- a reserved bit -- in its place and answered Invalid Parameters to every try.
-		 */
-		const uint8_t type = packet[4], i0 = packet[5], i1 = packet[6], w0 = packet[7], w1 = packet[8];
-
-		packet[4] = packet[9];              /* own address type, first now */
-		packet[5] = packet[10];             /* filter policy, second */
-		packet[6] = 0x01;                   /* Scanning_PHYs: the 1M PHY, third */
-		packet[7] = type;
-		packet[8] = i0;
-		packet[9] = i1;
-		packet[10] = w0;
-		packet[11] = w1;
-		packet[3] = 0x08;
-		packet[1] = 0x41;
-		return 12;
-	} else if (length == 6 && packet[0] == 0x01 && packet[1] == 0x0c && packet[2] == 0x20) {
-		/* LE_Set_Scan_Enable -> LE_Set_Extended_Scan_Enable: the same two bytes, then duration and period, 0: no limit */
-		packet[6] = 0x00;
-		packet[7] = 0x00;
-		packet[8] = 0x00;
-		packet[9] = 0x00;
-		packet[3] = 0x06;
-		packet[1] = 0x42;
-		return 10;
-	}
-	return length;
-}
-
 
 static unsigned
 skel_quirks(uint8_t *packet, unsigned length)
 {
 	static const uint8_t le_commands[4] = { 0xf7, 0xff, 0xff, 0x7f };
 
-	if (length >= 29 && packet[0] == 0x04 && packet[1] == 0x3e && packet[3] == 0x0d && packet[4] == 1) {
-		/*
-		 * The extended advertising report (what bt2h's scanning brought to the wire: 52 of them, three neighbours) become
-		 * the legacy report the stack reads -- the stack asked its scan the legacy way, so subevent 0x02 is the shape it
-		 * has been waiting for since bt2d. The event type maps (scan response to 4, directed to 1, connectable to 0,
-		 * scannable to 2, else 3), the address and its type go as they are, the data is clamped to the legacy 31 bytes,
-		 * the RSSI moves after the data; one report per event is what the firmware sends (a pair would pass untouched).
-		 */
-		const uint8_t et = packet[5], at = packet[7], rssi = packet[18];
-		unsigned dlen = packet[28];
-
-		if (dlen > 31) {
-			dlen = 31;
-		}
-		memmove(packet + 14, packet + 29, dlen);   /* the data, forward: everything after it is dropped */
-		packet[14 + dlen] = rssi;                  /* the legacy report ends with it */
-		memmove(packet + 7, packet + 8, 6);        /* the address, one byte forward */
-		packet[6] = at;
-		packet[13] = (uint8_t)dlen;
-		packet[5] = (et & 0x08) ? 0x04 : (et & 0x04) ? 0x01 : (et & 0x01) ? 0x00 : (et & 0x02) ? 0x02 : 0x03;
-		packet[4] = 1;
-		packet[3] = 0x02;
-		packet[2] = (uint8_t)(12 + dlen);
-		say("a 0x0d report become the 0x02 the stack reads (%u bytes of data)", dlen);
-		return 15 + dlen;
-	}
 	if (length == 7 && packet[0] == 0x04 && packet[1] == 0x0f && packet[2] == 0x04 && packet[3] == 0x01 && packet[4] == 0x01 &&
 	    (packet[6] >> 2) == 0x3f) {
-		/*
-		 * 0x1e is BD_VSC_OLYMPIC_READ_BT_SETTINGS by its place in the cycle (a read: the stack asks it on every scan restart), and
-		 * bt2l is its run: the status alone was answered, and every scan cycle from 70 s to the round's end came back to it -- the
-		 * stack's manager never left "Unknown" ("Ignoring XPC message as state is Unknown", Preferences' pairing agent refused,
-		 * the Bluetooth page never opened, bt2k the same). The sibling's run 673 is the precedent: 0x36 stalled a scan's start
-		 * the same way until 16 zeros were given. 0x1e never reached the sibling's wire at all; the zeroed settings say "everything
-		 * off", which is what an untouched controller has anyway.
-		 */
-		const bool antenna = packet[5] == 0xe2 && packet[6] == 0xfc && (skel_vsc_sub == 0x15 || skel_vsc_sub == 0x36 || skel_vsc_sub == 0x1e);
+		const bool antenna = packet[5] == 0xe2 && packet[6] == 0xfc && (skel_vsc_sub == 0x15 || skel_vsc_sub == 0x36);
 		const bool cal = packet[5] == 0x1b && packet[6] == 0xfd;
 		const bool data = antenna || cal || (packet[5] == 0x48 && packet[6] == 0xfd);
 		const unsigned extra = cal ? 64 : (antenna ? 16 : (data ? 1 : 0));
@@ -349,40 +246,11 @@ skel_quirks(uint8_t *packet, unsigned length)
 		packet[6] = 0x00;
 		return 7;
 	}
-	if (length == 7 && packet[0] == 0x04 && packet[1] == 0x0e && packet[2] == 0x04 && packet[3] == 0x01 && packet[5] == 0x20 &&
-	    (packet[4] == 0x41 || packet[4] == 0x42)) {
-		/* the extended scan pair's Command Complete, back to the legacy opcode the stack asked with (skel_out_quirks sent it);
-		 * the status as the controller gave it is said -- the probe of the round -- and then done, whatever it was */
-		say("extended scan 0x20%02x answered %02x, said done", packet[4], packet[6]);
-		packet[4] = packet[4] == 0x41 ? 0x0b : 0x0c;
-		packet[6] = 0x00;
-	}
-	if (length == 7 && packet[0] == 0x04 && packet[1] == 0x0f && packet[2] == 0x04 && packet[3] == 0x01 && packet[6] == 0x20 &&
-	    (packet[5] == 0x41 || packet[5] == 0x42)) {
-		/* the same as a Command Status (an answer the firmware gives as "Unknown" to what it does not know), to the same legacy
-		 * Command Complete, status done, the native one said */
-		say("extended scan 0x20%02x answered %02x (Command Status), said done", packet[5], packet[4]);
-		packet[1] = 0x0e;
-		packet[4] = packet[5] == 0x41 ? 0x0b : 0x0c;
-		packet[5] = 0x20;
-		packet[6] = 0x00;
-	}
-	if (length == 7 && packet[0] == 0x04 && packet[1] == 0x0e && packet[2] == 0x04 && packet[3] == 0x01 && packet[5] == 0x20 &&
-	    packet[6] == 0x0c && (packet[4] == 0x0b || packet[4] == 0x0c)) {
-		say("0x20%02x answered Command Disallowed, said done", packet[4]);
-		packet[6] = 0x00;
-	}
 	if (length >= 7 + 64 && packet[0] == 0x04 && packet[1] == 0x0e && packet[2] == 0x44 && packet[4] == 0x02 && packet[5] == 0x10 && packet[6] == 0x00) {
 		for (unsigned i = 0; i < 4; i++) {
 			packet[7 + 25 + i] |= le_commands[i];
 		}
 		packet[7 + 24] |= 0x60;
-		packet[7 + 18] |= 0x08;
-		/* Write_Default_Erroneous_Data_Reporting's bit is octet 18 bit 3 of this answer (its read twin 0x0c5a is bit 2 next to it, and
-		 * bluetoothd's test reads the octet and bit its command descriptor names: "status=628" is that test failing). The sibling's firmware
-		 * set the bit and only its "Unknown HCI Command" answer needed rewriting (the rule above); rosemary's firmware leaves it clear, so
-		 * the stack never wrote the command at all and died of "HCI initialization failed" instead (bt2c: no 0x0c5b on the wire, the last
-		 * command of every cycle 0x0c31). */
 	}
 	return length;
 }
@@ -692,7 +560,6 @@ skel_bridge(void)
 			if (n >= 5 && skel_packet[0] == 1 && skel_packet[1] == 0xe2 && skel_packet[2] == 0xfc) {
 				skel_vsc_sub = skel_packet[4];
 			}
-			n = skel_out_quirks(skel_packet, n);
 			skel_dump("out", skel_packet, n, &skel_said_out);
 			if (p->wake != NULL) {
 				p->wake();

@@ -2325,13 +2325,13 @@ bt_hook_log(unsigned id, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3)
 	unsigned n;
 	int len;
 
-	if (!bt_diag && id != 24) {
+	if (!bt_diag) {
 		return;
 	}
 	n = __atomic_add_fetch(&bt_hook_seen[id], 1, __ATOMIC_RELAXED);
 
 
-	if (id >= 18 && id != 23 && id != 24) {
+	if (id >= 18 && id != 23) {
 		return;
 	}
 	if (id == 17) {
@@ -2387,10 +2387,6 @@ bt_hook_log(unsigned id, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3)
 		len += snprintf(line + len, sizeof(line) - (size_t)len, " cbA78=%lx cbA80=%lx flagA90=%u",
 		    *(const unsigned long *)(bt_base + 0x855a78), *(const unsigned long *)(bt_base + 0x855a80), *(const uint8_t *)(bt_base + 0x855a90));
 	}
-	if (id == 24) {
-		/* the last slot is not the fourth argument (the sync takes three), but the return address: who called it */
-		len += snprintf(line + len, sizeof(line) - (size_t)len, " caller unslid=%llx", (unsigned long long)(a3 - bt_base));
-	}
 	(void)sysctlbyname("kern.redwood.host_keep", NULL, NULL, line, (size_t)len);
 }
 
@@ -2431,34 +2427,6 @@ BT_HOOK_STUB(14, "sub sp, sp, #0x40\n" "stp x20, x19, [sp, #0x20]\n" "stp x29, x
 BT_HOOK_STUB(15, "mov x8, x1\n" "ldp x2, x1, [x0, #0x20]\n" "add x3, x0, #0x30\n" "add x4, x0, #0x40\n")
 BT_HOOK_STUB(16, "sub sp, sp, #0x70\n" "stp x22, x21, [sp, #0x40]\n" "stp x20, x19, [sp, #0x50]\n" "stp x29, x30, [sp, #0x60]\n")
 BT_HOOK_STUB(17, "sub sp, sp, #0xd0\n" "stp x24, x23, [sp, #0x90]\n" "stp x22, x21, [sp, #0xa0]\n" "stp x20, x19, [sp, #0xb0]\n")
-/*
- * The Dynamic Store sync (bluetoothd+0x27614 (self, state, value)): the daemon's own update of the store the ModulePower getter
- * reads (writer +0x26f18 is only called from here and the dead twin +0x26e18). Neither its success nor its failure was ever logged
- * (bt2p/bt2q: the path looks not to run at all), so this one watches whether it runs, and with what state -- the same prologue as 10.
- * bt2r: it does run, once at the end of init, but with (0xe4870001, 3, 0x79) -- the orr-gate sends nonzero (state, value) straight to
- * the exit, and the store is never written. bt2s: the third argument slot says the caller instead (the return address), for no caller
- * of +0x27614 is anywhere in the code or the data -- the pointer on it lives in __DATA (0x843748, a table of the daemon's subsystems,
- * not a log category), and who fires it is what the next run is to name.
- */
-extern const uint32_t bt_disp24[];
-__attribute__((naked, used)) static void bt_hook_stub24(void)
-{
-	__asm__ volatile (
-		"sub sp, sp, #0xa0\n"
-		"stp x0, x1, [sp]\n" "stp x2, x3, [sp, #16]\n" "stp x4, x5, [sp, #32]\n" "stp x6, x7, [sp, #48]\n" "stp x8, x9, [sp, #64]\n"
-		"stp x29, x30, [sp, #80]\n" "stp q0, q1, [sp, #96]\n" "stp q2, q3, [sp, #128]\n"
-		"mov x4, x3\n" "mov x3, x2\n" "mov x2, x1\n" "mov x1, x0\n" "mov w0, #24\n"
-		"ldr x17, [sp, #88]\n" "mov x4, x17\n"
-		"bl _bt_hook_log\n"
-		"ldp x0, x1, [sp]\n" "ldp x2, x3, [sp, #16]\n" "ldp x4, x5, [sp, #32]\n" "ldp x6, x7, [sp, #48]\n" "ldp x8, x9, [sp, #64]\n"
-		"ldp x29, x30, [sp, #80]\n" "ldp q0, q1, [sp, #96]\n" "ldp q2, q3, [sp, #128]\n"
-		"add sp, sp, #0xa0\n"
-		".private_extern _bt_disp24\n"
-		"_bt_disp24:\n"
-		"sub sp, sp, #0x30\n" "stp x20, x19, [sp, #0x10]\n" "stp x29, x30, [sp, #0x20]\n" "add x29, sp, #0x20\n"
-		"adrp x16, _bt_hook_cont@PAGE\n" "add x16, x16, _bt_hook_cont@PAGEOFF\n" "ldr x16, [x16, #24*8]\n" "br x16\n"
-	);
-}
 /*
  * The fix, the constructor of a scan entry (bluetoothd+0x58e798 (this, config, foreground, type)): see bt_entry_fix. Its own stub, since it
  * changes two arguments: the type from bt_entry_fix's answer, the foreground flag to 1.
@@ -2805,8 +2773,6 @@ bt_hooks(uintptr_t base)
 	 * knows no bundle of it), and gets nothing (runs 676-707: "advertisements delivered 0"). Every scan entry is made for a foreground session.
 	 */
 	bt_hook_install(23, 0x10058e798UL, bt_disp23, (void *)bt_hook_stub23);
-	/* the Dynamic Store sync, always: it says what the daemon does with the store even with bt_diag off (bt2r) */
-	bt_hook_install(24, 0x100027614UL, bt_disp24, (void *)bt_hook_stub24);
 	if (!bt_diag) {
 		return;
 	}
@@ -2867,12 +2833,7 @@ os_log_watched(const char *how, const char *format, uint8_t *buf, uint32_t size)
 	    strstr(format, "ompleted") != NULL || strstr(format, "nable") != NULL || strstr(format, "eady") != NULL ||
 	    strstr(format, "ransport") != NULL || strstr(format, "tack") != NULL || strstr(format, "hipset") != NULL ||
 	    strstr(format, "Sending") != NULL || strstr(format, "XPC message") != NULL || strstr(format, "uthoriz") != NULL ||
-	    strstr(format, "Found device") != NULL || strstr(format, "ADVBUFF") != NULL ||
-	    /* rosemary: the Dynamic Store is the one step the chain never reaches ("Update Dynamic Store with state On"),
-	     * and its own failure lines ("Failed to update Dynamic Store...", "Couldn't create a dynamic store") match
-	     * nothing above: "Failed to up*date*" is not "*tate*", and the store's setter is watched through the
-	     * manager-state line only. Without these the failure, if it is one, is said where nothing collects it */
-	    strstr(format, "ynamic") != NULL || strstr(format, "Couldn") != NULL || strstr(format, "onfigd") != NULL;
+	    strstr(format, "Found device") != NULL || strstr(format, "ADVBUFF") != NULL;
 
 	if (strstr(format, "Stack Did Start") != NULL) {
 		bluetoothd_after_start = true;
