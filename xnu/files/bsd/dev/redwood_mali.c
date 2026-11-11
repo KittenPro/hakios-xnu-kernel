@@ -1221,6 +1221,156 @@ redwood_mali_wait(uint64_t seq, uint64_t timeout_ns)
 	return done;
 }
 
+/* ---- the chains as the window server built them, for the host to take one from ---- */
+
+/*
+ * The blit the display driver wants -- a frame scaled onto the panel by the GPU, instead of the
+ * processor's eight milliseconds -- is a job chain this stack builds by the hundred already: every
+ * frame CoreAnimation composites a full-screen textured pass on this GPU, and the driver could
+ * replay one of those, patched to sample the frame and write the panel. What such a chain is made
+ * of, no source of ours says (the descriptors are Mesa's, inside the program), so boot-arg
+ * mali_dump=N has the window client (RedwoodMali.cpp: a fragment submission whose buffers include
+ * a display surface -- the pass that composites a frame) call this for its first N: the chain's job
+ * headers, then the buffer it lives in as words at the addresses the GPU knows them by, blocks of
+ * zeros left out and every value that points into another of the last buffers noted -- the
+ * descriptors' own buffers, with the shaders in them, to fetch next. It all goes to the host's
+ * keep (the pmsg zone): a run's console would lose the middle of it.
+ */
+uint32_t mali_dump;
+
+/* One line of a dump, into the host's keep. */
+static void
+dump_line(const char *format, ...)
+{
+	char line[224];
+	va_list ap;
+	size_t length;
+
+	va_start(ap, format);
+	vsnprintf(line, sizeof(line) - 1, format, ap);
+	va_end(ap);
+	length = strlen(line);
+	line[length++] = '\n';
+	lck_mtx_lock(&kept_lock);
+	host_keep_append(line, length);
+	lck_mtx_unlock(&kept_lock);
+}
+
+/* `size` bytes at GPU address `gpu`, copied out through the page tables (the lock held): false
+ * when a page of them is not entered. */
+static bool
+gpu_read(uint64_t gpu, void *out, uint32_t size)
+{
+	uint8_t *to = (uint8_t *) out;
+
+	while (size != 0) {
+		uint64_t walk[3];
+		uint32_t n = 4096 - (uint32_t) (gpu & 0xfff);
+
+		walk_tables(gpu, walk);
+		if (!(walk[2] & 1)) {
+			return false;
+		}
+		if (n > size) {
+			n = size;
+		}
+		memcpy(to, (const void *) phystokv(walk[2] & PTE_ADDRESS) + (gpu & 0xfff), n);
+		to += n;
+		gpu += n;
+		size -= n;
+	}
+	return true;
+}
+
+void redwood_mali_dump(uint64_t chain);
+void
+redwood_mali_dump(uint64_t chain)
+{
+	uint64_t window = 0;
+	uint64_t whole = 0;
+	uint32_t size = 0;
+	int own = -1;
+
+	if (mali_dump == 0 || chain == 0) {
+		return;
+	}
+	mali_dump--;
+	lck_mtx_lock(&mali_lock);
+	for (int i = 0; i < MALI_RECENT; i++) {
+		if (mali_recent[i].size != 0 && chain >= mali_recent[i].address &&
+		    chain < mali_recent[i].address + mali_recent[i].size) {
+			own = i;
+			window = mali_recent[i].address;
+			whole = mali_recent[i].size;
+			break;
+		}
+	}
+	if (own < 0) {
+		printf("mali dump: chain %#llx is in no buffer of the last %u\n", chain, (unsigned) MALI_RECENT);
+		lck_mtx_unlock(&mali_lock);
+		return;
+	}
+	size = whole > 0x8000 ? 0x8000 : (uint32_t) whole;        /* (the jobs and their descriptors sit at the front) */
+	printf("mali dump: chain %#llx, the buffer of %#llx bytes at %#llx: %u bytes of it kept for the host\n", chain,
+	    whole, window, size);
+	dump_line("md chain %#llx buffer %#llx %llu bytes (this many read: %u)", chain, window, whole, size);
+
+	/* the chain's job headers, following each one's next (a chain's jobs share its buffer) */
+	for (uint64_t job = chain, n = 0; n < 16 && job != 0; n++) {
+		uint64_t header[8];
+
+		if (job < window || job >= window + whole || !gpu_read(job, header, sizeof(header))) {
+			break;
+		}
+		dump_line("md job %llu at %#llx: next %#llx %016llx %016llx %016llx %016llx %016llx %016llx", n, job,
+		    header[0], header[1], header[2], header[3], header[4], header[5], header[6], header[7]);
+		job = header[0];
+	}
+
+	/* the buffer's words, blocks of four that are not all zero */
+	uint32_t blocks = 0;
+
+	for (uint32_t at = 0; at + 32 <= size; at += 32) {
+		uint64_t words[4];
+
+		if (!gpu_read(window + at, words, sizeof(words))) {
+			break;
+		}
+		if ((words[0] | words[1] | words[2] | words[3]) == 0) {
+			continue;
+		}
+		blocks++;
+		dump_line("md %#llx: %016llx %016llx %016llx %016llx", window + at, words[0], words[1], words[2], words[3]);
+	}
+
+	/* which of the words point into another buffer: those hold the shaders, and the surfaces */
+	uint32_t noted = 0;
+
+	for (uint32_t at = 0; at + 8 <= size && noted < 96; at += 8) {
+		uint64_t value;
+
+		if (!gpu_read(window + at, &value, sizeof(value))) {
+			break;
+		}
+		if (value < window || value >= window + whole) {      /* (its own buffer it points to is seen above) */
+			for (int i = 0; i < MALI_RECENT; i++) {
+				if (mali_recent[i].size != 0 && value >= mali_recent[i].address &&
+				    value < mali_recent[i].address + mali_recent[i].size) {
+					if (mali_recent[i].address == window) {
+						continue;
+					}
+					dump_line("md %#llx: -> the buffer at %#llx (%#llx bytes)%s", window + at,
+					    mali_recent[i].address, mali_recent[i].size, mali_recent[i].freed ? ", FREED" : "");
+					noted++;
+					break;
+				}
+			}
+		}
+	}
+	dump_line("md chain %#llx end: %u blocks, %u pointers noted", chain, blocks, noted);
+	lck_mtx_unlock(&mali_lock);
+}
+
 static void
 mali_thread(__unused void *parameter, __unused wait_result_t result)
 {
@@ -1269,6 +1419,7 @@ redwood_mali_init(void)
 
 	(void)PE_parse_boot_argn("mali_fastmap", &mali_fastmap, sizeof(mali_fastmap));
 	(void)PE_parse_boot_argn("mali_trace", &mali_trace, sizeof(mali_trace));
+	(void)PE_parse_boot_argn("mali_dump", &mali_dump, sizeof(mali_dump));
 	if (!PE_parse_boot_argn("mali", &on, sizeof(on)) || on == 0) {
 		return;
 	}

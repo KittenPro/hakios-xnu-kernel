@@ -45,6 +45,8 @@ void redwood_mali_tag(uint64_t address, uint32_t kind, uint32_t width, uint32_t 
 uint32_t redwood_mali_submit(uint64_t chain, bool fragment);
 uint64_t redwood_mali_enqueue(uint64_t chain, bool fragment);
 bool redwood_mali_wait(uint64_t seq, uint64_t timeout_ns);
+void redwood_mali_dump(uint64_t chain);
+extern uint32_t mali_dump;
 
 void RedwoodMaliStart(void);
 void MiniIOMobileFramebufferShow(const uint8_t * pixels, uint32_t width, uint32_t height, uint32_t rowBytes);
@@ -534,9 +536,33 @@ RedwoodMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
 		/* queued, not run here: the job's number goes back in `jc`, and every buffer it names
 		 * remembers it (kPanfrostWaitBO, and no buffer is freed under a job that uses it) */
 		uint64_t seq = 0;
+		bool to_surface = false;    /* mali_dump: this pass draws a display surface */
 
 		fSubmits++;
 		gMaliSubmits++;
+		/* mali_dump: the fragment pass that composites onto a surface is the one the display
+		 * driver wants to copy, so its chain is the one to take -- read before the queue gets
+		 * it, while the GPU has still to start on the words */
+		if (mali_dump != 0 && (r.submit.requirements & PANFROST_JD_REQ_FS) != 0 && r.submit.jc != 0) {
+			for (uint32_t i = 0; i < r.submit.bo_handle_count && i < 4096; i += 64) {
+				uint32_t handles[64];
+				uint32_t n = r.submit.bo_handle_count - i < 64 ? r.submit.bo_handle_count - i : 64;
+
+				if (copyin((user_addr_t) (r.submit.bo_handles + i * sizeof(uint32_t)), handles, n * sizeof(uint32_t)) != 0) {
+					break;
+				}
+				for (uint32_t k = 0; k < n; k++) {
+					struct mali_buffer * named = buffer(handles[k]);
+
+					if (named != NULL && named->surface != NULL) {
+						to_surface = true;
+					}
+				}
+			}
+			if (to_surface) {
+				redwood_mali_dump(r.submit.jc);
+			}
+		}
 		if (r.submit.jc != 0) {
 			seq = redwood_mali_enqueue(r.submit.jc, r.submit.requirements & PANFROST_JD_REQ_FS);
 		}
