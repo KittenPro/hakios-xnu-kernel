@@ -1439,6 +1439,331 @@ redwood_mali_dump(uint64_t chain)
 	lck_mtx_unlock(&mali_lock);
 }
 
+/* ---- the frame to the panel by the GPU (boot-arg fb_mali=1) ----
+ *
+ * Scaling the display's 1125 x 2436 onto the panel's 1080 x 2400 is the one drawing the
+ * processor still does by hand, fb_threads of it every frame. The GPU can do it, and the
+ * recipe is one this stack already runs by the hundred: every frame the window server
+ * composites a full-screen textured pass, whose chain says "before the tiles, draw this
+ * descriptor" (the framebuffer's Pre Frame 0, mode Intersect) -- a four-vertex quad in the
+ * position buffer the descriptor names, and a fragment shader that fetches a texture at the
+ * coordinate a varying carries. The window server points that at the render target itself
+ * (loadOp LOAD, keeping what is there), which is a copy of a whole screen; here the same
+ * chain is replayed with the canvas as the texture and the panel as the target.
+ *
+ * The pieces are taken once, from the live chain of a submission that draws a display surface
+ * (the one mali_dump picks, and the same test: RedwoodMali.cpp calls
+ * redwood_mali_fb_capture before the job is queued, while the words are as the program wrote
+ * them): every descriptor and the shader's half kilobyte are copied out, and every pointer
+ * re-pointed at the copy. Nothing of the window server's is borrowed past that: the thread
+ * storage taken names no stack at all, and the tiler is dropped -- the pre-frame draw is the
+ * whole of the work, the polygon list of the pass the chain came from is not ours to draw.
+ *
+ * What is patched:
+ *
+ *   the framebuffer descriptor is the panel's: width, height, bounds, and the render target
+ *   (the panel's memory, which gets GPU addresses of its own; the boot framebuffer is
+ *   ordinary memory the display engine reads)
+ *
+ *   the quad stays 0,0 to 1125,2436 -- the panel clips it -- while the varying buffer (the
+ *   same four corners, as the shader's texture coordinate) is stretched to 1125^2/1080 and
+ *   2436^2/2400: a varying is interpolated across the quad it is fetched for, so each of the
+ *   panel's columns reads the canvas 1125/1080 times as far along -- the frame scaled, the
+ *   captured sampler's nearest neighbour, no column or row of it left out. Should the
+ *   hardware instead interpolate over the framebuffer's own extent, the picture will come
+ *   out cropped at the right and the bottom, and the run to compare against is fb_mali=1
+ *   with this buffer's ends left verbatim (one difference a run, as ever)
+ *
+ *   the texture's surface is the one word patched every frame (its base, and its row stride):
+ *   the window server makes itself a new canvas for every frame, and the surface's buffer
+ *   carries the GPU address (MiniIOSurface::maliAddress, RedwoodMali.cpp)
+ *
+ * A frame is asked of this by the display's presenter, once the GPU is done with its canvas
+ * (redwood_mali_fb_frame): one fragment job, enqueued and waited for like any other. A frame
+ * it does not finish falls back to the processor's scaling; three in a row give up. The
+ * canvas must be exactly the display's size and alone in its swap, or the processor draws.
+ */
+
+/* the one page, and where in it each piece sits (64-byte aligned, as the hardware wants) */
+#define FB_JOB        0x000u                  /* the fragment job, built anew each frame */
+#define FB_FBD        0x040u                  /* the framebuffer descriptor: parameters, padding, RT0 */
+#define FB_DCD        0x140u                  /* the pre-frame draw descriptor */
+#define FB_TEXTURE    0x1c0u                  /* the texture it samples */
+#define FB_SWS        0x200u                  /* the texture's surface: base and strides */
+#define FB_SAMPLER    0x240u
+#define FB_RSD        0x280u                  /* the renderer state */
+#define FB_SHADER     0x2c0u                  /* the shader's code, half a kilobyte */
+#define FB_TSD        0x4c0u                  /* the thread storage */
+#define FB_VIEWPORT   0x500u
+#define FB_SAMPLEPOS  0x540u                  /* the sample positions the framebuffer names */
+#define FB_QUAD       0x580u                  /* four vertices, four floats each: position */
+#define FB_UV         0x5c0u                  /* the same corners as the varying: stretched */
+#define FB_VDESC      0x600u                  /* the varying descriptor table */
+#define FB_VBUF       0x620u                  /* the varying buffer table */
+#define FB_BLOCK      0x640u
+
+static struct {
+	uint32_t    wanted, captured, built, failed, frames, attempts;
+	uint32_t    canvas_w, canvas_h;
+	uint64_t    canvas_delta;                  /* the captured render target's base, into its surface's buffer */
+	/* the pieces as captured, words as the GPU knows them */
+	uint64_t    fbd[32], dcd[16], texture[4], sws[2], sampler[4], rsd[8], shader[64];
+	uint64_t    tsd[4], viewport[4], samplepos[8], vdesc[2], vbuf[2];
+	/* the live copy of them, one page of kernel memory mapped at one GPU address */
+	uint64_t    gpu;
+	vm_offset_t kmem;
+	uint64_t    panel_gpu, panel_phys, panel_size;
+	uint32_t    panel_w, panel_h;
+} fb;
+static LCK_MTX_DECLARE(fb_lock, &mali_lock_group);
+
+/* Whether a submission should be looked at for a chain to take (RedwoodMali.cpp). */
+bool
+redwood_mali_fb_wanted(void)
+{
+	return fb.wanted && !fb.captured && fb.attempts < 5;
+}
+
+/*
+ * Take a chain apart. Called of a fragment submission that names a display surface, before the
+ * job is queued; a chain that is not the full-screen pass -- no reload, or a render target no
+ * buffer of ours holds -- is left for the next one (up to five, then never again).
+ */
+void redwood_mali_fb_capture(uint64_t chain);
+void
+redwood_mali_fb_capture(uint64_t chain)
+{
+	uint64_t payload[8], target;
+	bool taken = false;
+
+	if (!fb.wanted || fb.captured || fb.attempts >= 5 || chain == 0) {
+		return;
+	}
+	lck_mtx_lock(&fb_lock);
+	fb.attempts++;
+	lck_mtx_lock(&mali_lock);
+	/* the job's payload names the framebuffer (the word at +0x28; +0x20 holds the bounds in
+	 * tiles); the framebuffer's word 3 names the pre-frame draw; that draw's words name
+	 * everything else (the words are counted in 32-bit halves in the hardware's books; these
+	 * are 64-bit ones) */
+	if (gpu_read(chain + 0x20, payload, sizeof(payload)) &&
+	    (payload[1] & 0x3f) == 1 &&                          /* one render target, no ZS CRC */
+	    (payload[1] & ~0x3full) >= 0x100000 &&
+	    gpu_read(payload[1] & ~0x3full, fb.fbd, sizeof(fb.fbd)) &&
+	    fb.fbd[3] >= 0x100000 &&                          /* Frame Shader DCDs */
+	    gpu_read(fb.fbd[3], fb.dcd, sizeof(fb.dcd)) &&
+	    fb.dcd[4] >= 0x100000 &&                          /* Textures */
+	    gpu_read(fb.dcd[4], fb.texture, sizeof(fb.texture)) &&
+	    fb.texture[2] >= 0x100000 &&                      /* the texture's surfaces */
+	    gpu_read(fb.texture[2], fb.sws, sizeof(fb.sws)) &&
+	    fb.dcd[5] >= 0x100000 &&                          /* Samplers */
+	    gpu_read(fb.dcd[5], fb.sampler, sizeof(fb.sampler)) &&
+	    fb.dcd[7] >= 0x100000 &&                          /* State, the renderer state */
+	    gpu_read(fb.dcd[7], fb.rsd, sizeof(fb.rsd)) &&
+	    (fb.rsd[0] & ~0x3full) >= 0x100000 &&
+	    gpu_read(fb.rsd[0] & ~0x3full, fb.shader, sizeof(fb.shader)) &&
+	    fb.dcd[10] >= 0x100000 &&                         /* Varying buffers */
+	    gpu_read(fb.dcd[10], fb.vbuf, sizeof(fb.vbuf)) &&
+	    fb.dcd[11] >= 0x100000 &&                         /* Varyings */
+	    gpu_read(fb.dcd[11], fb.vdesc, sizeof(fb.vdesc)) &&
+	    fb.dcd[12] >= 0x100000 &&                         /* Viewport */
+	    gpu_read(fb.dcd[12], fb.viewport, sizeof(fb.viewport)) &&
+	    fb.dcd[14] >= 0x100000 &&                         /* Thread Storage */
+	    gpu_read(fb.dcd[14], fb.tsd, sizeof(fb.tsd)) &&
+	    fb.fbd[2] >= 0x100000 &&                          /* Sample Locations */
+	    gpu_read(fb.fbd[2], fb.samplepos, sizeof(fb.samplepos))) {
+		target = fb.fbd[20] & 0xfffffffffffff000ull;      /* RT0's RGB base: the canvas */
+		if ((fb.fbd[0] & 7) == 2 &&                       /* Pre Frame 0: Intersect, a reload */
+		    (fb.sws[0] & 0xfffffffffffff000ull) == target &&      /* the reload reads the target itself */
+		    (fb.fbd[4] & 0xffff) + (fb.fbd[4] >> 16 & 0xffff) != 0 &&    /* some size at all */
+		    (fb.fbd[4] & 0xffff) < 8191 && (fb.fbd[4] >> 16 & 0xffff) < 8191) {
+			for (int i = 0; i < MALI_RECENT; i++) {
+				if (mali_recent[i].size != 0 && mali_recent[i].kind == 2 &&
+				    target >= mali_recent[i].address && target < mali_recent[i].address + mali_recent[i].size) {
+					fb.canvas_w = (uint32_t)(fb.fbd[4] & 0xffff) + 1;
+					fb.canvas_h = (uint32_t)(fb.fbd[4] >> 16 & 0xffff) + 1;
+					fb.canvas_delta = target - mali_recent[i].address;
+					taken = true;
+					break;
+				}
+			}
+		}
+	}
+	lck_mtx_unlock(&mali_lock);
+	if (taken) {
+		fb.captured = 1;
+	}
+	lck_mtx_unlock(&fb_lock);
+	if (taken) {
+		redwood_keep("mali: a compositor chain taken for the panel: FBD %#llx (canvas %ux%u at %#llx, "
+		    "%u bytes a row), DCD %#llx, RSD %#llx, shader %#llx, sampler %#llx",
+		    payload[1] & ~0x3full, fb.canvas_w, fb.canvas_h, target, (uint32_t)fb.sws[1],
+		    fb.fbd[3], fb.dcd[7], fb.rsd[0] & ~0x3full, fb.dcd[5]);
+	} else if (fb.attempts == 5) {
+		redwood_keep("mali: no chain worth taking for the panel in %u tries: the processor keeps drawing", fb.attempts);
+	}
+}
+
+/* The copies and the panel's addresses, in one page. With fb_lock held; false: nothing was
+ * built and the processor keeps drawing (once said). */
+static bool
+fb_build(uint64_t panel_phys, uint32_t panel_w, uint32_t panel_h, uint32_t panel_stride)
+{
+	uint64_t *fbd, *dcd, *texture, *sampler, *rsd, *tsd, *viewport, *samplepos, *vdesc, *vbuf;
+	float *quad, *uv;
+	float u_end = (float)fb.canvas_w * (float)fb.canvas_w / (float)panel_w;
+	float v_end = (float)fb.canvas_h * (float)fb.canvas_h / (float)panel_h;
+	bool mapped = true;
+
+	if ((panel_phys & 0xfffull) != 0 || panel_w == 0 || panel_h == 0 || panel_stride < 4 * panel_w) {
+		redwood_keep("mali: the panel is not one the blit can draw (physical %#llx, %ux%u, %u bytes a row)",
+		    panel_phys, panel_w, panel_h, panel_stride);
+		return false;
+	}
+	fb.panel_w = panel_w;
+	fb.panel_h = panel_h;
+	fb.panel_phys = panel_phys;
+	fb.panel_size = ((uint64_t)panel_stride * panel_h + 0xfff) & ~0xfffull;
+	if (kmem_alloc(kernel_map, &fb.kmem, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
+	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+		return false;
+	}
+	fb.gpu = redwood_mali_address(PAGE_SIZE);
+	fb.panel_gpu = redwood_mali_address(fb.panel_size);
+	if (fb.gpu == 0 || fb.panel_gpu == 0) {
+		return false;
+	}
+	for (uint64_t at = 0; at < PAGE_SIZE && mapped; at += 4096) {
+		mapped = redwood_mali_map(fb.gpu + at, kvtophys(fb.kmem + at));
+	}
+	for (uint64_t at = 0; at < fb.panel_size && mapped; at += 4096) {
+		mapped = redwood_mali_map(fb.panel_gpu + at, panel_phys + at);
+	}
+	if (!mapped) {
+		return false;
+	}
+	redwood_mali_mapped();
+
+	/* the framebuffer descriptor: the panel's geometry and target, nobody's tiler */
+	fbd = (uint64_t *)(fb.kmem + FB_FBD);
+	memcpy(fbd, fb.fbd, 0x100);
+	fbd[2] = fb.gpu + FB_SAMPLEPOS;
+	fbd[3] = fb.gpu + FB_DCD;
+	fbd[4] = ((uint64_t)(panel_h - 1) << 16) | (panel_w - 1);            /* size, bounds min 0,0 */
+	fbd[5] = (fb.fbd[5] & 0xffffffff00000000ull) | ((uint64_t)(panel_h - 1) << 16) | (panel_w - 1);
+	fbd[7] = 0;                                                          /* Tiler: none */
+	fbd[0xa0 / 8] = fb.panel_gpu;                                        /* RT0's RGB base */
+	fbd[0xa8 / 8] = panel_stride;                                        /* RT0's row stride */
+
+	/* the draw: our quad, our varying, our copies of everything else */
+	dcd = (uint64_t *)(fb.kmem + FB_DCD);
+	memcpy(dcd, fb.dcd, sizeof(fb.dcd));
+	dcd[2] = fb.gpu + FB_QUAD;
+	dcd[4] = fb.gpu + FB_TEXTURE;
+	dcd[5] = fb.gpu + FB_SAMPLER;
+	dcd[7] = fb.gpu + FB_RSD;
+	dcd[10] = fb.gpu + FB_VBUF;
+	dcd[11] = fb.gpu + FB_VDESC;
+	dcd[12] = fb.gpu + FB_VIEWPORT;
+	dcd[14] = fb.gpu + FB_TSD;
+
+	texture = (uint64_t *)(fb.kmem + FB_TEXTURE);
+	memcpy(texture, fb.texture, sizeof(fb.texture));
+	texture[2] = fb.gpu + FB_SWS;
+	memcpy((uint64_t *)(fb.kmem + FB_SWS), fb.sws, sizeof(fb.sws));      /* base: every frame */
+	sampler = (uint64_t *)(fb.kmem + FB_SAMPLER);
+	memcpy(sampler, fb.sampler, sizeof(fb.sampler));
+	rsd = (uint64_t *)(fb.kmem + FB_RSD);
+	memcpy(rsd, fb.rsd, sizeof(fb.rsd));
+	rsd[0] = fb.gpu + FB_SHADER;                                         /* its Shader's one address word */
+	memcpy((uint64_t *)(fb.kmem + FB_SHADER), fb.shader, sizeof(fb.shader));
+	tsd = (uint64_t *)(fb.kmem + FB_TSD);
+	memcpy(tsd, fb.tsd, sizeof(fb.tsd));
+	viewport = (uint64_t *)(fb.kmem + FB_VIEWPORT);
+	memcpy(viewport, fb.viewport, sizeof(fb.viewport));
+	samplepos = (uint64_t *)(fb.kmem + FB_SAMPLEPOS);
+	memcpy(samplepos, fb.samplepos, sizeof(fb.samplepos));
+	vdesc = (uint64_t *)(fb.kmem + FB_VDESC);
+	memcpy(vdesc, fb.vdesc, sizeof(fb.vdesc));
+	vbuf = (uint64_t *)(fb.kmem + FB_VBUF);
+	vbuf[0] = (fb.gpu + FB_UV) | (fb.vbuf[0] & 0x3f);                    /* a 1D buffer, as captured */
+	vbuf[1] = fb.vbuf[1];                                                /* 64 bytes, stride 16 */
+
+	/* the quad, and the same corners stretched as the varying the shader fetches with */
+	quad = (float *)(fb.kmem + FB_QUAD);
+	uv = (float *)(fb.kmem + FB_UV);
+	for (unsigned v = 0; v < 4; v++) {
+		unsigned x = v & 1, y = v >> 1;
+
+		quad[4 * v + 0] = x ? (float)fb.canvas_w : 0.0f;
+		quad[4 * v + 1] = y ? (float)fb.canvas_h : 0.0f;
+		quad[4 * v + 2] = 0.0f;
+		quad[4 * v + 3] = 1.0f;
+		uv[4 * v + 0] = x ? u_end : 0.0f;
+		uv[4 * v + 1] = y ? v_end : 0.0f;
+		uv[4 * v + 2] = 0.0f;
+		uv[4 * v + 3] = 1.0f;
+	}
+	FlushPoC_DcacheRegion(fb.kmem, PAGE_SIZE);
+	redwood_keep("mali: the panel's blit built: canvas %ux%u onto %ux%u (physical %#llx), "
+	    "the UV ends %.3f and %.3f", fb.canvas_w, fb.canvas_h, panel_w, panel_h, panel_phys, u_end, v_end);
+	return true;
+}
+
+/*
+ * One frame: the canvas of `buffer` (a surface's GPU buffer, RedwoodMali.cpp) scaled onto the
+ * panel. False: the processor draws this one.
+ */
+bool redwood_mali_fb_frame(uint64_t buffer, uint32_t canvas_stride, uint64_t panel_phys,
+    uint32_t panel_w, uint32_t panel_h, uint32_t panel_stride);
+bool
+redwood_mali_fb_frame(uint64_t buffer, uint32_t canvas_stride, uint64_t panel_phys,
+    uint32_t panel_w, uint32_t panel_h, uint32_t panel_stride)
+{
+	uint64_t *job, *sws, seq;
+	uint32_t failed;
+
+	if (!fb.wanted || !fb.captured || fb.failed >= 3 || buffer == 0) {
+		return false;
+	}
+	lck_mtx_lock(&fb_lock);
+	if (!fb.built && !fb_build(panel_phys, panel_w, panel_h, panel_stride)) {
+		fb.failed++;
+		lck_mtx_unlock(&fb_lock);
+		return false;
+	}
+	fb.built = 1;
+
+	/* the texture's surface: the frame's canvas, wherever the window server put it */
+	sws = (uint64_t *)(fb.kmem + FB_SWS);
+	sws[0] = buffer + fb.canvas_delta;
+	sws[1] = (fb.sws[1] & 0xffffffff00000000ull) | canvas_stride;
+
+	/* the job, written anew: the hardware leaves its answer in the header's first words */
+	job = (uint64_t *)(fb.kmem + FB_JOB);
+	bzero(job, 64);
+	job[2] = 0x10013;                            /* a fragment job, 64-bit, no dependencies */
+	job[4] = ((((panel_h + 15) / 16 - 1) << 16) | (panel_w + 15) / 16 - 1);      /* bounds, in 16x16 tiles */
+	job[5] = (fb.gpu + FB_FBD) | 0x01;           /* the framebuffer: one render target */
+	FlushPoC_DcacheRegion((vm_offset_t)sws, 16);
+	FlushPoC_DcacheRegion((vm_offset_t)job, 64);
+
+	/* the worker counts a job that did not finish or faulted (gMaliFailed, the queue being one
+	 * at a time); a fault of the blit is then in last_failure's minute line with its address */
+	failed = gMaliFailed;
+	seq = redwood_mali_enqueue(fb.gpu + FB_JOB, true);
+	if (seq == 0 || !redwood_mali_wait(seq, 100ull * NSEC_PER_MSEC) || gMaliFailed != failed) {
+		fb.failed++;
+		redwood_keep("mali: the panel's blit did not finish (job %llu, %u of 3)%s", seq, fb.failed,
+		    fb.failed >= 3 ? ": giving up, the processor draws from now on" : "");
+		lck_mtx_unlock(&fb_lock);
+		return false;
+	}
+	fb.frames++;
+	lck_mtx_unlock(&fb_lock);
+	return true;
+}
+
 static void
 mali_thread(__unused void *parameter, __unused wait_result_t result)
 {
@@ -1452,6 +1777,13 @@ mali_thread(__unused void *parameter, __unused wait_result_t result)
 		printf("mali: step %u of 6; user space says %u%s; %u clients, %u buffers, %u job chains (%u failed), %u pictures shown\n",
 		    reached, user_said, user_said == 1 ? " -- a program ran a job on the GPU" : "", gMaliClients, gMaliBuffers,
 		    gMaliSubmits, gMaliFailed, gMaliShown);
+		if (fb.wanted) {
+			lck_mtx_lock(&fb_lock);
+			printf("mali: the panel's blit: %u frames by the GPU (%u unfinished%s); a chain taken on try %u of %u%s\n",
+			    fb.frames, fb.failed, fb.failed >= 3 ? ", given up" : "", fb.attempts, 5,
+			    fb.captured ? "" : ", nothing taken yet");
+			lck_mtx_unlock(&fb_lock);
+		}
 		lck_mtx_lock(&kept_lock);
 		for (uint32_t i = kept_next > KEPT_LINES ? kept_next - KEPT_LINES : 0; i < kept_next; i++) {
 			printf("kept: %s\n", kept_lines[i % KEPT_LINES]);
@@ -1491,6 +1823,7 @@ redwood_mali_init(void)
 	if (!PE_parse_boot_argn("mali", &on, sizeof(on)) || on == 0) {
 		return;
 	}
+	(void)PE_parse_boot_argn("fb_mali", &fb.wanted, sizeof(fb.wanted));
 	if (kernel_thread_start(mali_thread, NULL, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);
 	}

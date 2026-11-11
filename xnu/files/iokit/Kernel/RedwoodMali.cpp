@@ -46,6 +46,8 @@ uint32_t redwood_mali_submit(uint64_t chain, bool fragment);
 uint64_t redwood_mali_enqueue(uint64_t chain, bool fragment);
 bool redwood_mali_wait(uint64_t seq, uint64_t timeout_ns);
 void redwood_mali_dump(uint64_t chain);
+bool redwood_mali_fb_wanted(void);         /* the display driver wants a chain to replay on the panel (fb_mali=1) */
+void redwood_mali_fb_capture(uint64_t chain);
 extern uint32_t mali_dump;
 
 void RedwoodMaliStart(void);
@@ -263,6 +265,9 @@ RedwoodMaliUserClient::freeBuffer(struct mali_buffer * b)
 	redwood_mali_unmap(b->address, b->size);
 	b->memory->release();
 	if (b->surface != NULL) {
+		if (b->surface->maliAddress == b->address) {
+			b->surface->maliAddress = 0;       /* the blit draws by the processor until asked again */
+		}
 		MiniIOSurfaceDrop(b->surface);
 	}
 	bzero(b, sizeof(*b));
@@ -395,6 +400,7 @@ RedwoodMaliUserClient::surfaceBuffer(struct redwood_surface * request)
 		}
 	}
 	if (b != NULL) {
+		s->maliAddress = b->address;   /* the display driver's blit wants it (redwood_mali.c) */
 		memory->release();
 		MiniIOSurfaceDrop(s);
 		return kIOReturnSuccess;
@@ -409,6 +415,7 @@ RedwoodMaliUserClient::surfaceBuffer(struct redwood_surface * request)
 	b->surface = s;
 	redwood_mali_tag(b->address, 2, s->info.width, s->info.height, s->info.bytesPerRow, s->info.pixelFormat,
 	    (uint32_t) s->info.offset);
+	s->maliAddress = b->address;           /* the display driver's blit wants it (redwood_mali.c) */
 	return kIOReturnSuccess;
 }
 
@@ -542,8 +549,9 @@ RedwoodMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
 		gMaliSubmits++;
 		/* mali_dump: the fragment pass that composites onto a surface is the one the display
 		 * driver wants to copy, so its chain is the one to take -- read before the queue gets
-		 * it, while the GPU has still to start on the words */
-		if (mali_dump != 0 && (r.submit.requirements & PANFROST_JD_REQ_FS) != 0 && r.submit.jc != 0) {
+		 * it, while the GPU has still to start on the words. fb_mali wants the same pass, to
+		 * replay it on the panel every frame (redwood_mali.c) */
+		if ((mali_dump != 0 || redwood_mali_fb_wanted()) && (r.submit.requirements & PANFROST_JD_REQ_FS) != 0 && r.submit.jc != 0) {
 			for (uint32_t i = 0; i < r.submit.bo_handle_count && i < 4096; i += 64) {
 				uint32_t handles[64];
 				uint32_t n = r.submit.bo_handle_count - i < 64 ? r.submit.bo_handle_count - i : 64;
@@ -560,7 +568,12 @@ RedwoodMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
 				}
 			}
 			if (to_surface) {
-				redwood_mali_dump(r.submit.jc);
+				if (mali_dump != 0) {
+					redwood_mali_dump(r.submit.jc);
+				}
+				if (redwood_mali_fb_wanted()) {
+					redwood_mali_fb_capture(r.submit.jc);
+				}
 			}
 		}
 		if (r.submit.jc != 0) {

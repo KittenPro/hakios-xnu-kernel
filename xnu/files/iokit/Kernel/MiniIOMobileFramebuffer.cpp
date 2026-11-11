@@ -70,6 +70,9 @@ redwood_core_mhz(int *cpu)
 
 extern "C" void redwood_tl(const char * format, ...) __printflike(1, 2);
 extern "C" void redwood_keep(const char * format, ...) __printflike(1, 2);
+/* one frame scaled onto the panel by the GPU (fb_mali=1; bsd/dev/redwood_mali.c) */
+extern "C" bool redwood_mali_fb_frame(uint64_t buffer, uint32_t canvas_stride, uint64_t panel_phys,
+    uint32_t panel_w, uint32_t panel_h, uint32_t panel_stride);
 
 /* IOConnectCallMethod selectors of the framebuffer user client (iOS 16.5) */
 enum {
@@ -220,6 +223,13 @@ static TUNABLE(uint32_t, gOnTheBeat, "fb_beat", 1);
  */
 static TUNABLE(uint32_t, gThreads, "fb_threads", 3);
 /*
+ * Boot-arg fb_mali=1: the panel's frame is drawn by the GPU itself -- the compositor's own
+ * full-screen pass, taken once from a live submission and replayed with each frame's canvas
+ * as its texture (bsd/dev/redwood_mali.c), instead of fThreads processors scaling it by hand.
+ * Falls back to that for any frame the replay cannot take; three unfinished in a row, for good.
+ */
+static TUNABLE(uint32_t, gFBMali, "fb_mali", 0);
+/*
  * Three since 26 October: a swap comes in as soon as its command buffer is committed, before the GPU
  * has begun it, and waits here some 8 ms for the GPU and then for its beat -- 20 ms a frame. With two
  * places CoreAnimation's next swap found them both taken and waited (46 of 125 swaps, run 149), and the
@@ -355,6 +365,7 @@ public:
 	uint64_t        fStatWaiting;           /* how long frames waited for the GPU here */
 	/* how the display is doing: frames and time spent drawing them here since fStatSince */
 	uint32_t        fStatFrames;
+	uint32_t        fStatGPU;               /* ... of them scaled onto the panel by the GPU (fb_mali=1) */
 	uint64_t        fStatSince, fStatDrawing;
 	/* ... and how evenly: the time from each frame to the next, counted by the millisecond (the last count: longer) */
 	uint64_t        fLastFrame;
@@ -386,6 +397,7 @@ public:
 	static void presenterMain(void * self, wait_result_t result);
 	void reportFrameTimes(void);
 	void drawLayer(MiniIOSurface * s, const int32_t * src, const int32_t * dst);
+	bool byGPU(MiniIOSurface * s);
 	void drawRows(const struct RowJob * job, int32_t y0, int32_t y1, uint32_t * blendRow);
 	static void helperMain(void * self, wait_result_t result);
 	/* the scaling shared out (fb_threads): fThreads drawers, the presenter and fThreads - 1 helpers */
@@ -1002,6 +1014,22 @@ IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int
 }
 
 /*
+ * A frame by the GPU instead (fb_mali=1): its surface's pixels are already a buffer the Mali
+ * has (s->maliAddress, RedwoodMali.cpp), and the replay in bsd/dev/redwood_mali.c scales them
+ * onto the panel -- the panel's own memory, wherever in the boot framebuffer's picture this
+ * driver draws. Called only for a frame that is the whole display and alone in its swap, and
+ * not while flipping (the replay draws straight at what the display engine scans out); false:
+ * this one is drawn by the processor after all.
+ */
+bool
+IOMobileFramebuffer::byGPU(MiniIOSurface * s)
+{
+	uint64_t panel = (uint64_t) vinfo.v_physaddr + (uint64_t) (fBase - (uint8_t *) vinfo.v_baseaddr);
+
+	return redwood_mali_fb_frame(s->maliAddress, s->info.bytesPerRow, panel, fPanelWidth, fPanelHeight, fRowBytes);
+}
+
+/*
  * How evenly the frames of the last seconds came: how many followed the one before within the
  * time of one refresh at 120, 60, 40 and 30 a second, and the times half and 95 in 100 of them
  * stayed under. With the lock held.
@@ -1417,6 +1445,19 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 				fGraphics = true;
 				PE_initialize_console(NULL, kPEGraphicsMode);
 			}
+			/* the whole display and nothing else in the swap: the GPU can take the frame
+			 * itself (fb_mali=1), and no row of it is copied by the processor */
+			if (gFBMali != 0 && layer == 0 && !fFlip && fCropX == 0 && s->maliAddress != 0 &&
+			    s->info.width == fWidth && s->info.height == fHeight &&
+			    swapWord(swap, SWAP_SURFACE(1)) == 0 && swapWord(swap, SWAP_SURFACE(2)) == 0 &&
+			    swapWord(swap, SWAP_SURFACE(3)) == 0 &&
+			    src[0] == 0 && src[1] == 0 && src[2] == (int32_t) fWidth && src[3] == (int32_t) fHeight &&
+			    dst[0] == 0 && dst[1] == 0 && dst[2] == (int32_t) fWidth && dst[3] == (int32_t) fHeight &&
+			    byGPU(s)) {
+				fStatGPU++;
+				recorded = s;   /* (recorded once the frame is on the panel: the GPU has put it there) */
+				continue;
+			}
 			drawLayer(s, src, dst);
 			if (layer == 0) {
 				recorded = s;   /* (recorded once the frame is in the panel's memory: see below) */
@@ -1483,12 +1524,21 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 			measured++;
 			redwood_keep("MiniIOMobileFramebuffer: core %d runs at %u MHz", core, mhz);
 		}
-		IOLog("MiniIOMobileFramebuffer: %u frames in %llu ms (%llu a second), %llu us each in the driver, after %llu us "
-		    "waiting for the GPU and, %u of them, %llu us for the next refresh; %u swaps waited for the frame before, "
-		    "%u gave up; %u swaps came a refresh late themselves\n", fStatFrames, nanos / NSEC_PER_MSEC,
-		    fStatFrames * NSEC_PER_SEC / nanos, drawing / fStatFrames / NSEC_PER_USEC,
-		    waiting / fStatFrames / NSEC_PER_USEC, fStatOnBeat, fStatOnBeat ? beat / fStatOnBeat / NSEC_PER_USEC : 0,
-		    fStatHeld, fStatLost, fStatSwapsLate);
+		if (gFBMali != 0) {
+			IOLog("MiniIOMobileFramebuffer: %u frames in %llu ms (%llu a second), %llu us each in the driver, after %llu us "
+			    "waiting for the GPU and, %u of them, %llu us for the next refresh; %u swaps waited for the frame before, "
+			    "%u gave up; %u swaps came a refresh late themselves; %u frames by the GPU's blit\n", fStatFrames,
+			    nanos / NSEC_PER_MSEC, fStatFrames * NSEC_PER_SEC / nanos, drawing / fStatFrames / NSEC_PER_USEC,
+			    waiting / fStatFrames / NSEC_PER_USEC, fStatOnBeat, fStatOnBeat ? beat / fStatOnBeat / NSEC_PER_USEC : 0,
+			    fStatHeld, fStatLost, fStatSwapsLate, fStatGPU);
+		} else {
+			IOLog("MiniIOMobileFramebuffer: %u frames in %llu ms (%llu a second), %llu us each in the driver, after %llu us "
+			    "waiting for the GPU and, %u of them, %llu us for the next refresh; %u swaps waited for the frame before, "
+			    "%u gave up; %u swaps came a refresh late themselves\n", fStatFrames, nanos / NSEC_PER_MSEC,
+			    fStatFrames * NSEC_PER_SEC / nanos, drawing / fStatFrames / NSEC_PER_USEC,
+			    waiting / fStatFrames / NSEC_PER_USEC, fStatOnBeat, fStatOnBeat ? beat / fStatOnBeat / NSEC_PER_USEC : 0,
+			    fStatHeld, fStatLost, fStatSwapsLate);
+		}
 		if (recorded != NULL) {
 			/* what this frame looks like, for a run nobody watches: its average colour, and how much of it is not black */
 			uint64_t sum[3] = { 0, 0, 0 };
@@ -1534,6 +1584,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		bzero(fStatSurfaces, sizeof(fStatSurfaces));
 		fStatHeld = fStatLost = fStatOnBeat = 0;
 		fStatWaiting = fStatBeatWait = 0;
+		fStatGPU = 0;
 		reportFrameTimes();
 		if (gFlicker) {
 			/* (and the run's total, which the last of these lines carries past the log's lost middle) */
