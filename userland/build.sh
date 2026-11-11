@@ -182,6 +182,8 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 			-o obj/bt_test src/bt_test.m &&
 			{ ${LDID:-ldid} -Ssrc/bt_test.entitlements obj/bt_test 2>/dev/null ||
 			  echo "build.sh: no ldid: bt_test is unsigned, and TCC may not let it use Bluetooth"; }
+		# (Bluetooth's runs' probe: says from inside a process that the kernel's insertion reached it)
+		$DYN -dynamiclib -install_name /redwood/lib/libprobe.dylib -o obj/libprobe.dylib src/probe.c
 		$DYN -framework CoreFoundation -framework AVFoundation -lobjc -o obj/torch_test src/torch_test.c
 		$DYN -O2 -o obj/camera_test src/camera_test.c src/camera_isp.c
 		$DYN -fobjc-arc -framework Foundation -framework AVFoundation -o obj/camera_avtest src/camera_avtest.m
@@ -319,6 +321,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	mkdir -p root/dev root/private/var
 	mkdir -p root/lib
 	cp obj/libredwood.dylib obj/libredwood-sb.dylib root/lib/
+	[ -n "$BT" ] && [ -f obj/libprobe.dylib ] && cp obj/libprobe.dylib root/lib/     # (src/probe.c: the insertion probe, for Bluetooth's runs)
 	# the iOS 16 wallpaper as one picture, for SpringBoard where PosterBoard cannot draw it (src/inject_sb.c,
 	# put_wallpaper): drawn on this Mac from the .ca packages of the extracted system, with the Mac's own
 	# QuartzCore (../tools/render-ca-wallpaper.m), and not kept in the repository, being Apple's. Half the

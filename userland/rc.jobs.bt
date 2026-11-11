@@ -2,6 +2,9 @@
 # CoreBluetooth reports and a scan, which is also what wakes bluetoothd through launchd (it is on-demand
 # here). Settings -> Bluetooth is the switch and the device list; the psgrep lines say whether
 # bluetoothd, BlueTool and the keybag daemons are running without touching the screen.
+# The kern.exec_inject line is the insertion list as the kernel holds it now (psgrep -sysctl; the
+# probe library's lines -- "probe: NAME (pid N): ..." -- then say which processes actually got it).
+/redwood/bin/tolog /redwood/bin/psgrep -sysctl kern.exec_inject
 sleep 60
 /redwood/bin/tolog /redwood/bin/psgrep bluetoothd BlueTool keybagd wifid securityd
 /redwood/bin/tolog /redwood/bin/bt_test 30
