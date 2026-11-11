@@ -2833,7 +2833,12 @@ os_log_watched(const char *how, const char *format, uint8_t *buf, uint32_t size)
 	    strstr(format, "ompleted") != NULL || strstr(format, "nable") != NULL || strstr(format, "eady") != NULL ||
 	    strstr(format, "ransport") != NULL || strstr(format, "tack") != NULL || strstr(format, "hipset") != NULL ||
 	    strstr(format, "Sending") != NULL || strstr(format, "XPC message") != NULL || strstr(format, "uthoriz") != NULL ||
-	    strstr(format, "Found device") != NULL || strstr(format, "ADVBUFF") != NULL;
+	    strstr(format, "Found device") != NULL || strstr(format, "ADVBUFF") != NULL ||
+	    /* rosemary: the Dynamic Store is the one step the chain never reaches ("Update Dynamic Store with state On"),
+	     * and its own failure lines ("Failed to update Dynamic Store...", "Couldn't create a dynamic store") match
+	     * nothing above: "Failed to up*date*" is not "*tate*", and the store's setter is watched through the
+	     * manager-state line only. Without these the failure, if it is one, is said where nothing collects it */
+	    strstr(format, "ynamic") != NULL || strstr(format, "Couldn") != NULL || strstr(format, "onfigd") != NULL;
 
 	if (strstr(format, "Stack Did Start") != NULL) {
 		bluetoothd_after_start = true;
