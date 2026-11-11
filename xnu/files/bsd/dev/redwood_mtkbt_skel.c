@@ -221,8 +221,8 @@ redwood_connsys_bt_send(const uint8_t *bytes, unsigned length)
  * own log (BTLOG, src/inject.c's watcher) says which command it stopped at.
  *  - Apple's vendor commands (OGF 0x3f) are Broadcom's; the MediaTek controller says "Unknown HCI Command" (Command Status, status 1) to each
  *    and bluetoothd restarts ("VSC stall detected", reason 3602). Each is answered as done: Command Complete, status 0, and the data its parser
- *    reads after the status -- a byte for 0xfd48, 16 for 0xfce2 with sub-command 0x15 or 0x36, 64 (the first 0x51) for 0xfd1b, none for the rest
- *    (data on 0xfce9 left the next command unsent).
+ *    reads after the status -- a byte for 0xfd48, 16 for 0xfce2 with sub-command 0x15, 0x36 or 0x1e, 64 (the first 0x51) for 0xfd1b, none for the
+ *    rest (data on 0xfce9 left the next command unsent).
  *  - Write_Default_Erroneous_Data_Reporting (0x0c5b), also "Unknown HCI Command", is answered as done.
  *  - rosemary's firmware answers Command Disallowed (0x0c) to LE_Set_Scan_Parameters (0x200b) after the vendor sequence has run
  *    (bt2d: every death is 21 ms after that answer; the sibling's firmware answered 0 and its scans ran). Apple's stack faults its
@@ -316,7 +316,15 @@ skel_quirks(uint8_t *packet, unsigned length)
 	}
 	if (length == 7 && packet[0] == 0x04 && packet[1] == 0x0f && packet[2] == 0x04 && packet[3] == 0x01 && packet[4] == 0x01 &&
 	    (packet[6] >> 2) == 0x3f) {
-		const bool antenna = packet[5] == 0xe2 && packet[6] == 0xfc && (skel_vsc_sub == 0x15 || skel_vsc_sub == 0x36);
+		/*
+		 * 0x1e is BD_VSC_OLYMPIC_READ_BT_SETTINGS by its place in the cycle (a read: the stack asks it on every scan restart), and
+		 * bt2l is its run: the status alone was answered, and every scan cycle from 70 s to the round's end came back to it -- the
+		 * stack's manager never left "Unknown" ("Ignoring XPC message as state is Unknown", Preferences' pairing agent refused,
+		 * the Bluetooth page never opened, bt2k the same). The sibling's run 673 is the precedent: 0x36 stalled a scan's start
+		 * the same way until 16 zeros were given. 0x1e never reached the sibling's wire at all; the zeroed settings say "everything
+		 * off", which is what an untouched controller has anyway.
+		 */
+		const bool antenna = packet[5] == 0xe2 && packet[6] == 0xfc && (skel_vsc_sub == 0x15 || skel_vsc_sub == 0x36 || skel_vsc_sub == 0x1e);
 		const bool cal = packet[5] == 0x1b && packet[6] == 0xfd;
 		const bool data = antenna || cal || (packet[5] == 0x48 && packet[6] == 0xfd);
 		const unsigned extra = cal ? 64 : (antenna ? 16 : (data ? 1 : 0));
