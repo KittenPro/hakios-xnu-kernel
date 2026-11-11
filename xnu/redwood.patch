@@ -3487,7 +3487,7 @@ diff --git a/tools/lldbmacros/core/syntax_checker.py b/tools/lldbmacros/core/syn
 index 3ebc295117a3..de101eafc83b 100755
 --- a/tools/lldbmacros/core/syntax_checker.py
 +++ b/tools/lldbmacros/core/syntax_checker.py
-@@ -12,11 +12,14 @@ Usage:
+@@ -12,10 +12,13 @@ Usage:
  """
  import sys
  import os
