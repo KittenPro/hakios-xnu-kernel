@@ -249,15 +249,23 @@ skel_out_quirks(uint8_t *packet, unsigned length)
 	if (length == 12 && packet[0] == 0x01 && packet[1] == 0x01 && packet[2] == 0x20 && packet[3] == 0x08) {
 		packet[5] |= 0x20;                   /* LE_Set_Event_Mask: bit 13, subevent 0x0d, the extended advertising report */
 	} else if (length == 11 && packet[0] == 0x01 && packet[1] == 0x0b && packet[2] == 0x20) {
-		/* LE_Set_Scan_Parameters -> LE_Set_Extended_Scan_Parameters: Scanning_PHYs (the 1M PHY) before the same seven bytes */
-		packet[11] = packet[10];
-		packet[10] = packet[9];
-		packet[9] = packet[8];
-		packet[8] = packet[7];
-		packet[7] = packet[6];
-		packet[6] = packet[5];
-		packet[5] = packet[4];
-		packet[4] = 0x01;
+		/*
+		 * LE_Set_Scan_Parameters -> LE_Set_Extended_Scan_Parameters: a reorder, not an insertion. The legacy order is
+		 * type, interval, window, own address type, filter policy; the extended order is own address type, filter policy,
+		 * Scanning_PHYs, then per PHY type, interval, window -- the stock's own snoop, its taken 0x2041 is 01 00 01 01
+		 * a0 00 a0 00. bt2g inserted Scanning_PHYs as the first parameter, so the firmware read the stack's interval
+		 * low byte 0x40 -- a reserved bit -- in its place and answered Invalid Parameters to every try.
+		 */
+		const uint8_t type = packet[4], i0 = packet[5], i1 = packet[6], w0 = packet[7], w1 = packet[8];
+
+		packet[4] = packet[9];              /* own address type, first now */
+		packet[5] = packet[10];             /* filter policy, second */
+		packet[6] = 0x01;                   /* Scanning_PHYs: the 1M PHY, third */
+		packet[7] = type;
+		packet[8] = i0;
+		packet[9] = i1;
+		packet[10] = w0;
+		packet[11] = w1;
 		packet[3] = 0x08;
 		packet[1] = 0x41;
 		return 12;
