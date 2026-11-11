@@ -1306,13 +1306,15 @@ redwood_mali_dump(uint64_t chain)
 		}
 	}
 	if (own < 0) {
-		printf("mali dump: chain %#llx is in no buffer of the last %u\n", chain, (unsigned) MALI_RECENT);
+		redwood_keep("mali dump: chain %#llx is in no buffer of the last %u", chain, (unsigned) MALI_RECENT);
 		lck_mtx_unlock(&mali_lock);
 		return;
 	}
 	size = whole > 0x8000 ? 0x8000 : (uint32_t) whole;        /* (the jobs and their descriptors sit at the front) */
-	printf("mali dump: chain %#llx, the buffer of %#llx bytes at %#llx: %u bytes of it kept for the host\n", chain,
-	    whole, window, size);
+	/* said as a kept line as well: the console keeps a run's head and tail only, and this is said
+	 * in the middle of one (the md lines below are for the pmsg zone alone) */
+	redwood_keep("mali dump: chain %#llx, the buffer of %#llx bytes at %#llx: %u bytes of it kept for the host",
+	    chain, whole, window, size);
 	dump_line("md chain %#llx buffer %#llx %llu bytes (this many read: %u)", chain, window, whole, size);
 
 	/* the chain's job headers, following each one's next (a chain's jobs share its buffer) */
