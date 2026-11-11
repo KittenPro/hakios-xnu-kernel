@@ -288,6 +288,32 @@ skel_quirks(uint8_t *packet, unsigned length)
 {
 	static const uint8_t le_commands[4] = { 0xf7, 0xff, 0xff, 0x7f };
 
+	if (length >= 29 && packet[0] == 0x04 && packet[1] == 0x3e && packet[3] == 0x0d && packet[4] == 1) {
+		/*
+		 * The extended advertising report (what bt2h's scanning brought to the wire: 52 of them, three neighbours) become
+		 * the legacy report the stack reads -- the stack asked its scan the legacy way, so subevent 0x02 is the shape it
+		 * has been waiting for since bt2d. The event type maps (scan response to 4, directed to 1, connectable to 0,
+		 * scannable to 2, else 3), the address and its type go as they are, the data is clamped to the legacy 31 bytes,
+		 * the RSSI moves after the data; one report per event is what the firmware sends (a pair would pass untouched).
+		 */
+		const uint8_t et = packet[5], at = packet[7], rssi = packet[18];
+		unsigned dlen = packet[28];
+
+		if (dlen > 31) {
+			dlen = 31;
+		}
+		memmove(packet + 14, packet + 29, dlen);   /* the data, forward: everything after it is dropped */
+		packet[14 + dlen] = rssi;                  /* the legacy report ends with it */
+		memmove(packet + 7, packet + 8, 6);        /* the address, one byte forward */
+		packet[6] = at;
+		packet[13] = (uint8_t)dlen;
+		packet[5] = (et & 0x08) ? 0x04 : (et & 0x04) ? 0x01 : (et & 0x01) ? 0x00 : (et & 0x02) ? 0x02 : 0x03;
+		packet[4] = 1;
+		packet[3] = 0x02;
+		packet[2] = (uint8_t)(12 + dlen);
+		say("a 0x0d report become the 0x02 the stack reads (%u bytes of data)", dlen);
+		return 15 + dlen;
+	}
 	if (length == 7 && packet[0] == 0x04 && packet[1] == 0x0f && packet[2] == 0x04 && packet[3] == 0x01 && packet[4] == 0x01 &&
 	    (packet[6] >> 2) == 0x3f) {
 		const bool antenna = packet[5] == 0xe2 && packet[6] == 0xfc && (skel_vsc_sub == 0x15 || skel_vsc_sub == 0x36);
