@@ -1531,6 +1531,46 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 			    nanos / NSEC_PER_MSEC, fStatFrames * NSEC_PER_SEC / nanos, drawing / fStatFrames / NSEC_PER_USEC,
 			    waiting / fStatFrames / NSEC_PER_USEC, fStatOnBeat, fStatOnBeat ? beat / fStatOnBeat / NSEC_PER_USEC : 0,
 			    fStatHeld, fStatLost, fStatSwapsLate, fStatGPU);
+			/* what the panel itself holds, read the way the display engine reads it -- past every
+			 * cache, a write-combined mapping -- and, once, where the display's overlay engine
+			 * reads from at all: whether the blit's answer is where the screen looks */
+			static const volatile uint32_t * panel;
+			static bool looked;
+
+			if (!looked) {
+				volatile uint32_t * ovl = (volatile uint32_t *) ml_io_map(FLIP_OVL0, PAGE_SIZE);
+
+				looked = true;
+				redwood_keep("MiniIOMobileFramebuffer: the overlay engine reads %#x; the console's framebuffer is at %#llx",
+				    ovl != NULL ? ovl[FLIP_OVL_L0_ADDR / 4] : 0, (unsigned long long) vinfo.v_physaddr);
+			}
+			if (panel == NULL) {
+				panel = (const volatile uint32_t *) ml_io_map_wcomb(vinfo.v_physaddr,
+				    (vm_size_t) fRowBytes * fPanelHeight);
+			}
+			if (panel != NULL) {
+				uint64_t sum[3] = { 0, 0, 0 };
+				uint32_t lit = 0, samples = 0;
+
+				for (uint32_t y = fPanelHeight / 64; y < fPanelHeight; y += fPanelHeight / 32) {
+					const volatile uint32_t * row = panel + (size_t) y * (fRowBytes / 4);
+
+					for (uint32_t x = fPanelWidth / 32; x < fPanelWidth; x += fPanelWidth / 16) {
+						uint32_t pixel = row[x];    /* B G R A in memory */
+
+						sum[0] += (pixel >> 16) & 0xff;
+						sum[1] += (pixel >> 8) & 0xff;
+						sum[2] += pixel & 0xff;
+						lit += ((pixel >> 16) & 0xff) + ((pixel >> 8) & 0xff) + (pixel & 0xff) > 48;
+						samples++;
+					}
+				}
+				if (samples != 0) {
+					IOLog("MiniIOMobileFramebuffer: the panel on average red %llu green %llu blue %llu; "
+					    "%u%% of it not black\n", sum[0] / samples, sum[1] / samples, sum[2] / samples,
+					    lit * 100 / samples);
+				}
+			}
 		} else {
 			IOLog("MiniIOMobileFramebuffer: %u frames in %llu ms (%llu a second), %llu us each in the driver, after %llu us "
 			    "waiting for the GPU and, %u of them, %llu us for the next refresh; %u swaps waited for the frame before, "

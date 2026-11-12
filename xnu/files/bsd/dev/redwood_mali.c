@@ -46,6 +46,7 @@
 #include <vm/vm_kern.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
 extern uint64_t kvtophys(vm_offset_t va);
 extern void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);
 extern vm_offset_t phystokv(uint64_t pa);
@@ -1514,7 +1515,7 @@ static struct {
 	uint64_t    gpu;
 	vm_offset_t kmem;
 	uint64_t    panel_gpu, panel_phys, panel_size;
-	uint32_t    panel_w, panel_h;
+	uint32_t    panel_w, panel_h, panel_stride;
 } fb;
 static LCK_MTX_DECLARE(fb_lock, &mali_lock_group);
 
@@ -1623,6 +1624,7 @@ fb_build(uint64_t panel_phys, uint32_t panel_w, uint32_t panel_h, uint32_t panel
 	}
 	fb.panel_w = panel_w;
 	fb.panel_h = panel_h;
+	fb.panel_stride = panel_stride;
 	fb.panel_phys = panel_phys;
 	fb.panel_size = ((uint64_t)panel_stride * panel_h + 0xfff) & ~0xfffull;
 	if (kmem_alloc(kernel_map, &fb.kmem, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
@@ -1771,6 +1773,35 @@ redwood_mali_fb_frame(uint64_t buffer, uint32_t canvas_stride, uint64_t panel_ph
 		return false;
 	}
 	fb.frames++;
+	if (fb.frames == 1) {
+		/* whether the blit drew on the panel at all: read the panel the way the display
+		 * engine does, past every cache (a write-combined mapping, as fb_flip maps its
+		 * second picture), and say what colour it came out */
+		const volatile uint32_t *words =
+		    (const volatile uint32_t *) ml_io_map_wcomb(fb.panel_phys, (vm_size_t) fb.panel_size);
+
+		if (words != NULL) {
+			uint64_t sum[3] = { 0, 0, 0 };
+			uint32_t lit = 0, samples = 0;
+
+			for (uint32_t y = fb.panel_h / 64; y < fb.panel_h; y += fb.panel_h / 32) {
+				for (uint32_t x = fb.panel_w / 32; x < fb.panel_w; x += fb.panel_w / 16) {
+					uint32_t pixel = words[(size_t) y * (fb.panel_stride / 4) + x];
+
+					sum[0] += (pixel >> 16) & 0xff;
+					sum[1] += (pixel >> 8) & 0xff;
+					sum[2] += pixel & 0xff;
+					lit += ((pixel >> 16) & 0xff) + ((pixel >> 8) & 0xff) + (pixel & 0xff) > 48;
+					samples++;
+				}
+			}
+			if (samples != 0) {
+				redwood_keep("mali: the panel after the first blit: on average red %llu green %llu blue %llu; "
+				    "%u%% of it not black", sum[0] / samples, sum[1] / samples, sum[2] / samples,
+				    lit * 100 / samples);
+			}
+		}
+	}
 	lck_mtx_unlock(&fb_lock);
 	return true;
 }
