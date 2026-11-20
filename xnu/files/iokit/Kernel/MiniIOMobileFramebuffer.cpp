@@ -501,7 +501,9 @@ IOMobileFramebuffer::publishModes(void)
 #define FLIP_LK_FB_SIZE         0x1050000ULL
 extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern "C" vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
+extern "C" vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, uint32_t flags);
 extern "C" void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
+#define VM_WIMG_IO              0x7             /* osfmk/vm/vm_map.h, as redwood_mtkwifi.c takes it */
 static TUNABLE(uint32_t, gFlipOn, "fb_flip", 0);
 
 void
@@ -1550,9 +1552,13 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 				 * once, whole of the kernel's page, and unmap that same whole page. io_map
 				 * returns start+offset, so unmapping the returned pointer of an unaligned base
 				 * (0x1400b000 -> offset 0x3000) is a partial-page range, and pmap_remove of it
-				 * panicked write_pte_fast on this PAGE_RATIO_4 build (gpu5e's row probe) */
+				 * panicked write_pte_fast on this PAGE_RATIO_4 build (gpu5e's row probe). The
+				 * map is ml_io_map_unmappable, not ml_io_map: the plain one allocates
+				 * KMA_PERMANENT in the io_submap, and gpu5f's ml_io_unmap of such a window
+				 * panicked vm_map_delete ("Attempting to remove permanent VM map entry");
+				 * the unmappable one takes kernel_map with KMA_DATA, freeable */
 				vm_offset_t base = (vm_offset_t) (bases[0] & ~(uint64_t) (PAGE_SIZE - 1));
-				volatile uint32_t * map = (volatile uint32_t *) ml_io_map(base, PAGE_SIZE);
+				volatile uint32_t * map = (volatile uint32_t *) ml_io_map_unmappable(base, PAGE_SIZE, VM_WIMG_IO);
 
 				looked = true;
 				if (map != NULL) {

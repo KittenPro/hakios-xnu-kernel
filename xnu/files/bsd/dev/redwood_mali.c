@@ -46,8 +46,10 @@
 #include <vm/vm_kern.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
-extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
+extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, uint32_t flags);
 extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
+
+#define VM_WIMG_WCOMB           0x6             /* osfmk/vm/vm_map.h, as redwood_mtkwifi.c takes it */
 extern uint64_t kvtophys(vm_offset_t va);
 extern void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);
 extern vm_offset_t phystokv(uint64_t pa);
@@ -1739,8 +1741,12 @@ fb_build(uint64_t panel_phys, uint32_t panel_w, uint32_t panel_h, uint32_t panel
  * rounded to the KERNEL's page, PAGE_SIZE -- 16 KB on this build (PAGE_RATIO_4), not the
  * 4 KB of the hardware: gpu5e rounded it to 4 KB and ml_io_unmap's pmap_remove, handed a
  * range not whole of a VM page, walked the sub-pages and panicked write_pte_fast (the
- * 4-PTE write wants ptep 32-byte aligned, pmap.c). The grid is the presenter's own: 32
- * rows of 16 pixels, the same share of "not black" as the canvas's report.
+ * 4-PTE write wants ptep 32-byte aligned, pmap.c). And the map is ml_io_map_unmappable,
+ * not ml_io_map_wcomb: the latter's io_map allocates KMA_PERMANENT -- gpu5f's whole-page
+ * window still panicked 28.1 s in, ml_io_unmap's kmem_free -> vm_map_delete: "Attempting
+ * to remove permanent VM map entry"; the unmappable one takes kernel_map with KMA_DATA,
+ * freeable, as redwood_mtkwifi.c maps its trace windows. The grid is the presenter's own:
+ * 32 rows of 16 pixels, the same share of "not black" as the canvas's report.
  */
 void redwood_panel_color(uint64_t phys, uint32_t w, uint32_t h, uint32_t stride,
     uint64_t sum[3], uint32_t *lit, uint32_t *samples);
@@ -1760,7 +1766,7 @@ redwood_panel_color(uint64_t phys, uint32_t w, uint32_t h, uint32_t stride,
 		vm_offset_t off = (vm_offset_t) (row & (PAGE_SIZE - 1));
 		vm_size_t win = (vm_size_t) ((off + stride + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1));
 		const volatile uint32_t *words =
-		    (const volatile uint32_t *) ml_io_map_wcomb(row - off, win);
+		    (const volatile uint32_t *) ml_io_map_unmappable(row - off, win, VM_WIMG_WCOMB);
 
 		if (words == NULL) {
 			continue;
