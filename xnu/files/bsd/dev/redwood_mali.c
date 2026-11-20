@@ -1685,8 +1685,10 @@ fb_build(uint64_t panel_phys, uint32_t panel_w, uint32_t panel_h, uint32_t panel
 	 * the context is taken while the buffer lives (fb.tiler) and copied here, with its heap
 	 * pointer and FB size made ours and its polygon list and state reset for a fresh draw --
 	 * jm_emit_tiler_desc, pan_jm.c, builds one the same way for every batch (v7.xml Tiler Context,
-	 * Tiler Heap). The reload's mode is turned from Intersect to Always: the draw runs on every
-	 * tile in the bounds, which a whole-screen blit wants anyway, so no polygon list is needed.
+	 * Tiler Heap). The reload's mode is turned from Intersect to Always: the shader runs on every
+	 * tile in the bounds, which a whole-screen blit wants anyway, so no polygon list is needed --
+	 * but Always only writes the tiles out with the DCD's Clean Fragment Write bit clear, which
+	 * is done below (the pair Mesa keeps: always_write => Always + clean_fragment_write=0).
 	 * The writeback stays as taken (Linear: the canvas is plain rows too, its 4608 a row being
 	 * 1125 pixels' 4500 with the window server's padding). */
 	fbd = (uint64_t *)(fb.kmem + FB_FBD);
@@ -1724,6 +1726,14 @@ fb_build(uint64_t panel_phys, uint32_t panel_w, uint32_t panel_h, uint32_t panel
 	/* the draw: our quad, our varying, our copies of everything else */
 	dcd = (uint64_t *)(fb.kmem + FB_DCD);
 	memcpy(dcd, fb.dcd, sizeof(fb.dcd));
+	/* Clean Fragment Write OFF -- the other half of the Always mode, and gpu5i's black. The
+	 * captured DCD is an Intersect preload, so its bit 11 is set: a tile the preload shader
+	 * alone touched is still "clean", and clean tiles are NOT written back. gpu5i turned the
+	 * mode to Always but kept the bit, so the shader ran on every tile (~850 us, no fault)
+	 * and the panel stayed black -- the result was never written out. Mesa pairs the two
+	 * (pan_fb_preload.c: clean_fragment_write = !always_write, mode = always_write ? Always :
+	 * Intersect): to write every tile of a geometry-less blit, Always needs the bit CLEAR. */
+	dcd[0] &= ~(1ull << 11);
 	dcd[2] = fb.gpu + FB_QUAD;
 	dcd[4] = fb.gpu + FB_TEXTURE;
 	dcd[5] = fb.gpu + FB_SAMPLER;
