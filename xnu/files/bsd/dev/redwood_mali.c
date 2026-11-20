@@ -1799,6 +1799,22 @@ fb_build(uint64_t panel_phys, uint32_t panel_w, uint32_t panel_h, uint32_t panel
 		uv[4 * v + 3] = 1.0f;
 	}
 	FlushPoC_DcacheRegion(fb.kmem, PAGE_SIZE);
+	/* gpu5m: the chain as built, once, to read against the wild fault. gpu5l copied the Blend
+	 * (opaque, no shader PC) and kept the shader at its cache address, yet the fault stayed at
+	 * ~0xfb7fXXXX -- so the wild pointer is not the blend. Every descriptor matches Mesa's emit
+	 * word for word; what is left is the data the shader reads at run time: the texture's base
+	 * (patched per frame below) and the varying it samples through. These words say which. */
+	dump_line("mali fbm built: FBD rt %016llx %016llx base %016llx stride %016llx", fbd[16], fbd[17], fbd[20], fbd[21]);
+	dump_line("mali fbm built: DCD %016llx pos %016llx tex %016llx samp %016llx rsd %016llx vbuf %016llx vdesc %016llx tsd %016llx",
+	    dcd[0], dcd[2], dcd[4], dcd[5], dcd[7], dcd[10], dcd[11], dcd[14]);
+	dump_line("mali fbm built: tex %016llx %016llx surf %016llx; sampler %016llx %016llx",
+	    texture[0], texture[1], texture[2], sampler[0], sampler[1]);
+	dump_line("mali fbm built: RSD %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx",
+	    rsd[0], rsd[1], rsd[2], rsd[3], rsd[4], rsd[5], rsd[6], rsd[7]);
+	dump_line("mali fbm built: blend %016llx %016llx; vbuf %016llx %016llx; vdesc %016llx %016llx",
+	    rsd[8], rsd[9], vbuf[0], vbuf[1], vdesc[0], vdesc[1]);
+	dump_line("mali fbm built: shader taken %016llx %016llx %016llx %016llx %016llx %016llx",
+	    fb.shader[0], fb.shader[1], fb.shader[2], fb.shader[3], fb.shader[4], fb.shader[5]);
 	redwood_keep("mali: the panel's blit built: canvas %ux%u onto %ux%u (physical %#llx), "
 	    "the UV ends %u.%03u and %u.%03u, the tiler ours %#llx (heap %#llx, %u KB)", fb.canvas_w, fb.canvas_h, panel_w, panel_h, panel_phys,
 	    (uint32_t)u_end, (uint32_t)(u_end * 1000.0f) % 1000, (uint32_t)v_end, (uint32_t)(v_end * 1000.0f) % 1000,
@@ -1899,6 +1915,24 @@ redwood_mali_fb_frame(uint64_t buffer, uint32_t canvas_stride, uint64_t panel_ph
 	job[5] = (fb.gpu + FB_FBD) | 0x01;           /* the framebuffer: one render target */
 	FlushPoC_DcacheRegion((vm_offset_t)sws, 16);
 	FlushPoC_DcacheRegion((vm_offset_t)job, 64);
+
+	/* gpu5m: the texture's base this frame, and whether the shader the RSD names still reads as
+	 * the bytes taken at capture. If the base is the wild ~0xfb7fXXXX the fault is the surface
+	 * (buffer + canvas_delta); if the base is a live canvas address and the shader reads back the
+	 * same, the wild pointer is the varying the shader samples through -- which a geometry-less
+	 * empty tile has no interpolation for. Said on each attempt while none has finished. */
+	if (fb.frames == 0) {
+		uint64_t live[2] = {0, 0};
+		uint64_t sh = fb.rsd[0] & ~0x3full;
+		bool got = gpu_read(sh, live, sizeof(live));
+		dump_line("mali fbm: try %u tex base %#llx (buffer %#llx + delta %#llx) gpu %#llx panel %#llx; "
+		    "shader %#llx read %d live %016llx %016llx taken %016llx %016llx",
+		    fb.failed + 1, (unsigned long long) sws[0], (unsigned long long) buffer,
+		    (unsigned long long) fb.canvas_delta, (unsigned long long) fb.gpu,
+		    (unsigned long long) fb.panel_gpu, (unsigned long long) sh, got,
+		    (unsigned long long) live[0], (unsigned long long) live[1],
+		    (unsigned long long) fb.shader[0], (unsigned long long) fb.shader[1]);
+	}
 
 	/* the worker counts a job that did not finish or faulted (gMaliFailed, the queue being one
 	 * at a time); a fault of the blit is then in last_failure's minute line with its address */
