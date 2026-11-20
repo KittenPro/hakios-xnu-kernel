@@ -73,6 +73,9 @@ extern "C" void redwood_keep(const char * format, ...) __printflike(1, 2);
 /* one frame scaled onto the panel by the GPU (fb_mali=1; bsd/dev/redwood_mali.c) */
 extern "C" bool redwood_mali_fb_frame(uint64_t buffer, uint32_t canvas_stride, uint64_t panel_phys,
     uint32_t panel_w, uint32_t panel_h, uint32_t panel_stride);
+/* the panel's colour, read past every cache a row's window at a time (the same file) */
+extern "C" void redwood_panel_color(uint64_t phys, uint32_t w, uint32_t h, uint32_t stride,
+    uint64_t sum[3], uint32_t *lit, uint32_t *samples);
 
 /* IOConnectCallMethod selectors of the framebuffer user client (iOS 16.5) */
 enum {
@@ -498,6 +501,7 @@ IOMobileFramebuffer::publishModes(void)
 #define FLIP_LK_FB_SIZE         0x1050000ULL
 extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern "C" vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
+extern "C" void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
 static TUNABLE(uint32_t, gFlipOn, "fb_flip", 0);
 
 void
@@ -1532,39 +1536,35 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 			    waiting / fStatFrames / NSEC_PER_USEC, fStatOnBeat, fStatOnBeat ? beat / fStatOnBeat / NSEC_PER_USEC : 0,
 			    fStatHeld, fStatLost, fStatSwapsLate, fStatGPU);
 			/* what the panel itself holds, read the way the display engine reads it -- past every
-			 * cache, a write-combined mapping -- and, once, where the display's overlay engine
-			 * reads from at all: whether the blit's answer is where the screen looks */
-			static const volatile uint32_t * panel;
+			 * cache, a row's write-combined window at a time (the whole panel is 10 MB and every
+			 * ml_io_map lives in the 8 MB io_submap: gpu5c's one mapping of it panicked) -- and,
+			 * once, where the overlay engine reads from at all. OVL0's base is not the same on
+			 * every SoC: the MT6785's is 0x14008000, the MT6768's 0x1400b000, each the other's
+			 * RDMA0 (mtkloader/mtkdbg.h); read both, every layer's address and SRC_CON, beside
+			 * the console's own framebuffer, and the run says which block scans what */
 			static bool looked;
 
 			if (!looked) {
-				volatile uint32_t * ovl = (volatile uint32_t *) ml_io_map(FLIP_OVL0, PAGE_SIZE);
+				static const uint64_t bases[2] = { 0x14008000ULL, 0x1400b000ULL };
 
 				looked = true;
-				redwood_keep("MiniIOMobileFramebuffer: the overlay engine reads %#x; the console's framebuffer is at %#llx",
-				    ovl != NULL ? ovl[FLIP_OVL_L0_ADDR / 4] : 0, (unsigned long long) vinfo.v_physaddr);
-			}
-			if (panel == NULL) {
-				panel = (const volatile uint32_t *) ml_io_map_wcomb(vinfo.v_physaddr,
-				    (vm_size_t) fRowBytes * fPanelHeight);
-			}
-			if (panel != NULL) {
-				uint64_t sum[3] = { 0, 0, 0 };
-				uint32_t lit = 0, samples = 0;
+				for (unsigned b = 0; b < 2; b++) {
+					volatile uint32_t * ovl = (volatile uint32_t *) ml_io_map(bases[b], PAGE_SIZE);
 
-				for (uint32_t y = fPanelHeight / 64; y < fPanelHeight; y += fPanelHeight / 32) {
-					const volatile uint32_t * row = panel + (size_t) y * (fRowBytes / 4);
-
-					for (uint32_t x = fPanelWidth / 32; x < fPanelWidth; x += fPanelWidth / 16) {
-						uint32_t pixel = row[x];    /* B G R A in memory */
-
-						sum[0] += (pixel >> 16) & 0xff;
-						sum[1] += (pixel >> 8) & 0xff;
-						sum[2] += pixel & 0xff;
-						lit += ((pixel >> 16) & 0xff) + ((pixel >> 8) & 0xff) + (pixel & 0xff) > 48;
-						samples++;
+					if (ovl != NULL) {
+						redwood_keep("MiniIOMobileFramebuffer: OVL at %#llx: SRC_CON %#x, layer addresses %#x %#x %#x %#x; "
+						    "the console's framebuffer is at %#llx", (unsigned long long) bases[b], ovl[0x02c / 4],
+						    ovl[0xf40 / 4], ovl[0xf60 / 4], ovl[0xf80 / 4], ovl[0xfa0 / 4],
+						    (unsigned long long) vinfo.v_physaddr);
+						ml_io_unmap((vm_offset_t) ovl, PAGE_SIZE);
 					}
 				}
+			}
+			{
+				uint64_t sum[3];
+				uint32_t lit, samples;
+
+				redwood_panel_color(vinfo.v_physaddr, fPanelWidth, fPanelHeight, fRowBytes, sum, &lit, &samples);
 				if (samples != 0) {
 					IOLog("MiniIOMobileFramebuffer: the panel on average red %llu green %llu blue %llu; "
 					    "%u%% of it not black\n", sum[0] / samples, sum[1] / samples, sum[2] / samples,

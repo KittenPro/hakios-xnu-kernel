@@ -47,6 +47,7 @@
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
+extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
 extern uint64_t kvtophys(vm_offset_t va);
 extern void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);
 extern vm_offset_t phystokv(uint64_t pa);
@@ -1721,6 +1722,51 @@ fb_build(uint64_t panel_phys, uint32_t panel_w, uint32_t panel_h, uint32_t panel
 }
 
 /*
+ * The panel's colour, sampled where the display engine reads it -- past every cache, a
+ * write-combined mapping. Not one mapping of the whole panel: every ml_io_map lives in the
+ * io_submap, which is 8 MB whole (osfmk/arm/io_map.c, IO_MAP_SIZE), and this panel is 10 of
+ * them -- gpu5c's readback of it panicked 28.5 s in, kmem_alloc(10452992) failed with 3 and
+ * KMA_NOFAIL made the failure fatal. A row at a time instead: the row's two or three pages
+ * mapped, sampled, unmapped, as redwood_connsys.c reads its trace windows. The grid is the
+ * presenter's own: 32 rows of 16 pixels, the same share of "not black" as the canvas's report.
+ */
+void redwood_panel_color(uint64_t phys, uint32_t w, uint32_t h, uint32_t stride,
+    uint64_t sum[3], uint32_t *lit, uint32_t *samples);
+void
+redwood_panel_color(uint64_t phys, uint32_t w, uint32_t h, uint32_t stride,
+    uint64_t sum[3], uint32_t *lit, uint32_t *samples)
+{
+	uint32_t ystep = h / 32 != 0 ? h / 32 : 1, xstep = w / 16 != 0 ? w / 16 : 1;
+
+	sum[0] = sum[1] = sum[2] = 0;
+	*lit = *samples = 0;
+	if (w == 0 || h == 0 || stride < 4 * w) {
+		return;
+	}
+	for (uint32_t y = h / 64; y < h; y += ystep) {
+		uint64_t row = phys + (uint64_t) y * stride;
+		vm_offset_t off = (vm_offset_t) (row & 0xfff);
+		vm_size_t win = (vm_size_t) ((off + stride + 0xfff) & ~0xfffull);
+		const volatile uint32_t *words =
+		    (const volatile uint32_t *) ml_io_map_wcomb(row - off, win);
+
+		if (words == NULL) {
+			continue;
+		}
+		for (uint32_t x = w / 32; x < w; x += xstep) {
+			uint32_t pixel = words[off / 4 + x];    /* B G R A in memory */
+
+			sum[0] += (pixel >> 16) & 0xff;
+			sum[1] += (pixel >> 8) & 0xff;
+			sum[2] += pixel & 0xff;
+			*lit += ((pixel >> 16) & 0xff) + ((pixel >> 8) & 0xff) + (pixel & 0xff) > 48;
+			(*samples)++;
+		}
+		ml_io_unmap((vm_offset_t) words, win);
+	}
+}
+
+/*
  * One frame: the canvas of `buffer` (a surface's GPU buffer, RedwoodMali.cpp) scaled onto the
  * panel. False: the processor draws this one.
  */
@@ -1775,31 +1821,16 @@ redwood_mali_fb_frame(uint64_t buffer, uint32_t canvas_stride, uint64_t panel_ph
 	fb.frames++;
 	if (fb.frames == 1) {
 		/* whether the blit drew on the panel at all: read the panel the way the display
-		 * engine does, past every cache (a write-combined mapping, as fb_flip maps its
-		 * second picture), and say what colour it came out */
-		const volatile uint32_t *words =
-		    (const volatile uint32_t *) ml_io_map_wcomb(fb.panel_phys, (vm_size_t) fb.panel_size);
+		 * engine does, past every cache, a row's window at a time (the whole panel does
+		 * not fit the io_submap: gpu5c's panic), and say what colour it came out */
+		uint64_t sum[3];
+		uint32_t lit, samples;
 
-		if (words != NULL) {
-			uint64_t sum[3] = { 0, 0, 0 };
-			uint32_t lit = 0, samples = 0;
-
-			for (uint32_t y = fb.panel_h / 64; y < fb.panel_h; y += fb.panel_h / 32) {
-				for (uint32_t x = fb.panel_w / 32; x < fb.panel_w; x += fb.panel_w / 16) {
-					uint32_t pixel = words[(size_t) y * (fb.panel_stride / 4) + x];
-
-					sum[0] += (pixel >> 16) & 0xff;
-					sum[1] += (pixel >> 8) & 0xff;
-					sum[2] += pixel & 0xff;
-					lit += ((pixel >> 16) & 0xff) + ((pixel >> 8) & 0xff) + (pixel & 0xff) > 48;
-					samples++;
-				}
-			}
-			if (samples != 0) {
-				redwood_keep("mali: the panel after the first blit: on average red %llu green %llu blue %llu; "
-				    "%u%% of it not black", sum[0] / samples, sum[1] / samples, sum[2] / samples,
-				    lit * 100 / samples);
-			}
+		redwood_panel_color(fb.panel_phys, fb.panel_w, fb.panel_h, fb.panel_stride, sum, &lit, &samples);
+		if (samples != 0) {
+			redwood_keep("mali: the panel after the first blit: on average red %llu green %llu blue %llu; "
+			    "%u%% of it not black", sum[0] / samples, sum[1] / samples, sum[2] / samples,
+			    lit * 100 / samples);
 		}
 	}
 	lck_mtx_unlock(&fb_lock);
