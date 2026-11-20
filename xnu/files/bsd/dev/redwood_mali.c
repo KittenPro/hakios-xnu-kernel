@@ -1506,6 +1506,8 @@ redwood_mali_dump(uint64_t chain)
 #define FB_VDESC      0x600u                  /* the varying descriptor table */
 #define FB_VBUF       0x620u                  /* the varying buffer table */
 #define FB_BLOCK      0x640u
+#define FB_TILER_HEAP 0x680u                  /* our tiler heap's descriptor: size, base, bottom, top */
+#define FB_TILER_CTX  0x6c0u                  /* our tiler context: the chain's, heap and size our own */
 
 static struct {
 	uint32_t    wanted, captured, built, failed, frames, attempts;
@@ -1514,11 +1516,14 @@ static struct {
 	/* the pieces as captured, words as the GPU knows them */
 	uint64_t    fbd[32], dcd[16], texture[4], sws[2], sampler[4], rsd[8], shader[64];
 	uint64_t    tsd[4], viewport[4], samplepos[8], vdesc[2], vbuf[2];
+	uint64_t    tiler[24];                     /* the chain's tiler context, taken while its buffer lives */
 	/* the live copy of them, one page of kernel memory mapped at one GPU address */
 	uint64_t    gpu;
 	vm_offset_t kmem;
 	uint64_t    panel_gpu, panel_phys, panel_size;
 	uint32_t    panel_w, panel_h, panel_stride;
+	uint64_t    heap_gpu, heap_size;           /* our own tiler heap, mapped in the GPU's tables */
+	vm_offset_t heap_kmem;
 } fb;
 static LCK_MTX_DECLARE(fb_lock, &mali_lock_group);
 
@@ -1576,7 +1581,9 @@ redwood_mali_fb_capture(uint64_t chain)
 	    fb.dcd[14] >= 0x100000 &&                         /* Thread Storage */
 	    gpu_read(fb.dcd[14], fb.tsd, sizeof(fb.tsd)) &&
 	    fb.fbd[2] >= 0x100000 &&                          /* Sample Locations */
-	    gpu_read(fb.fbd[2], fb.samplepos, sizeof(fb.samplepos))) {
+	    gpu_read(fb.fbd[2], fb.samplepos, sizeof(fb.samplepos)) &&
+	    fb.fbd[7] >= 0x100000 &&                          /* the Tiler Context, while its buffer still lives */
+	    gpu_read(fb.fbd[7], fb.tiler, sizeof(fb.tiler))) {
 		target = fb.fbd[20] & 0xfffffffffffff000ull;      /* RT0's RGB base: the canvas */
 		if ((fb.fbd[0] & 7) == 2 &&                       /* Pre Frame 0: Intersect, a reload */
 		    (fb.sws[0] & 0xfffffffffffff000ull) == target &&      /* the reload reads the target itself */
@@ -1648,21 +1655,40 @@ fb_build(uint64_t panel_phys, uint32_t panel_w, uint32_t panel_h, uint32_t panel
 	if (!mapped) {
 		return false;
 	}
+	/* our own tiler heap. The chain's tiler context points into a buffer the compositor frees
+	 * between frames -- gpu5h kept the pointer and the GPU faulted at it ("FREED already"), so
+	 * the blit carries its own heap instead of borrowing the compositor's. A megabyte is plenty
+	 * for one quad's polygon lists; the compositor's 128 MB is for all of its draws. */
+	fb.heap_size = 0x100000;
+	if (kmem_alloc(kernel_map, &fb.heap_kmem, (vm_size_t) fb.heap_size, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
+	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+		return false;
+	}
+	fb.heap_gpu = redwood_mali_address(fb.heap_size);
+	if (fb.heap_gpu == 0) {
+		return false;
+	}
+	for (uint64_t at = 0; at < fb.heap_size && mapped; at += 4096) {
+		mapped = redwood_mali_map(fb.heap_gpu + at, kvtophys(fb.heap_kmem + at));
+	}
+	if (!mapped) {
+		return false;
+	}
 	redwood_mali_mapped();
 
-	/* the framebuffer descriptor: the panel's geometry and target, and the tiler the chain
-	 * came with -- KEPT. gpu5 and gpu5b zeroed this field ("Tiler: none") and every round
-	 * of that left the screen black: a Bifrost fragment job with no tiler context has no
-	 * tile layout, finishes clean and draws nothing. gpu4c's dump shows the captured
-	 * fbd[7] a live pointer (0x13ad1700 there) to a Tiler Context whose 128 MB heap stays
-	 * mapped in the compositor's GPU address space, and Mesa fills the field for every
-	 * batch (jm_emit_tiler_desc, pan_jm.c; v7.xml's Framebuffer Parameters word 14). The
-	 * replay's own tiler pass regenerates the polygon list in that heap; the context's
-	 * canvas-sized FB (1125x2436) covers the panel's bounds. The reload's mode is turned
-	 * from Intersect to Always as gpu5b had it: the draw runs on every tile in the bounds,
-	 * which a whole-screen blit wants anyway. The writeback stays as taken (Linear: the
-	 * canvas is plain rows too, its 4608 a row being 1125 pixels' 4500 with the window
-	 * server's padding). */
+	/* the framebuffer descriptor: the panel's geometry and target, and a tiler of OUR OWN.
+	 * gpu5/gpu5b zeroed fbd[7] ("Tiler: none") and the screen stayed black: a Bifrost fragment
+	 * job with no tiler context has no tile layout, finishes clean and draws nothing. gpu5e..gpu5h
+	 * kept the captured pointer instead -- but that context (and its heap) live in a panfrost BO
+	 * the compositor FREES between frames: gpu5h's blit ran clean twice while the buffer lived,
+	 * then MMU-faulted at the kept pointer ("FREED already") and fell back to the processor. So
+	 * the context is taken while the buffer lives (fb.tiler) and copied here, with its heap
+	 * pointer and FB size made ours and its polygon list and state reset for a fresh draw --
+	 * jm_emit_tiler_desc, pan_jm.c, builds one the same way for every batch (v7.xml Tiler Context,
+	 * Tiler Heap). The reload's mode is turned from Intersect to Always: the draw runs on every
+	 * tile in the bounds, which a whole-screen blit wants anyway, so no polygon list is needed.
+	 * The writeback stays as taken (Linear: the canvas is plain rows too, its 4608 a row being
+	 * 1125 pixels' 4500 with the window server's padding). */
 	fbd = (uint64_t *)(fb.kmem + FB_FBD);
 	memcpy(fbd, fb.fbd, 0x100);
 	fbd[0] = (fbd[0] & ~7ull) | 1;                                       /* Pre Frame 0: Always */
@@ -1670,7 +1696,28 @@ fb_build(uint64_t panel_phys, uint32_t panel_w, uint32_t panel_h, uint32_t panel
 	fbd[3] = fb.gpu + FB_DCD;
 	fbd[4] = ((uint64_t)(panel_h - 1) << 16) | (panel_w - 1);            /* size, bounds min 0,0 */
 	fbd[5] = (fb.fbd[5] & 0xffffffff00000000ull) | ((uint64_t)(panel_h - 1) << 16) | (panel_w - 1);
-	/* fbd[7]: the captured Tiler pointer stays as taken -- the one difference of gpu5e */
+
+	/* the tiler heap's descriptor, and the context pointing at it -- both in our page, both
+	 * mapped, neither the compositor's to free. Words are the hardware's 32-bit ones. */
+	uint32_t *heap = (uint32_t *)(fb.kmem + FB_TILER_HEAP);
+	uint32_t *tiler = (uint32_t *)(fb.kmem + FB_TILER_CTX);
+	memcpy(tiler, fb.tiler, sizeof(fb.tiler));                           /* hierarchy, sample pattern, weights: the chain's */
+	bzero(heap, 32);
+	heap[1] = (uint32_t) fb.heap_size;                                   /* Tiler Heap: size, base, bottom, top */
+	heap[2] = (uint32_t) fb.heap_gpu;
+	heap[3] = (uint32_t) (fb.heap_gpu >> 32);
+	heap[4] = heap[2];                                                   /* bottom = base: the whole heap free */
+	heap[5] = heap[3];
+	heap[6] = (uint32_t) (fb.heap_gpu + fb.heap_size);
+	heap[7] = (uint32_t) ((fb.heap_gpu + fb.heap_size) >> 32);
+	tiler[0] = tiler[1] = 0;                                             /* polygon list: none, Always draws every tile */
+	tiler[3] = ((panel_h - 1) << 16) | (panel_w - 1);                    /* FB width/height, minus one */
+	tiler[6] = (uint32_t) (fb.gpu + FB_TILER_HEAP);                      /* the heap descriptor, ours */
+	tiler[7] = (uint32_t) ((fb.gpu + FB_TILER_HEAP) >> 32);
+	for (unsigned w = 32; w < 48; w++) {                                 /* State: reset for the fresh heap */
+		tiler[w] = 0;
+	}
+	fbd[7] = fb.gpu + FB_TILER_CTX;                                      /* the tiler, ours */
 	fbd[0xa0 / 8] = fb.panel_gpu;                                        /* RT0's RGB base */
 	fbd[0xa8 / 8] = panel_stride;                                        /* RT0's row stride */
 
@@ -1725,9 +1772,9 @@ fb_build(uint64_t panel_phys, uint32_t panel_w, uint32_t panel_h, uint32_t panel
 	}
 	FlushPoC_DcacheRegion(fb.kmem, PAGE_SIZE);
 	redwood_keep("mali: the panel's blit built: canvas %ux%u onto %ux%u (physical %#llx), "
-	    "the UV ends %u.%03u and %u.%03u, the tiler kept %#llx", fb.canvas_w, fb.canvas_h, panel_w, panel_h, panel_phys,
+	    "the UV ends %u.%03u and %u.%03u, the tiler ours %#llx (heap %#llx, %u KB)", fb.canvas_w, fb.canvas_h, panel_w, panel_h, panel_phys,
 	    (uint32_t)u_end, (uint32_t)(u_end * 1000.0f) % 1000, (uint32_t)v_end, (uint32_t)(v_end * 1000.0f) % 1000,
-	    (unsigned long long) fbd[7]);
+	    (unsigned long long) fbd[7], (unsigned long long) fb.heap_gpu, (uint32_t) (fb.heap_size / 1024));
 	return true;
 }
 
