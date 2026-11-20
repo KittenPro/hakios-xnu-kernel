@@ -1546,18 +1546,25 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 
 			if (!looked) {
 				static const uint64_t bases[2] = { 0x14008000ULL, 0x1400b000ULL };
+				/* both bases fall in one 16 KB-aligned region (0x14008000..0x1400c000): map it
+				 * once, whole of the kernel's page, and unmap that same whole page. io_map
+				 * returns start+offset, so unmapping the returned pointer of an unaligned base
+				 * (0x1400b000 -> offset 0x3000) is a partial-page range, and pmap_remove of it
+				 * panicked write_pte_fast on this PAGE_RATIO_4 build (gpu5e's row probe) */
+				vm_offset_t base = (vm_offset_t) (bases[0] & ~(uint64_t) (PAGE_SIZE - 1));
+				volatile uint32_t * map = (volatile uint32_t *) ml_io_map(base, PAGE_SIZE);
 
 				looked = true;
-				for (unsigned b = 0; b < 2; b++) {
-					volatile uint32_t * ovl = (volatile uint32_t *) ml_io_map(bases[b], PAGE_SIZE);
+				if (map != NULL) {
+					for (unsigned b = 0; b < 2; b++) {
+						volatile uint32_t * ovl = map + (bases[b] - base) / 4;
 
-					if (ovl != NULL) {
 						redwood_keep("MiniIOMobileFramebuffer: OVL at %#llx: SRC_CON %#x, layer addresses %#x %#x %#x %#x; "
 						    "the console's framebuffer is at %#llx", (unsigned long long) bases[b], ovl[0x02c / 4],
 						    ovl[0xf40 / 4], ovl[0xf60 / 4], ovl[0xf80 / 4], ovl[0xfa0 / 4],
 						    (unsigned long long) vinfo.v_physaddr);
-						ml_io_unmap((vm_offset_t) ovl, PAGE_SIZE);
 					}
+					ml_io_unmap(base, PAGE_SIZE);
 				}
 			}
 			{

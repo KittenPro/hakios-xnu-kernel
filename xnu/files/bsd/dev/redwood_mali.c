@@ -1734,9 +1734,13 @@ fb_build(uint64_t panel_phys, uint32_t panel_w, uint32_t panel_h, uint32_t panel
  * write-combined mapping. Not one mapping of the whole panel: every ml_io_map lives in the
  * io_submap, which is 8 MB whole (osfmk/arm/io_map.c, IO_MAP_SIZE), and this panel is 10 of
  * them -- gpu5c's readback of it panicked 28.5 s in, kmem_alloc(10452992) failed with 3 and
- * KMA_NOFAIL made the failure fatal. A row at a time instead: the row's two or three pages
- * mapped, sampled, unmapped, as redwood_connsys.c reads its trace windows. The grid is the
- * presenter's own: 32 rows of 16 pixels, the same share of "not black" as the canvas's report.
+ * KMA_NOFAIL made the failure fatal. A row at a time instead: the row's one or two pages
+ * mapped, sampled, unmapped, as redwood_connsys.c reads its trace windows. The window is
+ * rounded to the KERNEL's page, PAGE_SIZE -- 16 KB on this build (PAGE_RATIO_4), not the
+ * 4 KB of the hardware: gpu5e rounded it to 4 KB and ml_io_unmap's pmap_remove, handed a
+ * range not whole of a VM page, walked the sub-pages and panicked write_pte_fast (the
+ * 4-PTE write wants ptep 32-byte aligned, pmap.c). The grid is the presenter's own: 32
+ * rows of 16 pixels, the same share of "not black" as the canvas's report.
  */
 void redwood_panel_color(uint64_t phys, uint32_t w, uint32_t h, uint32_t stride,
     uint64_t sum[3], uint32_t *lit, uint32_t *samples);
@@ -1753,8 +1757,8 @@ redwood_panel_color(uint64_t phys, uint32_t w, uint32_t h, uint32_t stride,
 	}
 	for (uint32_t y = h / 64; y < h; y += ystep) {
 		uint64_t row = phys + (uint64_t) y * stride;
-		vm_offset_t off = (vm_offset_t) (row & 0xfff);
-		vm_size_t win = (vm_size_t) ((off + stride + 0xfff) & ~0xfffull);
+		vm_offset_t off = (vm_offset_t) (row & (PAGE_SIZE - 1));
+		vm_size_t win = (vm_size_t) ((off + stride + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1));
 		const volatile uint32_t *words =
 		    (const volatile uint32_t *) ml_io_map_wcomb(row - off, win);
 
