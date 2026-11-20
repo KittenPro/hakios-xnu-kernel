@@ -1698,6 +1698,15 @@ fb_build(uint64_t panel_phys, uint32_t panel_w, uint32_t panel_h, uint32_t panel
 	fbd[3] = fb.gpu + FB_DCD;
 	fbd[4] = ((uint64_t)(panel_h - 1) << 16) | (panel_w - 1);            /* size, bounds min 0,0 */
 	fbd[5] = (fb.fbd[5] & 0xffffffff00000000ull) | ((uint64_t)(panel_h - 1) << 16) | (panel_w - 1);
+	/* Empty Tile Read + Write Enable (word 12, bits 28/29) -- gpu5j's black. The blit has no
+	 * geometry, so every tile is "empty": no polygon in the list. The captured FBD keeps both
+	 * bits clear (the compositor's reload runs on tiles its draws already filled, never empty
+	 * ones), and with them clear the hardware skips empty tiles -- the Always pre-frame shader
+	 * never runs on them and nothing is written back, hence ~850 us of clean GPU work and a
+	 * black panel. Mesa never sets these (pan_desc.c leaves them 0) because a Bifrost preload
+	 * always rides a batch WITH draws; a geometry-less blit is the case they exist for. Set
+	 * both so every empty tile is processed and written. */
+	fbd[6] |= (1ull << 28) | (1ull << 29);
 
 	/* the tiler heap's descriptor, and the context pointing at it -- both in our page, both
 	 * mapped, neither the compositor's to free. Words are the hardware's 32-bit ones. */
