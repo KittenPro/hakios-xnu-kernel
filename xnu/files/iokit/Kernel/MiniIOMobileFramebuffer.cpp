@@ -1570,7 +1570,12 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 						    ovl[0xf40 / 4], ovl[0xf60 / 4], ovl[0xf80 / 4], ovl[0xfa0 / 4],
 						    (unsigned long long) vinfo.v_physaddr);
 					}
-					ml_io_unmap(base, PAGE_SIZE);
+					/* unmap the RETURNED virtual pointer, not the physical base: gpu5g handed
+					 * ml_io_unmap the base 0x14008000 itself and pmap_remove_options panicked
+					 * "invalid address range, start=0x14008000" -- a physical address where a
+					 * kernel virtual one belongs. The row probe unmaps its returned pointer and
+					 * lived; this one must too */
+					ml_io_unmap((vm_offset_t) map, PAGE_SIZE);
 				}
 			}
 			{
