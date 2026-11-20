@@ -1458,10 +1458,12 @@ redwood_mali_dump(uint64_t chain)
  * The pieces are taken once, from the live chain of a submission that draws a display surface
  * (the one mali_dump picks, and the same test: RedwoodMali.cpp calls
  * redwood_mali_fb_capture before the job is queued, while the words are as the program wrote
- * them): every descriptor and the shader's half kilobyte are copied out, and every pointer
- * re-pointed at the copy. Nothing of the window server's is borrowed past that: the thread
- * storage taken names no stack at all, and the tiler is dropped -- the pre-frame draw is the
- * whole of the work, the polygon list of the pass the chain came from is not ours to draw.
+ * them): every descriptor is copied out and every pointer re-pointed at the copy, save the
+ * shader's address -- a preload shader is a persistent Mesa cache program (not a per-batch buffer
+ * the compositor frees), so it is referenced where it lives, and the Blend descriptors that
+ * follow the renderer state are copied along with it. The thread storage taken names no stack at
+ * all, and the tiler is dropped -- the pre-frame draw is the whole of the work, the polygon list
+ * of the pass the chain came from is not ours to draw.
  *
  * What is patched:
  *
@@ -1496,8 +1498,7 @@ redwood_mali_dump(uint64_t chain)
 #define FB_TEXTURE    0x1c0u                  /* the texture it samples */
 #define FB_SWS        0x200u                  /* the texture's surface: base and strides */
 #define FB_SAMPLER    0x240u
-#define FB_RSD        0x280u                  /* the renderer state */
-#define FB_SHADER     0x2c0u                  /* the shader's code, half a kilobyte */
+#define FB_RSD        0x280u                  /* the renderer state + the Blend descriptors after it (128 B) */
 #define FB_TSD        0x4c0u                  /* the thread storage */
 #define FB_VIEWPORT   0x500u
 #define FB_SAMPLEPOS  0x540u                  /* the sample positions the framebuffer names */
@@ -1514,7 +1515,7 @@ static struct {
 	uint32_t    canvas_w, canvas_h;
 	uint64_t    canvas_delta;                  /* the captured render target's base, into its surface's buffer */
 	/* the pieces as captured, words as the GPU knows them */
-	uint64_t    fbd[32], dcd[16], texture[4], sws[2], sampler[4], rsd[8], shader[64];
+	uint64_t    fbd[32], dcd[16], texture[4], sws[2], sampler[4], rsd[16], shader[64];
 	uint64_t    tsd[4], viewport[4], samplepos[8], vdesc[2], vbuf[2];
 	uint64_t    tiler[24];                     /* the chain's tiler context, taken while its buffer lives */
 	/* the live copy of them, one page of kernel memory mapped at one GPU address */
@@ -1759,9 +1760,17 @@ fb_build(uint64_t panel_phys, uint32_t panel_w, uint32_t panel_h, uint32_t panel
 	sampler = (uint64_t *)(fb.kmem + FB_SAMPLER);
 	memcpy(sampler, fb.sampler, sizeof(fb.sampler));
 	rsd = (uint64_t *)(fb.kmem + FB_RSD);
+	/* the renderer state AND the Blend descriptors that follow it. Mesa appends one Blend per
+	 * render target right at RSD + 64 (pan_fb_preload.c, pan_preload_emit_rsd). gpu5k copied only
+	 * the 64-byte RSD and laid the shader copy immediately after it, so the hardware read shader
+	 * code as the Blend descriptor: a Blend's Internal Blend defaults to Mode=Shader and carries a
+	 * blend-shader PC, which decoded to a wild address (0xfb7f7570) -- the MMU fault that appeared
+	 * only once gpu5k's empty-tile bits let the shader run (gpu5i/j skipped it, so the missing
+	 * blend was invisible). Copy the whole RSD+blend block so the blend is the captured
+	 * fixed-function one. rsd[0] keeps the captured shader address: a preload shader is a
+	 * persistent Mesa cache program, not a per-batch buffer the compositor frees, so it is
+	 * referenced where it lives -- and there is no 512-byte copy to truncate mid-clause. */
 	memcpy(rsd, fb.rsd, sizeof(fb.rsd));
-	rsd[0] = fb.gpu + FB_SHADER;                                         /* its Shader's one address word */
-	memcpy((uint64_t *)(fb.kmem + FB_SHADER), fb.shader, sizeof(fb.shader));
 	tsd = (uint64_t *)(fb.kmem + FB_TSD);
 	memcpy(tsd, fb.tsd, sizeof(fb.tsd));
 	viewport = (uint64_t *)(fb.kmem + FB_VIEWPORT);
