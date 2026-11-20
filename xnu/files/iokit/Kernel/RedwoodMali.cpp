@@ -48,6 +48,7 @@ bool redwood_mali_wait(uint64_t seq, uint64_t timeout_ns);
 void redwood_mali_dump(uint64_t chain);
 bool redwood_mali_fb_wanted(void);         /* the display driver wants a chain to replay on the panel (fb_mali=1) */
 void redwood_mali_fb_capture(uint64_t chain);
+void redwood_mali_fb_capture_vt(uint64_t chain);   /* gpu5n: the tiler side of the taken pass, dumped once */
 extern uint32_t mali_dump;
 
 void RedwoodMaliStart(void);
@@ -547,6 +548,15 @@ RedwoodMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
 
 		fSubmits++;
 		gMaliSubmits++;
+		/* gpu5n: the vertex/tiler submission of a pass goes BEFORE its fragment one (Mesa
+		 * submits the vtc chain first, then the fragment with PANFROST_JD_REQ_FS), and carries
+		 * no REQ_FS bit. Remember the last one while a chain is still wanted: the fragment
+		 * capture below dumps it right after taking the fragment side (the pair's tiler
+		 * context must match the FBD's -- the dump says whether it does). */
+		static uint64_t vt_jc = 0;
+		if (redwood_mali_fb_wanted() && (r.submit.requirements & PANFROST_JD_REQ_FS) == 0 && r.submit.jc != 0) {
+			vt_jc = r.submit.jc;
+		}
 		/* mali_dump: the fragment pass that composites onto a surface is the one the display
 		 * driver wants to copy, so its chain is the one to take -- read before the queue gets
 		 * it, while the GPU has still to start on the words. fb_mali wants the same pass, to
@@ -573,6 +583,7 @@ RedwoodMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
 				}
 				if (redwood_mali_fb_wanted()) {
 					redwood_mali_fb_capture(r.submit.jc);
+					redwood_mali_fb_capture_vt(vt_jc);
 				}
 			}
 		}

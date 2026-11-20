@@ -1511,7 +1511,7 @@ redwood_mali_dump(uint64_t chain)
 #define FB_TILER_CTX  0x6c0u                  /* our tiler context: the chain's, heap and size our own */
 
 static struct {
-	uint32_t    wanted, captured, built, failed, frames, attempts;
+	uint32_t    wanted, captured, built, failed, frames, attempts, vt_done;
 	uint32_t    canvas_w, canvas_h;
 	uint64_t    canvas_delta;                  /* the captured render target's base, into its surface's buffer */
 	/* the pieces as captured, words as the GPU knows them */
@@ -1615,6 +1615,130 @@ redwood_mali_fb_capture(uint64_t chain)
 	} else if (fb.attempts == 5) {
 		redwood_keep("mali: no chain worth taking for the panel in %u tries: the processor keeps drawing", fb.attempts);
 	}
+}
+
+/*
+ * gpu5n: the tiler side of the same pass, taken apart once right after the fragment side.
+ * gpu5m proved the blit's wild fault (0xfb7ff570, fixed while the texture's base moves frame
+ * to frame) is the varying the pre-frame shader samples through: a varying interpolates from
+ * rasterized geometry, and the blit runs the shader on empty tiles with no tiler pass, so
+ * there is nothing to interpolate from. The compositor draws its quad through a vertex/tiler
+ * submission (no PANFROST_JD_REQ_FS) that Mesa sends BEFORE the fragment one (pan_jm.c:
+ * jm_submit_jc of vtc_jc.first_job, then of frag with REQ_FS): a VERTEX job (type 5, Compute
+ * Job, Draw at +64) and a TILER job (type 7, Tiler Job, Draw at +128, Tiler Pointer at +72),
+ * or one INDEXED VERTEX job (type 10, Vertex Draw at +256) when the compiler chose IDVS.
+ * This says what is in that chain while its buffers still live: the vertex shader and its
+ * bytes, the attribute buffers and the vertices they hold, the varyings it writes, and
+ * whether its tiler context is the one the captured FBD names (the pairing). Observation
+ * only -- nothing is replayed yet; gpu5o builds the pair's replay on what this says.
+ */
+void redwood_mali_fb_capture_vt(uint64_t chain);
+void
+redwood_mali_fb_capture_vt(uint64_t chain)
+{
+	uint64_t j[48], rsd[16], shader[8], abuf[8], attr[8], pos[8], push[4], tc[4];
+	uint64_t vb[2] = {0, 0}, vd[2] = {0, 0}, vp[4] = {0, 0, 0, 0}, tsd[2] = {0, 0};
+	uint64_t at, next, sh;
+	uint32_t type, draw_at, whole;
+
+	if (!fb.captured || fb.vt_done || chain == 0) {
+		return;
+	}
+	lck_mtx_lock(&fb_lock);
+	fb.vt_done = 1;
+	lck_mtx_unlock(&fb_lock);
+	lck_mtx_lock(&mali_lock);
+	at = chain;
+	for (uint32_t n = 0; n < 3 && at >= 0x100000; n++) {
+		if (!gpu_read(at, j, 32)) {
+			dump_line("mali fbt job %u at %#llx: unmapped", n, at);
+			break;
+		}
+		type = (uint32_t)(j[2] >> 1) & 0x7f;
+		next = j[3] & ~0x3full;
+		dump_line("mali fbt job %u at %#llx: type %u hdr %016llx %016llx %016llx next %#llx",
+		    n, at, type, j[0], j[1], j[2], next);
+		whole = type == 10 ? 384 : 256;      /* Indexed Vertex / Tiler / Compute job sizes */
+		if (!gpu_read(at, j, whole)) {
+			dump_line("mali fbt job %u: the rest (%u bytes) unmapped", n, whole);
+			at = next;
+			continue;
+		}
+		if (type == 5) {                     /* VERTEX: Compute Job, Draw at +64 (word 8) */
+			draw_at = 8;
+			dump_line("mali fbt vertex: invocation %016llx %016llx params %016llx", j[4], j[5], j[6]);
+		} else if (type == 7) {              /* TILER: Tiler Job, Draw at +128 (word 16) */
+			draw_at = 16;
+			dump_line("mali fbt tiler: invocation %016llx %016llx prim %016llx primsize %016llx tiler %#llx (the FBD's %#llx)",
+			    j[4], j[5], j[6], j[8], j[9], fb.fbd[7]);
+			if (j[9] >= 0x100000 && gpu_read(j[9], tc, sizeof(tc))) {
+				dump_line("mali fbt tiler ctx: polygon list %#llx hierarchy/size %016llx heap %#llx",
+				    tc[0], tc[1], tc[3]);
+			}
+		} else if (type == 10) {             /* INDEXED VERTEX: Vertex Draw at +256 (word 32) */
+			draw_at = 32;
+			dump_line("mali fbt idvs: invocation %016llx %016llx prim %016llx primsize %016llx tiler %#llx (the FBD's %#llx)",
+			    j[4], j[5], j[6], j[8], j[9], fb.fbd[7]);
+		} else {
+			dump_line("mali fbt job %u: type %u has no draw we know", n, type);
+			at = next;
+			continue;
+		}
+		uint64_t *d = j + draw_at;
+		dump_line("mali fbt draw 0-7: %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx",
+		    d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]);
+		dump_line("mali fbt draw 8-15: %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx",
+		    d[8], d[9], d[10], d[11], d[12], d[13], d[14], d[15]);
+		if (type != 7) {                     /* the vertex draw: what the replay must re-point */
+			if (d[7] >= 0x100000 && gpu_read(d[7], rsd, sizeof(rsd))) {
+				dump_line("mali fbt RSD: %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx",
+				    rsd[0], rsd[1], rsd[2], rsd[3], rsd[4], rsd[5], rsd[6], rsd[7]);
+				sh = rsd[0] & ~0x3full;
+				if (sh >= 0x100000 && gpu_read(sh, shader, sizeof(shader))) {
+					dump_line("mali fbt vertex shader %#llx: %016llx %016llx %016llx %016llx",
+					    sh, shader[0], shader[1], shader[2], shader[3]);
+				} else {
+					dump_line("mali fbt vertex shader %#llx: unreadable", sh);
+				}
+			}
+			if (d[8] >= 0x100000 && gpu_read(d[8], abuf, sizeof(abuf))) {
+				dump_line("mali fbt attr buffers %#llx: %016llx %016llx %016llx %016llx",
+				    d[8], abuf[0], abuf[1], abuf[2], abuf[3]);
+				dump_line("mali fbt attr buffers +4: %016llx %016llx %016llx %016llx; entry 0: type %u ptr %#llx stride %u size %u",
+				    abuf[4], abuf[5], abuf[6], abuf[7], (uint32_t)(abuf[0] & 0x3f),
+				    ((abuf[0] >> 6) & 0x3ffffffffffffull) << 6, (uint32_t)abuf[1], (uint32_t)(abuf[1] >> 32));
+			}
+			if (d[9] >= 0x100000 && gpu_read(d[9], attr, sizeof(attr))) {
+				dump_line("mali fbt attributes %#llx: %016llx %016llx %016llx %016llx",
+				    d[9], attr[0], attr[1], attr[2], attr[3]);
+			}
+			if (d[2] >= 0x100000 && gpu_read(d[2], pos, sizeof(pos))) {
+				dump_line("mali fbt position %#llx: %016llx %016llx %016llx %016llx",
+				    d[2], pos[0], pos[1], pos[2], pos[3]);
+			}
+			if (d[6] >= 0x100000 && gpu_read(d[6], push, sizeof(push))) {
+				dump_line("mali fbt push uniforms %#llx: %016llx %016llx %016llx %016llx",
+				    d[6], push[0], push[1], push[2], push[3]);
+			}
+			if (d[10] >= 0x100000) {
+				gpu_read(d[10], vb, sizeof(vb));
+			}
+			if (d[11] >= 0x100000) {
+				gpu_read(d[11], vd, sizeof(vd));
+			}
+			dump_line("mali fbt varyings: buf %016llx %016llx desc %016llx %016llx", vb[0], vb[1], vd[0], vd[1]);
+			if (d[12] >= 0x100000) {
+				gpu_read(d[12], vp, sizeof(vp));
+			}
+			if (d[14] >= 0x100000) {
+				gpu_read(d[14], tsd, sizeof(tsd));
+			}
+			dump_line("mali fbt viewport %016llx %016llx %016llx %016llx tsd %016llx %016llx",
+			    vp[0], vp[1], vp[2], vp[3], tsd[0], tsd[1]);
+		}
+		at = next;
+	}
+	lck_mtx_unlock(&mali_lock);
 }
 
 /* The copies and the panel's addresses, in one page. With fb_lock held; false: nothing was
