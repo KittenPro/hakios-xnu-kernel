@@ -123,6 +123,7 @@ public:
 	OSDictionary *                  values;
 	uint32_t                        useCount[2];
 	uint64_t                        maliSeq;        /* the last Mali job that draws into it (RedwoodMali) */
+	uint64_t                        maliAddress;    /* its pixels as the Mali sees them, if a buffer holds them (0: none) */
 	uint32_t                        purgeable;
 	bool                            traced;         /* made by a program of boot-arg surftrace_of: its ports are said too */
 
