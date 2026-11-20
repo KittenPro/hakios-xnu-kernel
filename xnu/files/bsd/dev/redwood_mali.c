@@ -1511,13 +1511,20 @@ redwood_mali_dump(uint64_t chain)
 #define FB_TILER_CTX  0x6c0u                  /* our tiler context: the chain's, heap and size our own */
 
 static struct {
-	uint32_t    wanted, captured, built, failed, frames, attempts, vt_done;
+	uint32_t    wanted, captured, built, failed, frames, attempts, vt_done, vt_saved;
 	uint32_t    canvas_w, canvas_h;
 	uint64_t    canvas_delta;                  /* the captured render target's base, into its surface's buffer */
 	/* the pieces as captured, words as the GPU knows them */
 	uint64_t    fbd[32], dcd[16], texture[4], sws[2], sampler[4], rsd[16], shader[64];
 	uint64_t    tsd[4], viewport[4], samplepos[8], vdesc[2], vbuf[2];
 	uint64_t    tiler[24];                     /* the chain's tiler context, taken while its buffer lives */
+	/* gpu5o: the whole Indexed Vertex job (384 B) and the two draws' pieces, taken while the
+	 * pass's buffers live, for the pair's replay. The Vertex Draw (+256) is the VS; the
+	 * Fragment Draw (+128) is the MAIN FS (not the preload captured above). */
+	uint64_t    vt_job[48];
+	uint64_t    vrsd[8], vshader[8], vabuf[4], vattr[2], vvbuf[4], vvdesc[2], vpush[4], vviewport[4], vtsd[4];
+	uint64_t    ubuf[2], udata[8];             /* the uniform buffer's descriptor and first entries */
+	uint64_t    fdraw[16], frsd[16], fshader[8], ftex[4], fsws[2], fsamp[4], fvbuf[4], fvdesc[2], fviewport[4], ftsd[4];
 	/* the live copy of them, one page of kernel memory mapped at one GPU address */
 	uint64_t    gpu;
 	vm_offset_t kmem;
@@ -1629,24 +1636,176 @@ redwood_mali_fb_capture(uint64_t chain)
  * or one INDEXED VERTEX job (type 10, Vertex Draw at +256) when the compiler chose IDVS.
  * This says what is in that chain while its buffers still live: the vertex shader and its
  * bytes, the attribute buffers and the vertices they hold, the varyings it writes, and
- * whether its tiler context is the one the captured FBD names (the pairing). Observation
- * only -- nothing is replayed yet; gpu5o builds the pair's replay on what this says.
+ * whether its tiler context is the one the captured FBD names (the pairing).
+ *
+ * gpu5o: gpu5n named the pair (one INDEXED VERTEX job, tiler == the FBD's). The captured
+ * DCD/shader is the PRELOAD (pre-frame, Intersect -- runs only on tiles WITH geometry); the
+ * MAIN FS draw is the IDVS job's Fragment Draw at +128 (jm_emit_tiler_draw, pan_jm.c:846).
+ * This now SAVES the whole 384-byte job and both draws' pieces into fb (vt_job, v*, f*), and
+ * dumps the still-missing data the replay must re-point: the Fragment Draw, the 4 vertices,
+ * the VS varying-buffer contents, the uniform buffer. Observation only -- nothing replayed
+ * yet; gpu5p builds the pair's replay on what this saves.
  */
+/* gpu5o: the Vertex Draw's pieces, saved into fb for the replay and said while they live.
+ * `d` is the Draw (16 words); fb_lock and mali_lock held. The vertices, the VS's varying
+ * outputs and the uniform data are the run-time values no static descriptor check sees. */
+static void
+fb_vt_vertex(uint64_t *d)
+{
+	uint64_t verts[16], vdata[8], ptr, sh;
+	uint32_t stride, size, ubytes;
+
+	dump_line("mali fbt vdraw 0-7: %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx",
+	    d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]);
+	dump_line("mali fbt vdraw 8-15: %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx",
+	    d[8], d[9], d[10], d[11], d[12], d[13], d[14], d[15]);
+	if (d[7] >= 0x100000 && gpu_read(d[7], fb.vrsd, sizeof(fb.vrsd))) {
+		dump_line("mali fbt VS RSD: %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx",
+		    fb.vrsd[0], fb.vrsd[1], fb.vrsd[2], fb.vrsd[3], fb.vrsd[4], fb.vrsd[5], fb.vrsd[6], fb.vrsd[7]);
+		sh = fb.vrsd[0] & ~0x3full;
+		if (sh >= 0x100000 && gpu_read(sh, fb.vshader, sizeof(fb.vshader))) {
+			dump_line("mali fbt VS shader %#llx: %016llx %016llx %016llx %016llx",
+			    sh, fb.vshader[0], fb.vshader[1], fb.vshader[2], fb.vshader[3]);
+		} else {
+			dump_line("mali fbt VS shader %#llx: unreadable", sh);
+		}
+	}
+	if (d[8] >= 0x100000 && gpu_read(d[8], fb.vabuf, sizeof(fb.vabuf))) {
+		dump_line("mali fbt attr buffers: %016llx %016llx %016llx %016llx; entry0 type %u ptr %#llx stride %u size %u",
+		    fb.vabuf[0], fb.vabuf[1], fb.vabuf[2], fb.vabuf[3], (uint32_t)(fb.vabuf[0] & 0x3f),
+		    ((fb.vabuf[0] >> 6) & 0x3ffffffffffffull) << 6, (uint32_t)fb.vabuf[1], (uint32_t)(fb.vabuf[1] >> 32));
+		ptr = ((fb.vabuf[0] >> 6) & 0x3ffffffffffffull) << 6;
+		stride = (uint32_t)fb.vabuf[1];
+		if (ptr >= 0x100000 && stride == 32 && gpu_read(ptr, verts, sizeof(verts))) {
+			for (unsigned v = 0; v < 4; v++) {
+				dump_line("mali fbt vertex %u: pos %016llx %016llx uv %016llx %016llx",
+				    v, verts[4 * v], verts[4 * v + 1], verts[4 * v + 2], verts[4 * v + 3]);
+			}
+		}
+	}
+	if (d[9] >= 0x100000 && gpu_read(d[9], fb.vattr, sizeof(fb.vattr))) {
+		dump_line("mali fbt attributes: %016llx %016llx", fb.vattr[0], fb.vattr[1]);
+	}
+	if (d[6] >= 0x100000 && gpu_read(d[6], fb.vpush, sizeof(fb.vpush))) {
+		dump_line("mali fbt push uniforms: %016llx %016llx %016llx %016llx",
+		    fb.vpush[0], fb.vpush[1], fb.vpush[2], fb.vpush[3]);
+	}
+	if (d[3] >= 0x100000 && gpu_read(d[3], fb.ubuf, sizeof(fb.ubuf))) {
+		ubytes = (((uint32_t)fb.ubuf[0] & 0xfff) + 1) * 16;
+		dump_line("mali fbt uniform buf %#llx: %016llx %016llx (entries %u)",
+		    d[3], fb.ubuf[0], fb.ubuf[1], ((uint32_t)fb.ubuf[0] & 0xfff) + 1);
+		ptr = (fb.ubuf[0] >> 12) << 4;
+		if (ubytes > 64) {
+			ubytes = 64;
+		}
+		if (ptr >= 0x100000 && ubytes >= 16 && gpu_read(ptr, fb.udata, ubytes)) {
+			dump_line("mali fbt uniform data %#llx (%u B): %016llx %016llx", ptr, ubytes, fb.udata[0], fb.udata[1]);
+			if (ubytes >= 32) {
+				dump_line("mali fbt uniform data +2: %016llx %016llx", fb.udata[2], fb.udata[3]);
+			}
+			if (ubytes >= 64) {
+				dump_line("mali fbt uniform data +4: %016llx %016llx %016llx %016llx",
+				    fb.udata[4], fb.udata[5], fb.udata[6], fb.udata[7]);
+			}
+		}
+	}
+	if (d[10] >= 0x100000 && gpu_read(d[10], fb.vvbuf, sizeof(fb.vvbuf))) {
+		dump_line("mali fbt VS varying buffers: %016llx %016llx %016llx %016llx",
+		    fb.vvbuf[0], fb.vvbuf[1], fb.vvbuf[2], fb.vvbuf[3]);
+		ptr = ((fb.vvbuf[0] >> 6) & 0x3ffffffffffffull) << 6;
+		size = (uint32_t)(fb.vvbuf[1] >> 32);
+		if (ptr >= 0x100000 && size >= 64 && gpu_read(ptr, vdata, 64)) {
+			dump_line("mali fbt VS var0 %#llx: %016llx %016llx %016llx %016llx", ptr, vdata[0], vdata[1], vdata[2], vdata[3]);
+			dump_line("mali fbt VS var0 +4: %016llx %016llx %016llx %016llx", vdata[4], vdata[5], vdata[6], vdata[7]);
+		}
+		ptr = ((fb.vvbuf[2] >> 6) & 0x3ffffffffffffull) << 6;
+		size = (uint32_t)(fb.vvbuf[3] >> 32);
+		if (fb.vvbuf[2] != 0 && ptr >= 0x100000 && size >= 64 && gpu_read(ptr, vdata, 64)) {
+			dump_line("mali fbt VS var1 %#llx: %016llx %016llx %016llx %016llx", ptr, vdata[0], vdata[1], vdata[2], vdata[3]);
+			dump_line("mali fbt VS var1 +4: %016llx %016llx %016llx %016llx", vdata[4], vdata[5], vdata[6], vdata[7]);
+		}
+	}
+	if (d[11] >= 0x100000 && gpu_read(d[11], fb.vvdesc, sizeof(fb.vvdesc))) {
+		dump_line("mali fbt VS varyings: %016llx %016llx", fb.vvdesc[0], fb.vvdesc[1]);
+	}
+	if (d[12] >= 0x100000) {
+		gpu_read(d[12], fb.vviewport, sizeof(fb.vviewport));
+	}
+	if (d[14] >= 0x100000) {
+		gpu_read(d[14], fb.vtsd, sizeof(fb.vtsd));
+	}
+	dump_line("mali fbt VS viewport %016llx %016llx %016llx %016llx tsd %016llx %016llx",
+	    fb.vviewport[0], fb.vviewport[1], fb.vviewport[2], fb.vviewport[3], fb.vtsd[0], fb.vtsd[1]);
+}
+
+/* gpu5o: the Fragment Draw (the MAIN FS, at +128 of the IDVS job), saved and said. `fd` is
+ * the Draw (16 words); fb_lock and mali_lock held. Its texture's surface base says whether
+ * the compositor's full-screen pass samples the canvas itself (a reload) or another buffer. */
+static void
+fb_vt_fragment(uint64_t *fd)
+{
+	uint64_t sh;
+
+	memcpy(fb.fdraw, fd, sizeof(fb.fdraw));
+	dump_line("mali fbt fdraw 0-7: %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx",
+	    fd[0], fd[1], fd[2], fd[3], fd[4], fd[5], fd[6], fd[7]);
+	dump_line("mali fbt fdraw 8-15: %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx",
+	    fd[8], fd[9], fd[10], fd[11], fd[12], fd[13], fd[14], fd[15]);
+	if (fd[7] >= 0x100000 && gpu_read(fd[7], fb.frsd, sizeof(fb.frsd))) {
+		dump_line("mali fbt FS RSD: %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx",
+		    fb.frsd[0], fb.frsd[1], fb.frsd[2], fb.frsd[3], fb.frsd[4], fb.frsd[5], fb.frsd[6], fb.frsd[7]);
+		dump_line("mali fbt FS blend: %016llx %016llx", fb.frsd[8], fb.frsd[9]);
+		sh = fb.frsd[0] & ~0x3full;
+		if (sh >= 0x100000 && gpu_read(sh, fb.fshader, sizeof(fb.fshader))) {
+			dump_line("mali fbt FS shader %#llx: %016llx %016llx %016llx %016llx",
+			    sh, fb.fshader[0], fb.fshader[1], fb.fshader[2], fb.fshader[3]);
+		} else {
+			dump_line("mali fbt FS shader %#llx: unreadable", sh);
+		}
+	}
+	if (fd[4] >= 0x100000 && gpu_read(fd[4], fb.ftex, sizeof(fb.ftex))) {
+		dump_line("mali fbt FS texture: %016llx %016llx %016llx %016llx", fb.ftex[0], fb.ftex[1], fb.ftex[2], fb.ftex[3]);
+		if (fb.ftex[2] >= 0x100000 && gpu_read(fb.ftex[2], fb.fsws, sizeof(fb.fsws))) {
+			dump_line("mali fbt FS surface %#llx: %016llx %016llx (the canvas base %#llx)",
+			    fb.ftex[2], fb.fsws[0], fb.fsws[1], fb.fbd[20] & 0xfffffffffffff000ull);
+		}
+	}
+	if (fd[5] >= 0x100000 && gpu_read(fd[5], fb.fsamp, sizeof(fb.fsamp))) {
+		dump_line("mali fbt FS sampler: %016llx %016llx", fb.fsamp[0], fb.fsamp[1]);
+	}
+	if (fd[10] >= 0x100000) {
+		gpu_read(fd[10], fb.fvbuf, sizeof(fb.fvbuf));
+	}
+	if (fd[11] >= 0x100000) {
+		gpu_read(fd[11], fb.fvdesc, sizeof(fb.fvdesc));
+	}
+	dump_line("mali fbt FS varyings: buf %016llx %016llx %016llx %016llx desc %016llx %016llx",
+	    fb.fvbuf[0], fb.fvbuf[1], fb.fvbuf[2], fb.fvbuf[3], fb.fvdesc[0], fb.fvdesc[1]);
+	if (fd[12] >= 0x100000) {
+		gpu_read(fd[12], fb.fviewport, sizeof(fb.fviewport));
+	}
+	if (fd[14] >= 0x100000) {
+		gpu_read(fd[14], fb.ftsd, sizeof(fb.ftsd));
+	}
+	dump_line("mali fbt FS viewport %016llx %016llx tsd %016llx %016llx pos %016llx",
+	    fb.fviewport[0], fb.fviewport[1], fb.ftsd[0], fb.ftsd[1], fd[2]);
+}
+
 void redwood_mali_fb_capture_vt(uint64_t chain);
 void
 redwood_mali_fb_capture_vt(uint64_t chain)
 {
-	uint64_t j[48], rsd[16], shader[8], abuf[8], attr[8], pos[8], push[4], tc[4];
-	uint64_t vb[2] = {0, 0}, vd[2] = {0, 0}, vp[4] = {0, 0, 0, 0}, tsd[2] = {0, 0};
-	uint64_t at, next, sh;
-	uint32_t type, draw_at, whole;
+	uint64_t j[48], tc[4];
+	uint64_t at, next;
+	uint32_t type, whole;
 
 	if (!fb.captured || fb.vt_done || chain == 0) {
 		return;
 	}
+	/* fb_lock held across the reads so the pieces land in fb atomically w.r.t. fb_frame;
+	 * the order fb_lock -> mali_lock is the one fb_capture and fb_frame already use. */
 	lck_mtx_lock(&fb_lock);
 	fb.vt_done = 1;
-	lck_mtx_unlock(&fb_lock);
 	lck_mtx_lock(&mali_lock);
 	at = chain;
 	for (uint32_t n = 0; n < 3 && at >= 0x100000; n++) {
@@ -1664,81 +1823,34 @@ redwood_mali_fb_capture_vt(uint64_t chain)
 			at = next;
 			continue;
 		}
-		if (type == 5) {                     /* VERTEX: Compute Job, Draw at +64 (word 8) */
-			draw_at = 8;
+		if (type == 10) {                    /* INDEXED VERTEX: the whole pair in one job */
+			memcpy(fb.vt_job, j, sizeof(fb.vt_job));
+			dump_line("mali fbt idvs: invocation %016llx prim %016llx primsize %016llx tiler %#llx (the FBD's %#llx)",
+			    j[4], j[5], j[8], j[9], fb.fbd[7]);
+			if (j[9] >= 0x100000 && gpu_read(j[9], tc, sizeof(tc))) {
+				dump_line("mali fbt tiler ctx: polygon list %#llx hierarchy/size %016llx heap %#llx",
+				    tc[0], tc[1], tc[3]);
+			}
+			fb_vt_fragment(j + 16);      /* Fragment Draw at +128: the main FS */
+			fb_vt_vertex(j + 32);        /* Vertex Draw at +256: the VS */
+			fb.vt_saved = 1;
+		} else if (type == 5) {              /* VERTEX: Compute Job, Draw at +64 (word 8) */
 			dump_line("mali fbt vertex: invocation %016llx %016llx params %016llx", j[4], j[5], j[6]);
+			fb_vt_vertex(j + 8);
 		} else if (type == 7) {              /* TILER: Tiler Job, Draw at +128 (word 16) */
-			draw_at = 16;
 			dump_line("mali fbt tiler: invocation %016llx %016llx prim %016llx primsize %016llx tiler %#llx (the FBD's %#llx)",
 			    j[4], j[5], j[6], j[8], j[9], fb.fbd[7]);
 			if (j[9] >= 0x100000 && gpu_read(j[9], tc, sizeof(tc))) {
 				dump_line("mali fbt tiler ctx: polygon list %#llx hierarchy/size %016llx heap %#llx",
 				    tc[0], tc[1], tc[3]);
 			}
-		} else if (type == 10) {             /* INDEXED VERTEX: Vertex Draw at +256 (word 32) */
-			draw_at = 32;
-			dump_line("mali fbt idvs: invocation %016llx %016llx prim %016llx primsize %016llx tiler %#llx (the FBD's %#llx)",
-			    j[4], j[5], j[6], j[8], j[9], fb.fbd[7]);
 		} else {
 			dump_line("mali fbt job %u: type %u has no draw we know", n, type);
-			at = next;
-			continue;
-		}
-		uint64_t *d = j + draw_at;
-		dump_line("mali fbt draw 0-7: %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx",
-		    d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]);
-		dump_line("mali fbt draw 8-15: %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx",
-		    d[8], d[9], d[10], d[11], d[12], d[13], d[14], d[15]);
-		if (type != 7) {                     /* the vertex draw: what the replay must re-point */
-			if (d[7] >= 0x100000 && gpu_read(d[7], rsd, sizeof(rsd))) {
-				dump_line("mali fbt RSD: %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx",
-				    rsd[0], rsd[1], rsd[2], rsd[3], rsd[4], rsd[5], rsd[6], rsd[7]);
-				sh = rsd[0] & ~0x3full;
-				if (sh >= 0x100000 && gpu_read(sh, shader, sizeof(shader))) {
-					dump_line("mali fbt vertex shader %#llx: %016llx %016llx %016llx %016llx",
-					    sh, shader[0], shader[1], shader[2], shader[3]);
-				} else {
-					dump_line("mali fbt vertex shader %#llx: unreadable", sh);
-				}
-			}
-			if (d[8] >= 0x100000 && gpu_read(d[8], abuf, sizeof(abuf))) {
-				dump_line("mali fbt attr buffers %#llx: %016llx %016llx %016llx %016llx",
-				    d[8], abuf[0], abuf[1], abuf[2], abuf[3]);
-				dump_line("mali fbt attr buffers +4: %016llx %016llx %016llx %016llx; entry 0: type %u ptr %#llx stride %u size %u",
-				    abuf[4], abuf[5], abuf[6], abuf[7], (uint32_t)(abuf[0] & 0x3f),
-				    ((abuf[0] >> 6) & 0x3ffffffffffffull) << 6, (uint32_t)abuf[1], (uint32_t)(abuf[1] >> 32));
-			}
-			if (d[9] >= 0x100000 && gpu_read(d[9], attr, sizeof(attr))) {
-				dump_line("mali fbt attributes %#llx: %016llx %016llx %016llx %016llx",
-				    d[9], attr[0], attr[1], attr[2], attr[3]);
-			}
-			if (d[2] >= 0x100000 && gpu_read(d[2], pos, sizeof(pos))) {
-				dump_line("mali fbt position %#llx: %016llx %016llx %016llx %016llx",
-				    d[2], pos[0], pos[1], pos[2], pos[3]);
-			}
-			if (d[6] >= 0x100000 && gpu_read(d[6], push, sizeof(push))) {
-				dump_line("mali fbt push uniforms %#llx: %016llx %016llx %016llx %016llx",
-				    d[6], push[0], push[1], push[2], push[3]);
-			}
-			if (d[10] >= 0x100000) {
-				gpu_read(d[10], vb, sizeof(vb));
-			}
-			if (d[11] >= 0x100000) {
-				gpu_read(d[11], vd, sizeof(vd));
-			}
-			dump_line("mali fbt varyings: buf %016llx %016llx desc %016llx %016llx", vb[0], vb[1], vd[0], vd[1]);
-			if (d[12] >= 0x100000) {
-				gpu_read(d[12], vp, sizeof(vp));
-			}
-			if (d[14] >= 0x100000) {
-				gpu_read(d[14], tsd, sizeof(tsd));
-			}
-			dump_line("mali fbt viewport %016llx %016llx %016llx %016llx tsd %016llx %016llx",
-			    vp[0], vp[1], vp[2], vp[3], tsd[0], tsd[1]);
 		}
 		at = next;
 	}
 	lck_mtx_unlock(&mali_lock);
+	lck_mtx_unlock(&fb_lock);
 }
 
 /* The copies and the panel's addresses, in one page. With fb_lock held; false: nothing was
